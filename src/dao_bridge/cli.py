@@ -289,6 +289,87 @@ def status(ctx: click.Context, work_dir: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# classify
+# ---------------------------------------------------------------------------
+
+
+@cli.command()
+@click.option(
+    "--work-dir", type=click.Path(exists=True), default="./work", help="Work directory path."
+)
+@click.option(
+    "--spine", "spine_index", type=int, default=None, help="Classify only this spine index."
+)
+@click.option(
+    "--force",
+    is_flag=True,
+    help="Reclassify all items, overriding existing classifications.",
+)
+@click.pass_context
+def classify(ctx: click.Context, work_dir: str, spine_index: int | None, force: bool) -> None:
+    """Classify spine items by content type.
+
+    Determines whether each spine item is a chapter, frontmatter,
+    backmatter, table of contents, illustration, etc.  Uses structural
+    hints when possible and falls back to LLM classification.
+
+    Items with an existing classification in manifest.json are skipped
+    unless --force is passed.  To manually override a classification,
+    edit manifest.json directly and re-run subsequent pipeline stages.
+    """
+    work = Path(work_dir).resolve()
+    setup_logging(work, ctx.obj["verbose"])
+    config = _resolve_config(work)
+    state = load_state(work)
+
+    mp = manifest_path(work)
+    if not mp.exists():
+        raise click.ClickException("Manifest not found. Run 'dao-bridge extract' first.")
+
+    from collections import Counter
+
+    from rich.progress import Progress
+
+    from dao_bridge.classify import run_classify_stage
+    from dao_bridge.schemas import Manifest
+
+    manifest = Manifest(**json.loads(mp.read_text(encoding="utf-8")))
+    n_items = 1 if spine_index is not None else len(manifest.spine)
+
+    with Progress(transient=True) as progress:
+        task = progress.add_task("Classifying...", total=n_items)
+
+        manifest = run_classify_stage(
+            work,
+            config,
+            state,
+            force=force,
+            spine_filter=spine_index,
+            on_progress=lambda _: progress.advance(task),
+        )
+
+    # Print summary: counts per classification value.
+    counts = Counter(item.classification for item in manifest.spine)
+    click.echo("Classification summary:")
+    for cls_val in (
+        "chapter",
+        "frontmatter",
+        "backmatter",
+        "toc_auto",
+        "toc_authored",
+        "illustration",
+        "unknown",
+    ):
+        n = counts.get(cls_val, 0)
+        if n > 0:
+            click.echo(f"  {cls_val}: {n}")
+
+    unclassified = [i for i in manifest.spine if i.classification is None]
+    if unclassified:
+        click.echo(f"\nWarning: {len(unclassified)} item(s) still unclassified.")
+
+
+# ---------------------------------------------------------------------------
 # chunk
 # ---------------------------------------------------------------------------
 
@@ -394,7 +475,6 @@ def assemble(ctx: click.Context, work_dir: str, spine_index: int | None, force: 
 # ---------------------------------------------------------------------------
 
 _PLACEHOLDER_COMMANDS = [
-    "classify",
     "translate",
     "rebuild",
     "run",

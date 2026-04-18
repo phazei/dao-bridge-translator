@@ -27,8 +27,8 @@ dao-bridge extract --work-dir ./work
 # 3. Clean XHTML to markdown
 dao-bridge clean --work-dir ./work
 
-# 4. Classify spine items (requires LLM — not yet implemented)
-# dao-bridge classify --work-dir ./work
+# 4. Classify spine items (structural hints + LLM fallback)
+dao-bridge classify --work-dir ./work
 
 # 5. Chunk cleaned markdown into translation-ready segments
 dao-bridge chunk --work-dir ./work
@@ -52,12 +52,22 @@ is passed. Add `--verbose` to any command for DEBUG-level console output.
 | `init <epub>` | Create work directory, write default `config.yaml` |
 | `extract` | Extract EPUB spine items to `raw/NNN.xhtml` |
 | `clean` | Convert raw XHTML to markdown in `clean/NNN.md` |
+| `classify` | Classify spine items (chapter, frontmatter, illustration, etc.) |
 | `chunk` | Chunk cleaned markdown into `chunks/NNN/NNN.MMM.json` |
 | `assemble` | Reassemble translated chunks into `assembled/NNN.md` |
 | `status` | Display pipeline stage completion status |
 
-The `chunk` and `assemble` commands support `--spine N` to process a single
-spine item, and `--force` to reprocess even if already complete.
+The `classify`, `chunk`, and `assemble` commands support `--spine N` to process
+a single spine item, and `--force` to reprocess even if already complete.
+
+### Manual Classification Override
+
+After running `classify`, review `manifest.json` to check the results.
+To manually override a classification, edit the `classification` field on
+any spine item directly.  Re-running `classify` without `--force` will
+preserve your edits and only classify items that still have `null`
+classification.  Use `--force` to discard all manual edits and reclassify
+from scratch.
 
 ## Work Directory Layout
 

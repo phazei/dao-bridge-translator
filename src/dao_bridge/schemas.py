@@ -26,6 +26,21 @@ Classification = Literal[
     "unknown",
 ]
 
+
+# ---------------------------------------------------------------------------
+# Classification response (LLM structured output)
+# ---------------------------------------------------------------------------
+
+
+class ClassificationResponse(BaseModel):
+    """Pydantic model for LLM structured output via ``complete_json``."""
+
+    classification: Classification
+    title: str | None = None
+    confidence: Literal["high", "medium", "low"]
+    reasoning: str
+
+
 # ---------------------------------------------------------------------------
 # Manifest
 # ---------------------------------------------------------------------------

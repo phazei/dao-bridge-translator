@@ -1,4 +1,4 @@
-"""Integration tests: EPUB -> init -> extract -> clean -> chunk -> assemble.
+"""Integration tests: EPUB -> init -> extract -> clean -> classify -> chunk -> assemble.
 
 Uses the Japanese mini EPUB fixture to exercise the full pipeline
 end-to-end through chunk and assemble stages.
@@ -8,11 +8,13 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 
+from dao_bridge.classify import run_classify_stage
 from dao_bridge.clean import clean_all
 from dao_bridge.config import load_config
 from dao_bridge.extract import extract_epub
-from dao_bridge.schemas import Manifest, TranslatedChunk
+from dao_bridge.schemas import ClassificationResponse, Manifest, TranslatedChunk
 from dao_bridge.state import (
     is_stage_completed,
     load_state,
@@ -246,12 +248,12 @@ class TestCleanOutputQuality:
 
 
 # ---------------------------------------------------------------------------
-# Full pipeline: extract -> clean -> (manual classify) -> chunk -> assemble
+# Full pipeline: extract -> clean -> classify -> chunk -> assemble
 # ---------------------------------------------------------------------------
 
 
 class TestChunkAssemblePipeline:
-    """End-to-end test: extract -> clean -> classify (manual) -> chunk -> (inject translations) -> assemble."""
+    """End-to-end: extract -> clean -> classify -> chunk -> assemble."""
 
     def test_full_chunk_assemble_pipeline(self, jp_epub_path: Path, tmp_path: Path):
         work_dir = tmp_path / "work"
@@ -266,19 +268,37 @@ class TestChunkAssemblePipeline:
         # --- Clean ---
         manifest = clean_all(config, manifest, state, force=False)
 
-        # --- Manual classification (classify stage not yet implemented) ---
-        # Set all items to 'chapter' so they are chunkable.
+        # --- Classify (structural hints + mocked LLM) ---
+        # The LLM mock classifies anything not caught by structural hints
+        # as "chapter".  Structural hints will handle cover images, TOC, etc.
+        state = load_state(work_dir)
+        with patch("dao_bridge.classify.LLMClient") as mock_llm_cls:
+            mock_client = MagicMock()
+            mock_client.complete_json.return_value = ClassificationResponse(
+                classification="chapter",
+                title=None,
+                confidence="high",
+                reasoning="integration test default",
+            )
+            mock_llm_cls.return_value = mock_client
+
+            manifest = run_classify_stage(work_dir, config, state, force=False)
+
+        # Verify all items have a classification set.
         for item in manifest.spine:
-            item.classification = "chapter"
-        # Also set one item to 'illustration' to test skipping.
-        if len(manifest.spine) >= 2:
-            manifest.spine[0].classification = "illustration"
+            assert item.classification is not None, (
+                f"Spine {item.spine_index} has no classification after classify stage"
+            )
 
-        # Persist manifest with classifications.
-        from dao_bridge.workdir import atomic_write
+        # Verify classify stage completed.
+        reloaded_state = load_state(work_dir)
+        assert is_stage_completed(reloaded_state, "classify")
 
-        mp = manifest_path(work_dir)
-        atomic_write(mp, manifest.model_dump_json(indent=2))
+        # Ensure at least one illustration was detected (cover page).
+        classifications = [i.classification for i in manifest.spine]
+        assert "illustration" in classifications or "frontmatter" in classifications, (
+            f"Expected at least one structural hint classification, got: {classifications}"
+        )
 
         # --- Chunk ---
         from dao_bridge.chunk import chunk_all
@@ -294,8 +314,14 @@ class TestChunkAssemblePipeline:
         for item in manifest.spine:
             assert item.chunk_count is not None
 
-        # The illustration item should have chunk_count=0.
-        assert manifest.spine[0].chunk_count == 0
+        # Non-chunkable items (illustration, toc_auto) should have chunk_count=0.
+        non_chunkable = [
+            i for i in manifest.spine if i.classification in ("illustration", "toc_auto")
+        ]
+        for item in non_chunkable:
+            assert item.chunk_count == 0, (
+                f"Spine {item.spine_index} ({item.classification}) should have chunk_count=0"
+            )
 
         # At least some items should have chunks.
         chunked_items = [i for i in manifest.spine if (i.chunk_count or 0) > 0]
@@ -351,9 +377,13 @@ class TestChunkAssemblePipeline:
             assert len(content.strip()) > 0
             assert "[Translated]" in content
 
-        # Illustration item should NOT have an assembled file.
-        ap_illus = assembled_path(work_dir, manifest.spine[0].spine_index)
-        assert not ap_illus.exists()
+        # Non-chunkable items should NOT have assembled files.
+        for item in non_chunkable:
+            ap_nc = assembled_path(work_dir, item.spine_index)
+            assert not ap_nc.exists(), (
+                f"Non-chunkable spine {item.spine_index} ({item.classification}) "
+                f"should not have an assembled file"
+            )
 
     def test_chunk_idempotent_without_force(self, jp_epub_path: Path, tmp_path: Path):
         """Running chunk twice without --force is a no-op."""
@@ -366,13 +396,18 @@ class TestChunkAssemblePipeline:
         manifest = extract_epub(config, state, force=False)
         manifest = clean_all(config, manifest, state, force=False)
 
-        # Classify all as chapter.
-        for item in manifest.spine:
-            item.classification = "chapter"
-        from dao_bridge.workdir import atomic_write
-
-        mp = manifest_path(work_dir)
-        atomic_write(mp, manifest.model_dump_json(indent=2))
+        # Classify using structural hints + mocked LLM.
+        state = load_state(work_dir)
+        with patch("dao_bridge.classify.LLMClient") as mock_llm_cls:
+            mock_client = MagicMock()
+            mock_client.complete_json.return_value = ClassificationResponse(
+                classification="chapter",
+                title=None,
+                confidence="high",
+                reasoning="test default",
+            )
+            mock_llm_cls.return_value = mock_client
+            manifest = run_classify_stage(work_dir, config, state, force=False)
 
         from dao_bridge.chunk import chunk_all
 
@@ -382,11 +417,8 @@ class TestChunkAssemblePipeline:
 
         # Second run — should be no-op.
         state2 = load_state(work_dir)
+        mp = manifest_path(work_dir)
         manifest2 = Manifest(**json.loads(mp.read_text(encoding="utf-8")))
-        # Re-set classifications since they are loaded fresh from disk.
-        for item in manifest2.spine:
-            if item.classification is None:
-                item.classification = "chapter"
         manifest2 = chunk_all(config, manifest2, state2, force=False)
         second_counts = [i.chunk_count for i in manifest2.spine]
 

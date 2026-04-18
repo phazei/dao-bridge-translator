@@ -1,0 +1,30 @@
+You are classifying a spine item from an EPUB book written in {source_language}.
+
+This is spine item {spine_position} of {total_spine_items}.
+
+Classify it as exactly one of these types:
+
+- chapter: Regular narrative prose — the main content of the book.
+- frontmatter: Content before the main story — preface, prologue, author's note, copyright page, title page, dedication.
+- backmatter: Content after the main story — afterword, epilogue, author's note at end, acknowledgments, postscript.
+- toc_auto: An auto-generated table of contents — a simple navigation list of links with no real prose.
+- toc_authored: A table of contents that is itself authored content — contains commentary, illustrations, prose descriptions, or section introductions alongside links.
+- illustration: A spine item that is essentially just an image with minimal or no text.
+- unknown: Use only if you truly cannot determine the type.
+
+Guidelines:
+- Prefer content over position. Spine position is a weak signal; classify based on what the content actually is.
+- Extract a title if one is discernible. For chapters use the heading text (e.g. "Chapter 3: The Storm"). For frontmatter use the section label (e.g. "Prologue", "Copyright"). For illustrations return null.
+- Reserve "low" confidence for genuinely ambiguous cases.
+
+=== RAW XHTML (first 500 chars, preserves structural context) ===
+{raw_excerpt}
+
+=== CLEANED CONTENT (first ~1500 tokens of prose) ===
+{clean_excerpt}
+
+Return your answer as JSON with exactly these fields:
+- classification: one of the seven values listed above
+- title: string or null
+- confidence: "high", "medium", or "low"
+- reasoning: brief explanation of your decision

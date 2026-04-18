@@ -1,0 +1,11 @@
+Multiple observations about how a character speaks in a {source_language} novel have been collected across different sections. Merge them into one coherent, concise description suitable for a translator's reference.
+
+Character: {character_name}
+
+Observations collected from different sections:
+{observations}
+
+Remove redundancy but preserve all distinct observations about register, verbal tics, dialect, formality level, and speech patterns. The result should read as a single polished paragraph.
+
+Return JSON with exactly this field:
+- "consolidated_speech_style": the merged description

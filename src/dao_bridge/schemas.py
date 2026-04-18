@@ -101,7 +101,7 @@ GlossarySource = Literal["seed", "extracted", "user", "master"]
 class GlossaryEntry(BaseModel):
     """A single glossary entry for term consistency."""
 
-    japanese: str | None = None  # None for English-reference-only imports
+    source_term: str | None = None  # None for target-language-reference-only imports
     reading: str | None = None  # from furigana
     english: str
     category: str  # validated against config.glossary.categories at load time
@@ -123,6 +123,53 @@ class Glossary(BaseModel):
     book_metadata: dict = {}  # title, author, volume; per-book only
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+# ---------------------------------------------------------------------------
+# Glossary LLM response models
+# ---------------------------------------------------------------------------
+
+
+class GlossaryExtractionEntry(BaseModel):
+    """A single entry from the glossary extraction LLM response."""
+
+    source_term: str
+    reading: str | None = None
+    english_proposed: str
+    category: str
+    aliases: list[str] = []
+    nicknames: dict[str, str] = {}
+    speech_style: str | None = None
+    notes: str | None = None
+
+
+class GlossaryCorrectionEntry(BaseModel):
+    """A correction proposed by the LLM during glossary extraction."""
+
+    existing_english: str
+    source_term: str
+    corrected_english: str
+    reason: str
+
+
+class GlossaryExtractionResponse(BaseModel):
+    """Top-level LLM response for glossary extraction."""
+
+    entries: list[GlossaryExtractionEntry] = []
+    corrections: list[GlossaryCorrectionEntry] = []
+
+
+class GlossaryReconcileResponse(BaseModel):
+    """LLM response for resolving a term conflict."""
+
+    chosen_english: str
+    reasoning: str
+
+
+class GlossarySpeechMergeResponse(BaseModel):
+    """LLM response for consolidating speech-style observations."""
+
+    consolidated_speech_style: str
 
 
 # ---------------------------------------------------------------------------

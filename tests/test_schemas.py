@@ -160,13 +160,13 @@ class TestChunk:
 class TestGlossaryEntry:
     def test_minimal_entry(self):
         e = GlossaryEntry(english="Subaru", category="character", source="extracted")
-        assert e.japanese is None
+        assert e.source_term is None
         assert e.aliases == []
         assert e.nicknames == {}
 
     def test_full_entry(self):
         e = GlossaryEntry(
-            japanese="スバル",
+            source_term="スバル",
             reading="すばる",
             english="Subaru",
             category="character",
@@ -178,7 +178,7 @@ class TestGlossaryEntry:
             source="seed",
             source_books=["isbn-9784041234567"],
         )
-        assert e.japanese == "スバル"
+        assert e.source_term == "スバル"
         assert e.nicknames["Rem"] == "Subaru-kun"
         assert e.source_books == ["isbn-9784041234567"]
 
@@ -188,7 +188,7 @@ class TestGlossaryEntry:
 
     def test_round_trip(self):
         e = GlossaryEntry(
-            japanese="エミリア",
+            source_term="エミリア",
             english="Emilia",
             category="character",
             source="extracted",
@@ -197,7 +197,7 @@ class TestGlossaryEntry:
         )
         data = e.model_dump()
         restored = GlossaryEntry(**data)
-        assert restored.japanese == "エミリア"
+        assert restored.source_term == "エミリア"
         assert restored.notes == "Half-elf"
         assert restored.source_books == ["rezero-vol5", "rezero-vol6"]
 
@@ -214,7 +214,7 @@ class TestGlossary:
             entries=[
                 GlossaryEntry(english="Subaru", category="character", source="seed"),
                 GlossaryEntry(
-                    japanese="ルグニカ", english="Lugunica", category="place", source="extracted"
+                    source_term="ルグニカ", english="Lugunica", category="place", source="extracted"
                 ),
             ],
             book_id="rezero-5",

@@ -7,11 +7,45 @@ validated but not acted on.
 
 from __future__ import annotations
 
+import json
+import logging
 from pathlib import Path
 from typing import Literal
 
 import yaml
 from pydantic import BaseModel, Field
+
+logger = logging.getLogger("dao_bridge")
+
+# ---------------------------------------------------------------------------
+# Language name resolution
+# ---------------------------------------------------------------------------
+
+_LANG_NAMES_PATH = Path(__file__).parent / "lang_names.json"
+_lang_names_cache: dict[str, str] | None = None
+
+
+def _load_lang_names() -> dict[str, str]:
+    """Load the language code-to-name mapping from ``lang_names.json``."""
+    global _lang_names_cache  # noqa: PLW0603
+    if _lang_names_cache is not None:
+        return _lang_names_cache
+    try:
+        _lang_names_cache = json.loads(_LANG_NAMES_PATH.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError):
+        logger.warning("Could not load lang_names.json — falling back to raw codes")
+        _lang_names_cache = {}
+    return _lang_names_cache
+
+
+def resolve_language_name(code: str) -> str:
+    """Return the human-readable language name for *code*.
+
+    Falls back to the raw code string if not found in ``lang_names.json``.
+    """
+    names = _load_lang_names()
+    return names.get(code, code)
+
 
 # ---------------------------------------------------------------------------
 # Model config (per-task LLM endpoint)

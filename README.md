@@ -1,11 +1,12 @@
 # dao-bridge-translator
 
-AI translation pipeline for Japanese light novel EPUBs using LLM APIs.
+AI translation pipeline for EPUB novels using LLM APIs.
 
-Translates Japanese EPUB files to English through a multi-stage pipeline:
-extraction, cleaning, classification, glossary building, chunking, translation,
-assembly, and EPUB rebuild. Designed to work with any OpenAI-compatible API
-(local llama-server, vLLM, LM Studio, OpenAI, Claude, OpenRouter, etc.).
+Translates EPUB files through a multi-stage pipeline: extraction, cleaning,
+classification, chunking, glossary building, reconciliation, translation,
+assembly, and EPUB rebuild. Language-agnostic (source/target configured in
+`config.yaml`). Designed to work with any OpenAI-compatible API (local
+llama-server, vLLM, LM Studio, OpenAI, Claude, OpenRouter, etc.).
 
 ## Installation
 
@@ -18,8 +19,8 @@ pip install -e ".[dev]"
 ## Quickstart
 
 ```bash
-# 1. Initialise a work directory from a Japanese EPUB
-dao-bridge init /path/to/book.jp.epub --work-dir ./work
+# 1. Initialise a work directory from an EPUB
+dao-bridge init /path/to/book.epub --work-dir ./work
 
 # 2. Extract spine items from the EPUB
 dao-bridge extract --work-dir ./work
@@ -33,10 +34,22 @@ dao-bridge classify --work-dir ./work
 # 5. Chunk cleaned markdown into translation-ready segments
 dao-bridge chunk --work-dir ./work
 
-# 6. (translate — not yet implemented)
+# 6. Build a per-book glossary from chunked text
+dao-bridge glossary-build --work-dir ./work
 
-# 7. Assemble translated chunks into per-spine markdown
+# 7. Resolve within-book glossary conflicts
+dao-bridge glossary-reconcile --work-dir ./work
+
+# 8. Export glossary for human review
+dao-bridge glossary-export --work-dir ./work
+
+# 9. (translate — not yet implemented)
+
+# 10. Assemble translated chunks into per-spine markdown
 dao-bridge assemble --work-dir ./work
+
+# Run all stages through glossary in one command
+dao-bridge run --work-dir ./work
 
 # Check pipeline status at any time
 dao-bridge status --work-dir ./work
@@ -54,11 +67,42 @@ is passed. Add `--verbose` to any command for DEBUG-level console output.
 | `clean` | Convert raw XHTML to markdown in `clean/NNN.md` |
 | `classify` | Classify spine items (chapter, frontmatter, illustration, etc.) |
 | `chunk` | Chunk cleaned markdown into `chunks/NNN/NNN.MMM.json` |
+| `glossary-build` | Extract per-book glossary from chunked source text |
+| `glossary-reconcile` | Resolve within-book glossary conflicts via LLM |
+| `glossary-export` | Export glossary as human-readable markdown |
 | `assemble` | Reassemble translated chunks into `assembled/NNN.md` |
+| `run` | Chain all stages (extract through glossary-reconcile) |
 | `status` | Display pipeline stage completion status |
 
 The `classify`, `chunk`, and `assemble` commands support `--spine N` to process
 a single spine item, and `--force` to reprocess even if already complete.
+
+### Glossary Flow
+
+The glossary stages extract and refine a per-book glossary of proper nouns,
+character names, and notable terms:
+
+1. **glossary-build** -- Greedy-packs chunks into batches and sends each to
+   the LLM for extraction. Entries accumulate across batches; the glossary is
+   saved after each batch for crash-resumability. Conflicting English proposals
+   and corrections are logged for the reconcile stage.
+
+2. **glossary-reconcile** -- Resolves within-book conflicts (differing English
+   translations, corrections) via LLM calls, and consolidates multiple
+   speech-style observations per character. Writes a decision report to
+   `glossary_reconcile_report.md`.
+
+3. **glossary-export** -- Renders the glossary as categorized markdown
+   (`glossary.md`) for human review and editing before the translation stage.
+
+The intended workflow is: build -> reconcile -> export -> **human review and
+editing of glossary.json** -> translate. Human edits to `glossary.json` should
+set `"source": "user"` on modified entries to prevent the build stage from
+overwriting them.
+
+**Master glossary features** (`glossary-crosscheck`, `glossary-promote`,
+`glossary-import-reference`) for multi-book series with consistent terminology
+are planned for a future release.
 
 ### Manual Classification Override
 
@@ -95,7 +139,9 @@ work/
     0000.md
     0001.md
   summaries/           # (future) Rolling translation summaries
-  glossary.json        # (future) Per-book glossary
+  glossary.json        # Per-book glossary (build -> reconcile -> user edit)
+  glossary.md          # Exported glossary for human review
+  glossary_reconcile_report.md  # Reconciliation decisions and reasoning
   logs/
     run.log            # Full debug log
 ```

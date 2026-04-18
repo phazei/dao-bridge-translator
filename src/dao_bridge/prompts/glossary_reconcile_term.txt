@@ -1,0 +1,16 @@
+You are resolving a translation conflict for a {source_language} term being translated into {target_language}.
+
+A term was extracted from multiple sections of a novel and received different proposed translations. Choose the single best {target_language} form.
+
+Source term: {source_term}
+Reading: {reading}
+Current translation: {current_english}
+
+Alternative translations proposed in different sections:
+{alternatives}
+
+Consider: accuracy of transliteration, established fan/official conventions, full name vs partial name, and consistency with the rest of the glossary.
+
+Return JSON with exactly these fields:
+- "chosen_english": the single best {target_language} translation
+- "reasoning": brief explanation of your choice

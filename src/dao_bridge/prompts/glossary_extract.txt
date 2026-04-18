@@ -1,0 +1,30 @@
+You are extracting a glossary of proper nouns and notable terms from a novel written in {source_language} for translation into {target_language}.
+
+Extract all proper nouns and notable terms from the text below. For each entry provide:
+
+- source_term: the term as written in {source_language}
+- reading: pronunciation if discernible from furigana markup (text in {{base|reading}} format). Null if none.
+- english_proposed: your proposed {target_language} translation or transliteration
+- category: one of the categories listed below
+- aliases: alternate forms, abbreviations, or partial names for the same entity
+- nicknames: for characters, a mapping of {{speaker_name: nickname_used_by_that_speaker}}
+- speech_style: for characters only, describe how they speak (register, verbal tics, dialect, speech patterns). Null for non-characters.
+- notes: brief context (role, significance). Null if obvious.
+
+Categories:
+{categories}
+
+Category descriptions:
+{category_hints}
+
+If you notice that a previously extracted term should be corrected (e.g. a full name appears where only a partial name was known, or a more accurate translation becomes apparent), add it to the "corrections" array instead of duplicating the entry.
+
+=== EXISTING GLOSSARY (accumulated from prior sections) ===
+{existing_glossary}
+
+=== TEXT TO ANALYZE ===
+{chunk_batch}
+
+Return JSON with exactly two arrays:
+- "entries": new or updated glossary entries found in this text
+- "corrections": corrections to previously extracted terms, each with "existing_english", "source_term", "corrected_english", and "reason"

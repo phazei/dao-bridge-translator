@@ -24,9 +24,9 @@ from pathlib import Path
 
 import tiktoken
 
-from dao_bridge.config import AppConfig
+from dao_bridge.config import AppConfig, resolve_language_name
 from dao_bridge.llm_client import LLMClient, LLMStructuredOutputError
-from dao_bridge.schemas import Classification, ClassificationResponse, Manifest, ManifestItem
+from dao_bridge.schemas import ClassificationResponse, Manifest, ManifestItem
 from dao_bridge.state import (
     PipelineState,
     is_stage_completed,
@@ -50,7 +50,7 @@ _RAW_EXCERPT_CHARS = 500
 _CLEAN_EXCERPT_TOKENS = 1500  # truncate clean excerpt to ~1500 tokens
 
 _PROMPT_TEMPLATE_PATH = Path(__file__).parent / "prompts" / "classify.txt"
-_LANG_NAMES_PATH = Path(__file__).parent / "lang_names.json"
+
 
 # Threshold for the illustration structural hint (token count).
 _ILLUSTRATION_MAX_TOKENS = 30
@@ -85,35 +85,6 @@ def _truncate_to_tokens(text: str, max_tokens: int) -> str:
     if len(tokens) <= max_tokens:
         return text
     return enc.decode(tokens[:max_tokens])
-
-
-# ---------------------------------------------------------------------------
-# Language name resolution
-# ---------------------------------------------------------------------------
-
-_lang_names_cache: dict[str, str] | None = None
-
-
-def _load_lang_names() -> dict[str, str]:
-    """Load the language code-to-name mapping from ``lang_names.json``."""
-    global _lang_names_cache  # noqa: PLW0603
-    if _lang_names_cache is not None:
-        return _lang_names_cache
-    try:
-        _lang_names_cache = json.loads(_LANG_NAMES_PATH.read_text(encoding="utf-8"))
-    except (FileNotFoundError, json.JSONDecodeError):
-        logger.warning("Could not load lang_names.json — falling back to raw codes")
-        _lang_names_cache = {}
-    return _lang_names_cache
-
-
-def resolve_language_name(code: str) -> str:
-    """Return the human-readable language name for *code*.
-
-    Falls back to the raw code string if not found in ``lang_names.json``.
-    """
-    names = _load_lang_names()
-    return names.get(code, code)
 
 
 # ---------------------------------------------------------------------------

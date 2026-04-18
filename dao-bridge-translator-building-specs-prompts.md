@@ -188,7 +188,7 @@
 > - `Manifest`: `source_epub_path` (str), `book_id` (str — derived from EPUB metadata at init: prefer ISBN, fall back to normalized title+volume, fall back to filename stem), `spine_padding_width` (int, default 4 — computed at extract time as `max(4, len(str(spine_count)))`; all spine-related path helpers and ID formatters consult this width), `spine` (list[ManifestItem]), `images` (list[str] — image item paths), `metadata` (dict — original EPUB metadata: title, author, language, identifier, etc.).
 > - `Chunk`: `chunk_id` (str, format "NNNN.MMM" — spine portion uses dynamic padding width, chunk portion always 3 digits), `spine_index` (int), `chunk_index` (int — per-spine, starting at 1), `source_file` (str — path to clean markdown file), `block_range` (tuple[int, int] — inclusive start, inclusive end of block indices in source file), `token_count` (int), `extended_for_remainder` (bool), `text` (str), `ends_at_scene_break` (bool).
 >   - Note: no `mode` field, no `overlap_range`, no `new_text_starts_at_block`. Chunks are phase-agnostic. Each phase assembles calls from them.
-> - `GlossaryEntry`: `japanese` (str | None — None for English-reference-only entries from import-reference), `reading` (str | None — from furigana), `english` (str), `category` (str — validated against `config.glossary.categories` at load time), `first_seen_chunk` (str | None), `aliases` (list[str] = []), `nicknames` (dict[str, str] = {} — `{speaker_english_name: nickname_english}`, only used by specific speakers), `speech_style` (str | None = None — prose description, characters only), `notes` (str | None = None), `source` (literal: `"seed" | "extracted" | "user" | "master"`), `source_books` (list[str] = [] — populated for master-glossary entries).
+> - `GlossaryEntry`: `source_term` (str | None — the term in the source language; None for target-language-reference-only entries from import-reference), `reading` (str | None — from furigana), `english` (str), `category` (str — validated against `config.glossary.categories` at load time), `first_seen_chunk` (str | None), `aliases` (list[str] = []), `nicknames` (dict[str, str] = {} — `{speaker_english_name: nickname_english}`, only used by specific speakers), `speech_style` (str | None = None — prose description, characters only), `notes` (str | None = None), `source` (literal: `"seed" | "extracted" | "user" | "master"`), `source_books` (list[str] = [] — populated for master-glossary entries).
 > - `Glossary`: `entries` (list[GlossaryEntry]), `version` (int — bumped on merges), `book_id` (str | None — None for master, set for per-book), `book_metadata` (dict = {} — title, author, volume; per-book only), `created_at` (datetime), `updated_at` (datetime).
 > - `TranslatedChunk`: `chunk_id` (str), `source_text` (str — copy of Japanese source), `pass1_translation` (str — Pass 1 output, kept for debugging), `translated_text` (str — final translation: Pass 2 if double_pass, else Pass 1), `pass_count` (int — 1 or 2), `qa_result` (str | None — `"pass" | "fail"` | None if QA disabled), `qa_issues` (list[str] = [] — issues from QA, empty if passed), `total_attempts` (int — count of full chunk translation attempts, each = Pass 1 + optional Pass 2 + QA), `overlap_chunk_id` (str | None — which chunk provided overlap context), `summary_generated` (str | None — rolling summary snippet for this chunk), `token_usage` (dict — `{prompt_tokens, completion_tokens, total_tokens}` summed across all calls for the final successful attempt), `model_used` (str), `created_at` (datetime), `duration_seconds` (float — wall clock for all passes + assessment + summary of final attempt).
 > 
@@ -677,7 +677,7 @@
 
 ## **Prompt 3b: Glossary Module for dao-bridge-translator**
 
-> Build the glossary stage for `dao-bridge-translator`. This builds on Prompts 1, 2, and 3a. The glossary stage extracts proper nouns and character information from the chunked Japanese text, reconciles within-book conflicts, and exports the glossary for human review and editing.
+> Build the glossary stage for `dao-bridge-translator`. This builds on Prompts 1, 2, and 3a. The glossary stage extracts proper nouns and character information from the chunked source text, reconciles within-book conflicts, and exports the glossary for human review and editing.
 > 
 > **Scope:**
 > - `src/dao_bridge/glossary.py` — build, reconcile, and export operations
@@ -702,14 +702,14 @@
 > 
 > ### glossary-build
 > 
-> Extracts the per-book glossary from Japanese chunks.
+> Extracts the per-book glossary from source-language chunks.
 > 
 > **Packing:** greedy-pack chunks across all spines (in spine + chunk order) until adding the next chunk would exceed `glossary_phase.target_tokens_per_call`. Emit a batch, start a new one. Last batch emitted as-is regardless of size.
 > 
 > **Per-batch LLM call:**
 > 
 > Prompt includes:
-> - Instructions on what to extract: proper nouns from the configured categories, with Japanese form, reading (from `{kanji|reading}` furigana markup), proposed English translation, category, aliases, speech style and nicknames for characters.
+> - Instructions on what to extract: proper nouns from the configured categories, with source-language form (`source_term`), reading (from `{kanji|reading}` furigana markup), proposed English translation, category, aliases, speech style and nicknames for characters.
 > - The configured category list with hints.
 > - The existing per-book glossary so far (accumulated from previous batches). Rendered compactly, grouped by category. If this exceeds half the model's context, truncate to the most recently added entries with a note.
 > - The batch's chunk text (the `text` field from each chunk, joined with chunk separators).
@@ -720,7 +720,7 @@
 > {
 >   "entries": [
 >     {
->       "japanese": "ナツキ・スバル",
+>       "source_term": "ナツキ・スバル",
 >       "reading": "ナツキ・スバル",
 >       "english_proposed": "Natsuki Subaru",
 >       "category": "character",
@@ -733,7 +733,7 @@
 >   "corrections": [
 >     {
 >       "existing_english": "Priscilla",
->       "japanese": "プリシラ・バーリエル",
+>       "source_term": "プリシラ・バーリエル",
 >       "corrected_english": "Priscilla Barielle",
 >       "reason": "Full name appears in this section."
 >     }
@@ -743,8 +743,8 @@
 > 
 > **Merge logic** per returned entry:
 > 
-> - If Japanese form not in per-book glossary: add with `source: extracted`, `first_seen_chunk` set to the first chunk in this batch where the term appears (or the batch's first chunk if not trackable).
-> - If Japanese form exists (from a prior batch): union aliases, merge nicknames dict, concatenate speech_style observations (dedup identical sentences), preserve existing English. Log differing English proposals in an internal conflict list.
+> - If `source_term` not in per-book glossary: add with `source: extracted`, `first_seen_chunk` set to the first chunk in this batch where the term appears (or the batch's first chunk if not trackable).
+> - If `source_term` exists (from a prior batch): union aliases, merge nicknames dict, concatenate speech_style observations (dedup identical sentences), preserve existing English. Log differing English proposals in an internal conflict list.
 > - If `source: user`: never modify.
 > 
 > **Corrections** are logged to an internal conflict list; not applied here. Reconcile handles them.
@@ -765,7 +765,7 @@
 > **Resolution:**
 > 
 > For each conflict, call the LLM with:
-> - The Japanese term and its reading.
+> - The source-language term (`source_term`) and its reading.
 > - The current English form in the glossary.
 > - Alternative English forms proposed, each with a short context snippet from the chunk where it was proposed.
 > - A request for the best single English form, with reasoning.
@@ -782,7 +782,7 @@
 > 
 > **Output:** `<work_dir>/glossary.md` (or stdout with `--stdout`).
 > 
-> Format: grouped by category, entries sorted alphabetically within each category by English form. Each entry shows Japanese, reading (if any), English, aliases, nicknames (if any), speech style (if any), notes (if any).
+> Format: grouped by category, entries sorted alphabetically within each category by English form. Each entry shows source_term, reading (if any), English, aliases, nicknames (if any), speech style (if any), notes (if any).
 > 
 > ---
 > 
@@ -790,9 +790,9 @@
 > 
 > Create these in `src/dao_bridge/prompts/`:
 > 
-> - `glossary_extract.txt` — build-stage extraction prompt. Variables: `{categories}`, `{category_hints}`, `{existing_glossary}`, `{chunk_batch}`.
-> - `glossary_reconcile_term.txt` — reconcile prompt for term conflicts. Variables: `{japanese}`, `{reading}`, `{current_english}`, `{alternatives}`.
-> - `glossary_reconcile_speech.txt` — reconcile prompt for speech-style consolidation. Variables: `{character_name}`, `{observations}`.
+> - `glossary_extract.txt` — build-stage extraction prompt. Variables: `{source_language}`, `{target_language}`, `{categories}`, `{category_hints}`, `{existing_glossary}`, `{chunk_batch}`.
+> - `glossary_reconcile_term.txt` — reconcile prompt for term conflicts. Variables: `{source_language}`, `{target_language}`, `{source_term}`, `{reading}`, `{current_english}`, `{alternatives}`.
+> - `glossary_reconcile_speech.txt` — reconcile prompt for speech-style consolidation. Variables: `{source_language}`, `{character_name}`, `{observations}`.
 > 
 > All prompts under 800 tokens. Use simple `{variable}` substitution, no Jinja.
 > 
@@ -877,7 +877,7 @@
 > ### 1. Gather context
 > 
 > **Glossary rendering:**
-> If `glossary_injection: "relevant"`: scan the chunk's `text` for each glossary entry's `japanese` field (substring match). Include only matching entries. If `glossary_injection: "all"`: include the entire glossary.
+> If `glossary_injection: "relevant"`: scan the chunk's `text` for each glossary entry's `source_term` field (substring match). Include only matching entries. If `glossary_injection: "all"`: include the entire glossary.
 > 
 > Render format, grouped by category:
 > ```

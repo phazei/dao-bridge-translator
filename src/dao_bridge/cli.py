@@ -471,27 +471,231 @@ def assemble(ctx: click.Context, work_dir: str, spine_index: int | None, force: 
 
 
 # ---------------------------------------------------------------------------
+# glossary-build
+# ---------------------------------------------------------------------------
+
+
+@cli.command("glossary-build")
+@click.option(
+    "--work-dir", type=click.Path(exists=True), default="./work", help="Work directory path."
+)
+@click.option("--force", is_flag=True, help="Rebuild glossary from scratch.")
+@click.pass_context
+def glossary_build_cmd(ctx: click.Context, work_dir: str, force: bool) -> None:
+    """Extract a per-book glossary from chunked source text.
+
+    Greedy-packs chunks into batches and sends each batch to the LLM for
+    glossary extraction.  Entries are merged progressively and saved after
+    each batch, making the stage resumable.
+
+    Requires: extract, clean, classify, chunk stages completed.
+    """
+    work = Path(work_dir).resolve()
+    setup_logging(work, ctx.obj["verbose"])
+    config = _resolve_config(work)
+    state = load_state(work)
+
+    from rich.progress import Progress
+
+    from dao_bridge.glossary import glossary_build
+
+    with Progress(transient=True) as progress:
+        task = progress.add_task("Building glossary...", total=None)
+
+        glossary = glossary_build(
+            work,
+            config,
+            state,
+            force=force,
+            on_progress=lambda _: progress.advance(task),
+        )
+
+    click.echo(f"Glossary build complete: {len(glossary.entries)} entries extracted.")
+
+
+# ---------------------------------------------------------------------------
+# glossary-reconcile
+# ---------------------------------------------------------------------------
+
+
+@cli.command("glossary-reconcile")
+@click.option(
+    "--work-dir", type=click.Path(exists=True), default="./work", help="Work directory path."
+)
+@click.option("--force", is_flag=True, help="Re-reconcile from scratch.")
+@click.pass_context
+def glossary_reconcile_cmd(ctx: click.Context, work_dir: str, force: bool) -> None:
+    """Resolve within-book glossary conflicts from the build stage.
+
+    Resolves differing English proposals and corrections via LLM calls,
+    and consolidates multiple speech-style observations per character.
+    Writes a reconciliation report to glossary_reconcile_report.md.
+
+    Requires: glossary-build stage completed.
+    """
+    work = Path(work_dir).resolve()
+    setup_logging(work, ctx.obj["verbose"])
+    config = _resolve_config(work)
+    state = load_state(work)
+
+    from rich.progress import Progress
+
+    from dao_bridge.glossary import glossary_reconcile
+
+    with Progress(transient=True) as progress:
+        task = progress.add_task("Reconciling glossary...", total=None)
+
+        glossary = glossary_reconcile(
+            work,
+            config,
+            state,
+            force=force,
+            on_progress=lambda _: progress.advance(task),
+        )
+
+    click.echo(f"Glossary reconcile complete: {len(glossary.entries)} entries.")
+    click.echo(f"Report: {work / 'glossary_reconcile_report.md'}")
+
+
+# ---------------------------------------------------------------------------
+# glossary-export
+# ---------------------------------------------------------------------------
+
+
+@cli.command("glossary-export")
+@click.option(
+    "--work-dir", type=click.Path(exists=True), default="./work", help="Work directory path."
+)
+@click.option("--stdout", "use_stdout", is_flag=True, help="Print to stdout instead of file.")
+@click.option(
+    "--output", "output_path", type=click.Path(), default=None, help="Custom output path."
+)
+@click.pass_context
+def glossary_export_cmd(
+    ctx: click.Context, work_dir: str, use_stdout: bool, output_path: str | None
+) -> None:
+    """Export the per-book glossary as human-readable markdown.
+
+    By default writes to <work_dir>/glossary.md.  Use --stdout to print
+    to the console, or --output to specify a custom path.
+    """
+    work = Path(work_dir).resolve()
+    setup_logging(work, ctx.obj["verbose"])
+    config = _resolve_config(work)
+
+    from dao_bridge.glossary import glossary_export
+
+    out = Path(output_path) if output_path else None
+
+    md = glossary_export(work, config, stdout=use_stdout, output_path=out)
+
+    if use_stdout:
+        click.echo(md)
+    else:
+        dest = out or (work / "glossary.md")
+        click.echo(f"Glossary exported to {dest}")
+
+
+# ---------------------------------------------------------------------------
+# run (chains all implemented stages)
+# ---------------------------------------------------------------------------
+
+
+@cli.command()
+@click.option(
+    "--work-dir", type=click.Path(exists=True), default="./work", help="Work directory path."
+)
+@click.option("--force", is_flag=True, help="Force re-run of all stages.")
+@click.pass_context
+def run(ctx: click.Context, work_dir: str, force: bool) -> None:
+    """Run the full pipeline through glossary stages.
+
+    Chains: extract -> clean -> classify -> chunk -> glossary-build ->
+    glossary-reconcile.  Each stage skips completed work unless --force
+    is passed.
+    """
+    work = Path(work_dir).resolve()
+    setup_logging(work, ctx.obj["verbose"])
+    config = _resolve_config(work)
+    state = load_state(work)
+
+    mp = manifest_path(work)
+    if not mp.exists():
+        raise click.ClickException("Manifest not found. Run 'dao-bridge init <epub>' first.")
+
+    from dao_bridge.schemas import Manifest
+
+    manifest = Manifest(**json.loads(mp.read_text(encoding="utf-8")))
+
+    # --- Stage 1: extract ---
+    click.echo("=== extract ===")
+    from dao_bridge.extract import extract_epub
+
+    manifest = extract_epub(config, state, force=force)
+    click.echo(f"  {len(manifest.spine)} spine items, {len(manifest.images)} images")
+
+    # --- Stage 2: clean ---
+    click.echo("=== clean ===")
+    from dao_bridge.clean import clean_all
+
+    manifest = clean_all(config, manifest, state, force=force)
+    total_tokens = sum(i.token_count or 0 for i in manifest.spine)
+    click.echo(f"  {len(manifest.spine)} items ({total_tokens:,} total tokens)")
+
+    # --- Stage 3: classify ---
+    click.echo("=== classify ===")
+    from dao_bridge.classify import run_classify_stage
+
+    manifest = run_classify_stage(work, config, state, force=force)
+    from collections import Counter
+
+    counts = Counter(item.classification for item in manifest.spine)
+    click.echo(f"  {dict(counts)}")
+
+    # --- Stage 4: chunk ---
+    click.echo("=== chunk ===")
+    from dao_bridge.chunk import chunk_all
+
+    manifest = chunk_all(config, manifest, state, force=force)
+    total_chunks = sum(i.chunk_count or 0 for i in manifest.spine)
+    click.echo(f"  {total_chunks} total chunks")
+
+    # --- Stage 5: glossary-build ---
+    click.echo("=== glossary-build ===")
+    from dao_bridge.glossary import glossary_build, glossary_reconcile
+
+    glossary = glossary_build(work, config, state, force=force)
+    click.echo(f"  {len(glossary.entries)} entries extracted")
+
+    # --- Stage 6: glossary-reconcile ---
+    click.echo("=== glossary-reconcile ===")
+    glossary = glossary_reconcile(work, config, state, force=force)
+    click.echo(f"  {len(glossary.entries)} entries (reconciled)")
+
+    click.echo("\nPipeline complete through glossary stages.")
+
+
+# ---------------------------------------------------------------------------
 # Placeholder commands (not yet implemented)
 # ---------------------------------------------------------------------------
 
 _PLACEHOLDER_COMMANDS = [
     "translate",
     "rebuild",
-    "run",
-    "glossary-build",
-    "glossary-reconcile",
+]
+
+_MASTER_GLOSSARY_COMMANDS = [
     "glossary-crosscheck",
     "glossary-promote",
     "glossary-import-reference",
-    "glossary-export",
 ]
 
 
-def _make_placeholder(name: str):
+def _make_placeholder(name: str, message: str | None = None):
     @cli.command(name=name)
     @click.pass_context
     def placeholder(ctx: click.Context) -> None:
-        click.echo(f"'{name}' is not yet implemented.")
+        click.echo(message or f"'{name}' is not yet implemented.")
         sys.exit(0)
 
     placeholder.__doc__ = f"{name} (not yet implemented)."
@@ -500,3 +704,10 @@ def _make_placeholder(name: str):
 
 for _cmd_name in _PLACEHOLDER_COMMANDS:
     _make_placeholder(_cmd_name)
+
+for _cmd_name in _MASTER_GLOSSARY_COMMANDS:
+    _make_placeholder(
+        _cmd_name,
+        f"'{_cmd_name}' is not yet implemented — master glossary features "
+        "coming in a future release.",
+    )

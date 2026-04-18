@@ -27,7 +27,18 @@ dao-bridge extract --work-dir ./work
 # 3. Clean XHTML to markdown
 dao-bridge clean --work-dir ./work
 
-# 4. Check pipeline status
+# 4. Classify spine items (requires LLM — not yet implemented)
+# dao-bridge classify --work-dir ./work
+
+# 5. Chunk cleaned markdown into translation-ready segments
+dao-bridge chunk --work-dir ./work
+
+# 6. (translate — not yet implemented)
+
+# 7. Assemble translated chunks into per-spine markdown
+dao-bridge assemble --work-dir ./work
+
+# Check pipeline status at any time
 dao-bridge status --work-dir ./work
 ```
 
@@ -41,7 +52,12 @@ is passed. Add `--verbose` to any command for DEBUG-level console output.
 | `init <epub>` | Create work directory, write default `config.yaml` |
 | `extract` | Extract EPUB spine items to `raw/NNN.xhtml` |
 | `clean` | Convert raw XHTML to markdown in `clean/NNN.md` |
+| `chunk` | Chunk cleaned markdown into `chunks/NNN/NNN.MMM.json` |
+| `assemble` | Reassemble translated chunks into `assembled/NNN.md` |
 | `status` | Display pipeline stage completion status |
+
+The `chunk` and `assemble` commands support `--spine N` to process a single
+spine item, and `--force` to reprocess even if already complete.
 
 ## Work Directory Layout
 
@@ -58,9 +74,16 @@ work/
     000.md
     001.md
     ...
-  chunks/              # (future) Chunked content for translation
+  chunks/              # Chunked content for translation
+    000/               #   Per-spine chunk directories
+      000.001.json     #     Chunk JSON (Chunk schema)
+      000.002.json
+    001/
+      001.001.json
   translations/        # (future) Per-chunk translations
-  assembled/           # (future) Reassembled translated markdown
+  assembled/           # Reassembled translated markdown
+    000.md
+    001.md
   summaries/           # (future) Rolling translation summaries
   glossary.json        # (future) Per-book glossary
   logs/

@@ -289,14 +289,113 @@ def status(ctx: click.Context, work_dir: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# chunk
+# ---------------------------------------------------------------------------
+
+
+@cli.command()
+@click.option(
+    "--work-dir", type=click.Path(exists=True), default="./work", help="Work directory path."
+)
+@click.option("--spine", "spine_index", type=int, default=None, help="Chunk only this spine index.")
+@click.option("--force", is_flag=True, help="Rechunk even if already completed.")
+@click.pass_context
+def chunk(ctx: click.Context, work_dir: str, spine_index: int | None, force: bool) -> None:
+    """Chunk cleaned markdown into translation-ready segments."""
+    work = Path(work_dir).resolve()
+    setup_logging(work, ctx.obj["verbose"])
+    config = _resolve_config(work)
+    state = load_state(work)
+
+    # Load manifest.
+    mp = manifest_path(work)
+    if not mp.exists():
+        raise click.ClickException("Manifest not found. Run 'dao-bridge extract' first.")
+
+    from dao_bridge.schemas import Manifest
+
+    manifest = Manifest(**json.loads(mp.read_text(encoding="utf-8")))
+
+    from rich.progress import Progress
+
+    from dao_bridge.chunk import chunk_all
+
+    with Progress(transient=True) as progress:
+        n_items = len(manifest.spine)
+        task = progress.add_task("Chunking...", total=n_items)
+
+        # We call chunk_all which handles per-item iteration internally.
+        # Advance progress after completion.
+        manifest = chunk_all(
+            config,
+            manifest,
+            state,
+            force=force,
+            spine_filter=spine_index,
+        )
+        progress.update(task, completed=n_items)
+
+    total_chunks = sum(i.chunk_count or 0 for i in manifest.spine)
+    click.echo(f"Chunked {len(manifest.spine)} items ({total_chunks} total chunks)")
+
+
+# ---------------------------------------------------------------------------
+# assemble
+# ---------------------------------------------------------------------------
+
+
+@cli.command()
+@click.option(
+    "--work-dir", type=click.Path(exists=True), default="./work", help="Work directory path."
+)
+@click.option(
+    "--spine", "spine_index", type=int, default=None, help="Assemble only this spine index."
+)
+@click.option("--force", is_flag=True, help="Reassemble even if already completed.")
+@click.pass_context
+def assemble(ctx: click.Context, work_dir: str, spine_index: int | None, force: bool) -> None:
+    """Assemble translated chunks into per-spine markdown files."""
+    work = Path(work_dir).resolve()
+    setup_logging(work, ctx.obj["verbose"])
+    config = _resolve_config(work)
+    state = load_state(work)
+
+    # Load manifest.
+    mp = manifest_path(work)
+    if not mp.exists():
+        raise click.ClickException("Manifest not found. Run 'dao-bridge extract' first.")
+
+    from dao_bridge.schemas import Manifest
+
+    manifest = Manifest(**json.loads(mp.read_text(encoding="utf-8")))
+
+    from rich.progress import Progress
+
+    from dao_bridge.assemble import assemble_all
+
+    with Progress(transient=True) as progress:
+        n_items = len(manifest.spine)
+        task = progress.add_task("Assembling...", total=n_items)
+
+        manifest = assemble_all(
+            config,
+            manifest,
+            state,
+            force=force,
+            spine_filter=spine_index,
+        )
+        progress.update(task, completed=n_items)
+
+    click.echo("Assembly complete.")
+
+
+# ---------------------------------------------------------------------------
 # Placeholder commands (not yet implemented)
 # ---------------------------------------------------------------------------
 
 _PLACEHOLDER_COMMANDS = [
     "classify",
-    "chunk",
     "translate",
-    "assemble",
     "rebuild",
     "run",
     "glossary-build",

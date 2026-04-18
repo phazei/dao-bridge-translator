@@ -1,7 +1,7 @@
-"""Integration tests: EPUB -> init -> extract -> clean -> verify.
+"""Integration tests: EPUB -> init -> extract -> clean -> chunk -> assemble.
 
-Uses the Japanese mini EPUB fixture to exercise the full extract + clean
-pipeline end-to-end.
+Uses the Japanese mini EPUB fixture to exercise the full pipeline
+end-to-end through chunk and assemble stages.
 """
 
 from __future__ import annotations
@@ -12,14 +12,19 @@ from pathlib import Path
 from dao_bridge.clean import clean_all
 from dao_bridge.config import load_config
 from dao_bridge.extract import extract_epub
+from dao_bridge.schemas import Manifest, TranslatedChunk
 from dao_bridge.state import (
     is_stage_completed,
     load_state,
 )
 from dao_bridge.workdir import (
+    assembled_path,
+    chunk_dir,
     ensure_dirs,
+    format_chunk_id,
     manifest_path,
     state_path,
+    translation_path,
 )
 
 # ---------------------------------------------------------------------------
@@ -238,3 +243,151 @@ class TestCleanOutputQuality:
                 md = (work_dir / item.clean_path).read_text(encoding="utf-8")
                 assert "<script" not in md.lower()
                 assert "<style" not in md.lower()
+
+
+# ---------------------------------------------------------------------------
+# Full pipeline: extract -> clean -> (manual classify) -> chunk -> assemble
+# ---------------------------------------------------------------------------
+
+
+class TestChunkAssemblePipeline:
+    """End-to-end test: extract -> clean -> classify (manual) -> chunk -> (inject translations) -> assemble."""
+
+    def test_full_chunk_assemble_pipeline(self, jp_epub_path: Path, tmp_path: Path):
+        work_dir = tmp_path / "work"
+        ensure_dirs(work_dir)
+        cfg_path = _write_config(work_dir, jp_epub_path)
+        config = load_config(cfg_path)
+        state = load_state(work_dir)
+
+        # --- Extract ---
+        manifest = extract_epub(config, state, force=False)
+
+        # --- Clean ---
+        manifest = clean_all(config, manifest, state, force=False)
+
+        # --- Manual classification (classify stage not yet implemented) ---
+        # Set all items to 'chapter' so they are chunkable.
+        for item in manifest.spine:
+            item.classification = "chapter"
+        # Also set one item to 'illustration' to test skipping.
+        if len(manifest.spine) >= 2:
+            manifest.spine[0].classification = "illustration"
+
+        # Persist manifest with classifications.
+        from dao_bridge.workdir import atomic_write
+
+        mp = manifest_path(work_dir)
+        atomic_write(mp, manifest.model_dump_json(indent=2))
+
+        # --- Chunk ---
+        from dao_bridge.chunk import chunk_all
+
+        state = load_state(work_dir)
+        manifest = chunk_all(config, manifest, state, force=False)
+
+        # Verify chunk stage completed.
+        reloaded_state = load_state(work_dir)
+        assert is_stage_completed(reloaded_state, "chunk")
+
+        # Verify chunk_count set for all items.
+        for item in manifest.spine:
+            assert item.chunk_count is not None
+
+        # The illustration item should have chunk_count=0.
+        assert manifest.spine[0].chunk_count == 0
+
+        # At least some items should have chunks.
+        chunked_items = [i for i in manifest.spine if (i.chunk_count or 0) > 0]
+        assert len(chunked_items) > 0
+
+        # Verify chunk files exist.
+        for item in chunked_items:
+            cd = chunk_dir(work_dir, item.spine_index)
+            chunk_files = list(cd.glob("*.json"))
+            assert len(chunk_files) == item.chunk_count
+
+        # --- Inject mock translations ---
+        for item in manifest.spine:
+            n = item.chunk_count or 0
+            for ci in range(1, n + 1):
+                chunk_id = format_chunk_id(item.spine_index, ci)
+                # Read the source chunk to get its text.
+                from dao_bridge.workdir import chunk_path
+
+                cp = chunk_path(work_dir, chunk_id)
+                chunk_data = json.loads(cp.read_text(encoding="utf-8"))
+                source_text = chunk_data["text"]
+
+                # Create a mock translation.
+                tc = TranslatedChunk(
+                    chunk_id=chunk_id,
+                    source_text=source_text,
+                    pass1_translation=f"[Translated] {source_text[:100]}...",
+                    translated_text=f"[Translated] {source_text[:100]}...",
+                    pass_count=1,
+                    total_attempts=1,
+                    model_used="test-model",
+                )
+                tp = translation_path(work_dir, chunk_id)
+                tp.parent.mkdir(parents=True, exist_ok=True)
+                tp.write_text(tc.model_dump_json(indent=2), encoding="utf-8")
+
+        # --- Assemble ---
+        from dao_bridge.assemble import assemble_all
+
+        state = load_state(work_dir)
+        manifest = assemble_all(config, manifest, state, force=False)
+
+        # Verify assemble stage completed.
+        reloaded_state = load_state(work_dir)
+        assert is_stage_completed(reloaded_state, "assemble")
+
+        # Verify assembled files exist for chunked items.
+        for item in chunked_items:
+            ap = assembled_path(work_dir, item.spine_index)
+            assert ap.exists(), f"Assembled file missing for spine {item.spine_index}"
+            content = ap.read_text(encoding="utf-8")
+            assert len(content.strip()) > 0
+            assert "[Translated]" in content
+
+        # Illustration item should NOT have an assembled file.
+        ap_illus = assembled_path(work_dir, manifest.spine[0].spine_index)
+        assert not ap_illus.exists()
+
+    def test_chunk_idempotent_without_force(self, jp_epub_path: Path, tmp_path: Path):
+        """Running chunk twice without --force is a no-op."""
+        work_dir = tmp_path / "work"
+        ensure_dirs(work_dir)
+        cfg_path = _write_config(work_dir, jp_epub_path)
+        config = load_config(cfg_path)
+        state = load_state(work_dir)
+
+        manifest = extract_epub(config, state, force=False)
+        manifest = clean_all(config, manifest, state, force=False)
+
+        # Classify all as chapter.
+        for item in manifest.spine:
+            item.classification = "chapter"
+        from dao_bridge.workdir import atomic_write
+
+        mp = manifest_path(work_dir)
+        atomic_write(mp, manifest.model_dump_json(indent=2))
+
+        from dao_bridge.chunk import chunk_all
+
+        state = load_state(work_dir)
+        manifest = chunk_all(config, manifest, state, force=False)
+        first_counts = [i.chunk_count for i in manifest.spine]
+
+        # Second run — should be no-op.
+        state2 = load_state(work_dir)
+        manifest2 = Manifest(**json.loads(mp.read_text(encoding="utf-8")))
+        # Re-set classifications since they are loaded fresh from disk.
+        for item in manifest2.spine:
+            if item.classification is None:
+                item.classification = "chapter"
+        manifest2 = chunk_all(config, manifest2, state2, force=False)
+        second_counts = [i.chunk_count for i in manifest2.spine]
+
+        assert first_counts == second_counts

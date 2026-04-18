@@ -1,1 +1,148 @@
-"""Work directory path helpers and atomic file operations."""
+"""Work directory path helpers and atomic file operations.
+
+Every module uses these helpers instead of constructing paths manually.
+All JSON writes go through ``atomic_write`` to prevent corruption on crash.
+"""
+
+from __future__ import annotations
+
+import os
+from pathlib import Path
+
+# ---------------------------------------------------------------------------
+# Padding / formatting helpers
+# ---------------------------------------------------------------------------
+
+
+def pad_spine(spine_index: int) -> str:
+    """Return a zero-padded 3-digit string for *spine_index*."""
+    return f"{spine_index:03d}"
+
+
+def format_chunk_id(spine_index: int, chunk_index: int) -> str:
+    """Return ``"NNN.MMM"`` chunk identifier."""
+    return f"{pad_spine(spine_index)}.{chunk_index:03d}"
+
+
+def parse_chunk_id(chunk_id: str) -> tuple[int, int]:
+    """Parse ``"NNN.MMM"`` back to ``(spine_index, chunk_index)``."""
+    parts = chunk_id.split(".")
+    if len(parts) != 2:
+        raise ValueError(f"Invalid chunk_id format: {chunk_id!r}")
+    return int(parts[0]), int(parts[1])
+
+
+# ---------------------------------------------------------------------------
+# Path helpers
+# ---------------------------------------------------------------------------
+
+
+def raw_path(work_dir: Path, spine_index: int) -> Path:
+    """``raw/NNN.xhtml``"""
+    return work_dir / "raw" / f"{pad_spine(spine_index)}.xhtml"
+
+
+def clean_path(work_dir: Path, spine_index: int) -> Path:
+    """``clean/NNN.md``"""
+    return work_dir / "clean" / f"{pad_spine(spine_index)}.md"
+
+
+def chunk_dir(work_dir: Path, spine_index: int) -> Path:
+    """``chunks/NNN/``"""
+    return work_dir / "chunks" / pad_spine(spine_index)
+
+
+def chunk_path(work_dir: Path, chunk_id: str) -> Path:
+    """``chunks/NNN/NNN.MMM.json``"""
+    spine_index, _ = parse_chunk_id(chunk_id)
+    return work_dir / "chunks" / pad_spine(spine_index) / f"{chunk_id}.json"
+
+
+def translation_dir(work_dir: Path, spine_index: int) -> Path:
+    """``translations/NNN/``"""
+    return work_dir / "translations" / pad_spine(spine_index)
+
+
+def translation_path(work_dir: Path, chunk_id: str) -> Path:
+    """``translations/NNN/NNN.MMM.json``"""
+    spine_index, _ = parse_chunk_id(chunk_id)
+    return work_dir / "translations" / pad_spine(spine_index) / f"{chunk_id}.json"
+
+
+def assembled_path(work_dir: Path, spine_index: int) -> Path:
+    """``assembled/NNN.md``"""
+    return work_dir / "assembled" / f"{pad_spine(spine_index)}.md"
+
+
+def summary_path(work_dir: Path) -> Path:
+    """``summaries/rolling_summary.json``"""
+    return work_dir / "summaries" / "rolling_summary.json"
+
+
+def glossary_path(work_dir: Path) -> Path:
+    """``glossary.json``"""
+    return work_dir / "glossary.json"
+
+
+def manifest_path(work_dir: Path) -> Path:
+    """``manifest.json``"""
+    return work_dir / "manifest.json"
+
+
+def state_path(work_dir: Path) -> Path:
+    """``state.json``"""
+    return work_dir / "state.json"
+
+
+def log_dir(work_dir: Path) -> Path:
+    """``logs/``"""
+    return work_dir / "logs"
+
+
+# ---------------------------------------------------------------------------
+# Directory creation
+# ---------------------------------------------------------------------------
+
+_SUBDIRS = [
+    "raw",
+    "clean",
+    "chunks",
+    "translations",
+    "assembled",
+    "summaries",
+    "logs",
+]
+
+
+def ensure_dirs(work_dir: Path) -> None:
+    """Create the work directory and all standard subdirectories."""
+    for subdir in _SUBDIRS:
+        (work_dir / subdir).mkdir(parents=True, exist_ok=True)
+
+
+# ---------------------------------------------------------------------------
+# Atomic file write
+# ---------------------------------------------------------------------------
+
+
+def atomic_write(path: Path, data: str | bytes) -> None:
+    """Write *data* to *path* atomically via a temporary file.
+
+    Writes to ``<path>.tmp`` first, then replaces the target with
+    ``os.replace()``.  This ensures readers never see a partially-written
+    file — they either see the old version or the new one.
+    """
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    try:
+        if isinstance(data, str):
+            tmp_path.write_text(data, encoding="utf-8")
+        else:
+            tmp_path.write_bytes(data)
+        os.replace(tmp_path, path)
+    except BaseException:
+        # Clean up the temp file on any failure.
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise

@@ -677,11 +677,11 @@
 
 ## **Prompt 3b: Glossary Module for dao-bridge-translator**
 
-> Build the glossary stage for `dao-bridge-translator`. This builds on Prompts 1, 2, and 3a. The glossary stage extracts proper nouns and character information from the chunked Japanese text, reconciles within-book conflicts, and optionally cross-checks against a cross-book master glossary.
+> Build the glossary stage for `dao-bridge-translator`. This builds on Prompts 1, 2, and 3a. The glossary stage extracts proper nouns and character information from the chunked Japanese text, reconciles within-book conflicts, and exports the glossary for human review and editing.
 > 
 > **Scope:**
-> - `src/dao_bridge/glossary.py` — build, reconcile, crosscheck, promote, export, import-reference operations
-> - CLI commands: `glossary-build`, `glossary-reconcile`, `glossary-crosscheck`, `glossary-promote`, `glossary-export`, `glossary-import-reference`
+> - `src/dao_bridge/glossary.py` — build, reconcile, and export operations
+> - CLI commands: `glossary-build`, `glossary-reconcile`, `glossary-export`
 > - Prompt templates in `src/dao_bridge/prompts/`
 > - Tests
 > 
@@ -692,7 +692,7 @@
 > - `GlossaryEntry` and `Glossary` schemas already defined in `schemas.py` from Prompt 1 (with all fields: nicknames, speech_style, source, source_books, book_id, book_metadata, timestamps).
 > - Config `glossary` and `glossary_phase` sections already loaded from Prompt 1.
 > 
-> **Note:** No schema or config updates should be needed — Prompt 1 already includes the complete definitions.
+> **Note:** No schema or config updates should be needed — Prompt 1 already includes the complete definitions. The `GlossaryEntry.source` field includes values (`"master"`, `"seed"`) and the config includes `glossary.master_glossary_path`, `glossary.crosscheck`, and `glossary.promote_on_complete` settings that are reserved for future master glossary features (crosscheck, promote, import-reference). These schema fields and config sections should be loaded and validated as defined in Prompt 1 but are not acted on by this prompt.
 > 
 > Validate `entry.category` against `config.glossary.categories` at load time. Raise a clear error listing invalid categories if mismatched.
 > 
@@ -776,86 +776,6 @@
 > 
 > **State tracking:** per-conflict items. Also per-character for speech-style consolidation.
 > 
-> ### glossary-crosscheck
-> 
-> Compares per-book glossary against the master glossary.
-> 
-> **No-op if `config.glossary.master_glossary_path` is null or file doesn't exist.** Log and skip.
-> 
-> **Matching:**
-> 
-> For each per-book entry, find matches in the master:
-> 1. Exact Japanese form match.
-> 2. If no Japanese (per-book entry lacks it): reading match, then English exact match.
-> 3. Alias overlap: any per-book alias equals any master alias.
-> 
-> If multiple master entries match, collect all; flag as a multi-match conflict for user review.
-> 
-> **Per-field comparison** for single-match cases:
-> 
-> - `english`: if different, this is an English-form conflict. Apply `on_conflict` rule.
-> - `category`: if different, prefer master (categories are canonical).
-> - `aliases`, `nicknames`: union (additive, no conflict possible).
-> - `speech_style`: if per-book has new info not in master's speech_style, flag for promotion (will update master when promoted).
-> - `notes`: append per-book's notes to master's if different, separated by newline.
-> 
-> **`on_conflict: prefer_master`**: adopt master's value in the per-book glossary for conflicting fields. Log the change.
-> **`on_conflict: prefer_book`**: keep per-book's value; will override master at promote time.
-> **`on_conflict: flag_only`**: keep per-book's value, flag in report, don't modify either glossary.
-> 
-> **LLM-assisted conflicts** (when `llm_assist: true`):
-> 
-> For English-form conflicts and multi-match conflicts, call the LLM: "Master glossary has term A with translation X. This book's glossary has translation Y. Are these the same term being translated differently, or distinct terms that happen to share a form? If same, which translation is better? Provide reasoning." The recommendation goes into the report but is not auto-applied.
-> 
-> **Output:**
-> 
-> `<work_dir>/glossary_crosscheck_report.md` with sections:
-> - Summary counts (matches / new / conflicts / adjusted)
-> - New entries (no master match) — candidates for promote
-> - Matched entries, no differences
-> - Matched entries, adjustments applied (per `on_conflict`)
-> - Conflicts requiring review
-> - Multi-match warnings (same term matches multiple master entries)
-> 
-> ### glossary-promote
-> 
-> Merges the per-book glossary into the master.
-> 
-> **Input:** `<work_dir>/glossary.json` (per-book, post-crosscheck, possibly user-edited). `config.glossary.master_glossary_path` (master, may not exist yet).
-> 
-> **Behavior:**
-> 
-> - Back up master to `<master_path>.backup.YYYYMMDDHHMMSS` if it exists.
-> - Load master (or create empty if doesn't exist).
-> - For each per-book entry:
->   - If not in master (by matching rules above): add with `source: master`, `source_books: [book_id]`.
->   - If in master: union aliases and nicknames, add `book_id` to `source_books` if absent, merge speech_style via the same consolidation logic as reconcile.
->   - English form: `prefer_master` is the default; but if the per-book glossary was created with `on_conflict: prefer_book`, adopt the per-book English (the crosscheck stage already signaled the intent to override).
-> - Write master (via `atomic_write`) with updated `version`.
-> - `--dry-run`: print the diff without writing.
-> 
-> ### glossary-import-reference
-> 
-> Extracts English proper nouns from an English EPUB (or directory of EPUBs) and merges them into the master glossary. Useful for seeding the master from authoritative translations before starting work on a new book.
-> 
-> **Input:** path to an English EPUB or directory.
-> 
-> **Behavior:**
-> 
-> - For each EPUB:
->   - Extract spine items using existing `extract` logic (treat as a standalone operation, don't require a full work dir).
->   - Clean to markdown using existing `clean` logic.
->   - Pack the English text into batches by token budget.
->   - For each batch, LLM call: "Extract all proper nouns from this English text. For each, give the English form, category, and any aliases. Do not attempt to guess Japanese forms." Structured JSON output via `complete_json()`.
->   - Merge into master with `source: seed`, `japanese: null`, `reading: null`, `source_books: [english_book_id]`.
-> - Entries from multiple English books: merge on English exact match, union aliases and source_books.
-> 
-> This is a utility command run out-of-pipeline. Does not require a `work_dir` for the target translation — it just needs a path to the English EPUB(s) and a master glossary path.
-> 
-> ```
-> dao-bridge glossary-import-reference <english-epub-or-dir> [--master PATH] [--dry-run] [--verbose]
-> ```
-> 
 > ### glossary-export
 > 
 > Produces a human-readable markdown view of the per-book glossary.
@@ -863,8 +783,6 @@
 > **Output:** `<work_dir>/glossary.md` (or stdout with `--stdout`).
 > 
 > Format: grouped by category, entries sorted alphabetically within each category by English form. Each entry shows Japanese, reading (if any), English, aliases, nicknames (if any), speech style (if any), notes (if any).
-> 
-> Also supports `--master` to export the master glossary instead of per-book.
 > 
 > ---
 > 
@@ -875,8 +793,6 @@
 > - `glossary_extract.txt` — build-stage extraction prompt. Variables: `{categories}`, `{category_hints}`, `{existing_glossary}`, `{chunk_batch}`.
 > - `glossary_reconcile_term.txt` — reconcile prompt for term conflicts. Variables: `{japanese}`, `{reading}`, `{current_english}`, `{alternatives}`.
 > - `glossary_reconcile_speech.txt` — reconcile prompt for speech-style consolidation. Variables: `{character_name}`, `{observations}`.
-> - `glossary_crosscheck_conflict.txt` — optional LLM-assisted conflict reasoning. Variables: `{japanese}`, `{reading}`, `{master_entry}`, `{book_entry}`.
-> - `reference_extract.txt` — English proper noun extraction for import-reference. Variables: `{categories}`, `{text_batch}`.
 > 
 > All prompts under 800 tokens. Use simple `{variable}` substitution, no Jinja.
 > 
@@ -887,13 +803,12 @@
 > ```
 > dao-bridge glossary-build [--work-dir ./work] [--force] [--verbose]
 > dao-bridge glossary-reconcile [--work-dir ./work] [--force] [--verbose]
-> dao-bridge glossary-crosscheck [--work-dir ./work] [--force] [--verbose]
-> dao-bridge glossary-promote [--work-dir ./work] [--master PATH] [--dry-run] [--verbose]
-> dao-bridge glossary-import-reference <epub-or-dir> [--master PATH] [--dry-run] [--verbose]
-> dao-bridge glossary-export [--work-dir ./work] [--master PATH] [--stdout] [--output PATH] [--verbose]
+> dao-bridge glossary-export [--work-dir ./work] [--stdout] [--output PATH] [--verbose]
 > ```
 > 
-> All stage commands integrate with state tracking, skip completed work without `--force`. The `run` command (chains stages) should now include build + reconcile + crosscheck (if master configured).
+> All stage commands integrate with state tracking, skip completed work without `--force`. The `run` command (chains stages) should now include build + reconcile.
+> 
+> **Placeholder commands:** Register `glossary-crosscheck`, `glossary-promote`, and `glossary-import-reference` as CLI commands that exit with "not yet implemented — master glossary features coming in a future release." This keeps the CLI surface discoverable and documented.
 > 
 > ---
 > 
@@ -911,42 +826,23 @@
 > - Speech style consolidation merges observations for each character.
 > - Report file generated with all decisions.
 > 
-> **glossary-crosscheck:**
-> - No-op when master path is null.
-> - Exact Japanese matches detected.
-> - Alias overlap matches detected.
-> - Multi-match flagged for review.
-> - `on_conflict` modes behave correctly.
-> - Report generated with all sections populated.
-> 
-> **glossary-promote:**
-> - New entries added with correct source_books.
-> - Existing entries get book_id appended to source_books.
-> - Master backed up before write.
-> - `--dry-run` produces diff output without writing.
-> 
-> **glossary-import-reference:**
-> - Single EPUB processed end-to-end with mocked LLM.
-> - Directory of EPUBs processed, results merged.
-> - Entries have `source: seed`, `japanese: null`.
-> 
 > **glossary-export:**
 > - Markdown output grouped by category, sorted alphabetically.
 > - All optional fields rendered when present, omitted when null.
 > 
 > **Integration:**
-> - Full pipeline through glossary stages with mini-book fixture and mocked LLM.
-> - Crosscheck against a prepared master glossary fixture.
+> - Full pipeline through glossary stages with mini-book fixture and mocked LLM: init → extract → clean → classify → chunk → glossary-build → glossary-reconcile.
+> - Verify glossary.json contains expected entries with correct fields.
 > 
 > ---
 > 
 > ## Deliverables
 > 
-> - `src/dao_bridge/glossary.py` with all operations, full docstrings.
-> - All prompt templates.
-> - Updated `src/dao_bridge/cli.py` with glossary subcommands replacing placeholders where they exist.
+> - `src/dao_bridge/glossary.py` with build, reconcile, and export operations, full docstrings.
+> - All prompt templates (glossary_extract.txt, glossary_reconcile_term.txt, glossary_reconcile_speech.txt).
+> - Updated `src/dao_bridge/cli.py` with `glossary-build`, `glossary-reconcile`, and `glossary-export` commands replacing their placeholder stubs. `glossary-crosscheck`, `glossary-promote`, and `glossary-import-reference` registered as "not yet implemented" placeholders.
 > - All tests passing.
-> - Updated `README.md` explaining the glossary flow, master glossary concept, and when to use which command.
+> - Updated `README.md` explaining the glossary flow, the per-book glossary lifecycle (build → reconcile → export → user review → translate), and a note that master glossary features (crosscheck, promote, import-reference) are planned for a future release to support multi-book series with consistent terminology.
 
 ---
 

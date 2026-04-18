@@ -56,9 +56,9 @@ def _load_translation(work_dir: Path, chunk_id: str) -> TranslatedChunk:
     return TranslatedChunk(**raw)
 
 
-def _load_chunks_for_spine(work_dir: Path, spine_index: int) -> list[Chunk]:
+def _load_chunks_for_spine(work_dir: Path, spine_index: int, spine_width: int = 4) -> list[Chunk]:
     """Load all chunk JSON files for a spine item, sorted by chunk_index."""
-    cd = chunk_dir(work_dir, spine_index)
+    cd = chunk_dir(work_dir, spine_index, spine_width)
     if not cd.exists():
         return []
     chunk_files = sorted(cd.glob("*.json"))
@@ -80,6 +80,7 @@ def assemble_spine_item(
     work_dir: Path,
     spine_index: int,
     chunk_count: int,
+    spine_width: int = 4,
 ) -> str:
     """Assemble translated chunks for a spine item into a single markdown string.
 
@@ -91,6 +92,8 @@ def assemble_spine_item(
         Spine index to assemble.
     chunk_count:
         Expected number of chunks (from manifest).
+    spine_width:
+        Zero-padding width for spine indices.
 
     Returns
     -------
@@ -104,16 +107,18 @@ def assemble_spine_item(
     ValueError
         If the assembled output is empty.
     """
+    padded = pad_spine(spine_index, spine_width)
+
     # Load chunks to get expected chunk IDs.
-    chunks = _load_chunks_for_spine(work_dir, spine_index)
+    chunks = _load_chunks_for_spine(work_dir, spine_index, spine_width)
     if not chunks:
-        raise FileNotFoundError(f"No chunk files found for spine {spine_index:03d}")
+        raise FileNotFoundError(f"No chunk files found for spine {padded}")
 
     # Verify we have the expected count.
     if len(chunks) != chunk_count:
         logger.warning(
-            "Spine %03d: expected %d chunks but found %d chunk files",
-            spine_index,
+            "Spine %s: expected %d chunks but found %d chunk files",
+            padded,
             chunk_count,
             len(chunks),
         )
@@ -121,14 +126,12 @@ def assemble_spine_item(
     # Check all translations exist before loading any.
     missing: list[str] = []
     for c in chunks:
-        tp = translation_path(work_dir, c.chunk_id)
+        tp = translation_path(work_dir, c.chunk_id, spine_width)
         if not tp.exists():
             missing.append(c.chunk_id)
 
     if missing:
-        raise FileNotFoundError(
-            f"Missing translations for spine {spine_index:03d}: {', '.join(missing)}"
-        )
+        raise FileNotFoundError(f"Missing translations for spine {padded}: {', '.join(missing)}")
 
     # Load translations in chunk order.
     translations: list[TranslatedChunk] = []
@@ -140,7 +143,7 @@ def assemble_spine_item(
     assembled = "\n\n".join(tc.translated_text for tc in translations)
 
     if not assembled.strip():
-        raise ValueError(f"Assembled output for spine {spine_index:03d} is empty")
+        raise ValueError(f"Assembled output for spine {padded} is empty")
 
     # Sanity check: rough token count comparison.
     assembled_tokens = count_tokens(assembled)
@@ -149,9 +152,9 @@ def assemble_spine_item(
     tolerance = max(len(translations) * 5, 10)
     if abs(assembled_tokens - sum_translation_tokens) > tolerance:
         logger.warning(
-            "Spine %03d: assembled token count (%d) differs from sum of "
+            "Spine %s: assembled token count (%d) differs from sum of "
             "translation token counts (%d) by more than tolerance (%d)",
-            spine_index,
+            padded,
             assembled_tokens,
             sum_translation_tokens,
             tolerance,
@@ -165,11 +168,13 @@ def assemble_spine_item(
 # ---------------------------------------------------------------------------
 
 
-def _has_all_translations(work_dir: Path, spine_index: int, chunk_count: int) -> bool:
+def _has_all_translations(
+    work_dir: Path, spine_index: int, chunk_count: int, spine_width: int = 4
+) -> bool:
     """Return True if all expected translations exist for a spine item."""
     for ci in range(1, chunk_count + 1):
-        chunk_id = format_chunk_id(spine_index, ci)
-        tp = translation_path(work_dir, chunk_id)
+        chunk_id = format_chunk_id(spine_index, ci, spine_width)
+        tp = translation_path(work_dir, chunk_id, spine_width)
         if not tp.exists():
             return False
     return True
@@ -213,6 +218,7 @@ def assemble_all(
         The manifest (unchanged).
     """
     work_dir = config.work_dir_path
+    sw = manifest.spine_padding_width
 
     # Determine which items to process.
     if spine_filter is not None:
@@ -232,7 +238,7 @@ def assemble_all(
     mark_stage_started(work_dir, state, "assemble")
 
     # Build list of item IDs for pending check.
-    item_ids = [pad_spine(item.spine_index) for item in items]
+    item_ids = [pad_spine(item.spine_index, sw) for item in items]
     pending = set(iter_pending_items(state, "assemble", item_ids))
 
     assembled_count = 0
@@ -240,7 +246,7 @@ def assemble_all(
     deferred_count = 0
 
     for item in items:
-        padded = pad_spine(item.spine_index)
+        padded = pad_spine(item.spine_index, sw)
 
         # Skip if already completed (unless force).
         if not force and padded not in pending:
@@ -263,7 +269,7 @@ def assemble_all(
             continue
 
         # Check if translations are available.
-        if not _has_all_translations(work_dir, item.spine_index, chunk_count):
+        if not _has_all_translations(work_dir, item.spine_index, chunk_count, sw):
             logger.warning(
                 "Spine %s: translations incomplete (%d chunks expected), deferring",
                 padded,
@@ -277,10 +283,10 @@ def assemble_all(
         mark_item_started(work_dir, state, "assemble", padded)
 
         try:
-            text = assemble_spine_item(work_dir, item.spine_index, chunk_count)
+            text = assemble_spine_item(work_dir, item.spine_index, chunk_count, sw)
 
             # Write assembled markdown.
-            ap = assembled_path(work_dir, item.spine_index)
+            ap = assembled_path(work_dir, item.spine_index, sw)
             ap.parent.mkdir(parents=True, exist_ok=True)
             atomic_write(ap, text)
 

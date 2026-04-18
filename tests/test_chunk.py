@@ -336,14 +336,14 @@ class TestGreedyPacking:
     """Tests for chunk_blocks()."""
 
     def test_empty_file_zero_chunks(self):
-        chunks = chunk_blocks([], _default_config(), 0, "clean/000.md")
+        chunks = chunk_blocks([], _default_config(), 0, "clean/0000.md")
         assert chunks == []
 
     def test_single_small_block_one_chunk(self):
         """File smaller than target produces exactly one chunk."""
         md = _load_fixture("short_chapter.md")
         blocks = parse_blocks(md, _default_config())
-        chunks = chunk_blocks(blocks, _default_config(), 0, "clean/000.md")
+        chunks = chunk_blocks(blocks, _default_config(), 0, "clean/0000.md")
         assert len(chunks) == 1
         assert chunks[0].chunk_index == 1
 
@@ -354,7 +354,7 @@ class TestGreedyPacking:
         blocks = parse_blocks(md, config)
         total = sum(b.token_count for b in blocks)
         assert total < config.target_tokens  # Confirm fixture is under target
-        chunks = chunk_blocks(blocks, config, 0, "clean/000.md")
+        chunks = chunk_blocks(blocks, config, 0, "clean/0000.md")
         assert len(chunks) == 1
 
     def test_above_target_splits(self):
@@ -364,7 +364,7 @@ class TestGreedyPacking:
         blocks = parse_blocks(md, config)
         total = sum(b.token_count for b in blocks)
         assert total > config.target_tokens
-        chunks = chunk_blocks(blocks, config, 0, "clean/000.md")
+        chunks = chunk_blocks(blocks, config, 0, "clean/0000.md")
         assert len(chunks) >= 2
 
     def test_scene_break_in_flex_window(self):
@@ -372,7 +372,7 @@ class TestGreedyPacking:
         md = _load_fixture("scene_break_chapter.md")
         config = _default_config()
         blocks = parse_blocks(md, config)
-        chunks = chunk_blocks(blocks, config, 0, "clean/000.md")
+        chunks = chunk_blocks(blocks, config, 0, "clean/0000.md")
         assert len(chunks) >= 2
 
         # Check that at least one chunk ends at a scene break.
@@ -386,7 +386,7 @@ class TestGreedyPacking:
         blocks = parse_blocks(md, config)
         assert len(blocks) == 1
         assert blocks[0].token_count > config.max_tokens
-        chunks = chunk_blocks(blocks, config, 0, "clean/000.md")
+        chunks = chunk_blocks(blocks, config, 0, "clean/0000.md")
         assert len(chunks) == 1
         assert chunks[0].token_count > config.max_tokens
 
@@ -394,7 +394,7 @@ class TestGreedyPacking:
         md = _load_fixture("two_chunk_chapter.md")
         config = _default_config()
         blocks = parse_blocks(md, config)
-        chunks = chunk_blocks(blocks, config, 0, "clean/000.md")
+        chunks = chunk_blocks(blocks, config, 0, "clean/0000.md")
         for i, c in enumerate(chunks):
             assert c.chunk_index == i + 1
 
@@ -404,7 +404,7 @@ class TestGreedyPacking:
         blocks = parse_blocks(md, config)
         chunks = chunk_blocks(blocks, config, 5, "clean/005.md")
         for c in chunks:
-            assert c.chunk_id.startswith("005.")
+            assert c.chunk_id.startswith("0005.")
             assert c.spine_index == 5
 
     def test_block_range_inclusive(self):
@@ -412,7 +412,7 @@ class TestGreedyPacking:
         md = _load_fixture("single_chunk_chapter.md")
         config = _default_config()
         blocks = parse_blocks(md, config)
-        chunks = chunk_blocks(blocks, config, 0, "clean/000.md")
+        chunks = chunk_blocks(blocks, config, 0, "clean/0000.md")
         assert len(chunks) == 1
         start, end = chunks[0].block_range
         assert start == 0
@@ -430,7 +430,7 @@ class TestRemainderAbsorption:
         md = _load_fixture("tiny_remainder.md")
         config = _default_config()
         blocks = parse_blocks(md, config)
-        chunks = chunk_blocks(blocks, config, 0, "clean/000.md")
+        chunks = chunk_blocks(blocks, config, 0, "clean/0000.md")
 
         # The last chunk should have extended_for_remainder set.
         # Find it — it's the chunk that absorbed the remainder.
@@ -444,7 +444,7 @@ class TestRemainderAbsorption:
         md = _load_fixture("short_chapter.md")
         config = _default_config()
         blocks = parse_blocks(md, config)
-        chunks = chunk_blocks(blocks, config, 0, "clean/000.md")
+        chunks = chunk_blocks(blocks, config, 0, "clean/0000.md")
         assert len(chunks) == 1
         assert not chunks[0].extended_for_remainder
 
@@ -460,9 +460,9 @@ class TestClassificationFiltering:
     def _make_item(self, classification, spine_index=0):
         return ManifestItem(
             spine_index=spine_index,
-            original_href=f"text/{spine_index:03d}.xhtml",
-            raw_path=f"raw/{spine_index:03d}.xhtml",
-            clean_path=f"clean/{spine_index:03d}.md",
+            original_href=f"text/{spine_index:04d}.xhtml",
+            raw_path=f"raw/{spine_index:04d}.xhtml",
+            clean_path=f"clean/{spine_index:04d}.md",
             classification=classification,
         )
 
@@ -506,10 +506,10 @@ class TestDeterminism:
         config = _default_config()
 
         blocks1 = parse_blocks(md, config)
-        chunks1 = chunk_blocks(blocks1, config, 0, "clean/000.md")
+        chunks1 = chunk_blocks(blocks1, config, 0, "clean/0000.md")
 
         blocks2 = parse_blocks(md, config)
-        chunks2 = chunk_blocks(blocks2, config, 0, "clean/000.md")
+        chunks2 = chunk_blocks(blocks2, config, 0, "clean/0000.md")
 
         assert len(chunks1) == len(chunks2)
         for c1, c2 in zip(chunks1, chunks2):
@@ -529,7 +529,7 @@ class TestBlockCoverage:
         md = _load_fixture("two_chunk_chapter.md")
         config = _default_config()
         blocks = parse_blocks(md, config)
-        chunks = chunk_blocks(blocks, config, 0, "clean/000.md")
+        chunks = chunk_blocks(blocks, config, 0, "clean/0000.md")
 
         covered: set[int] = set()
         for c in chunks:
@@ -544,7 +544,7 @@ class TestBlockCoverage:
         md = _load_fixture("scene_break_chapter.md")
         config = _default_config()
         blocks = parse_blocks(md, config)
-        chunks = chunk_blocks(blocks, config, 0, "clean/000.md")
+        chunks = chunk_blocks(blocks, config, 0, "clean/0000.md")
 
         covered: set[int] = set()
         for c in chunks:
@@ -556,7 +556,7 @@ class TestBlockCoverage:
         md = _load_fixture("tiny_remainder.md")
         config = _default_config()
         blocks = parse_blocks(md, config)
-        chunks = chunk_blocks(blocks, config, 0, "clean/000.md")
+        chunks = chunk_blocks(blocks, config, 0, "clean/0000.md")
 
         covered: set[int] = set()
         for c in chunks:
@@ -575,7 +575,7 @@ class TestValidation:
         md = _load_fixture("two_chunk_chapter.md")
         config = _default_config()
         blocks = parse_blocks(md, config)
-        chunks = chunk_blocks(blocks, config, 0, "clean/000.md")
+        chunks = chunk_blocks(blocks, config, 0, "clean/0000.md")
         # Should not raise.
         validate_chunks(blocks, chunks)
 
@@ -591,10 +591,10 @@ class TestValidation:
         blocks = [Block(0, "paragraph", "a", 5), Block(1, "paragraph", "b", 5)]
         # Create a chunk covering only block 0.
         bad_chunk = Chunk(
-            chunk_id="000.001",
+            chunk_id="0000.001",
             spine_index=0,
             chunk_index=1,
-            source_file="clean/000.md",
+            source_file="clean/0000.md",
             block_range=(0, 0),
             token_count=5,
             text="a",
@@ -606,10 +606,10 @@ class TestValidation:
         blocks = [Block(0, "paragraph", "a", 5), Block(1, "paragraph", "b", 5)]
         bad_chunks = [
             Chunk(
-                chunk_id="000.002",
+                chunk_id="0000.002",
                 spine_index=0,
                 chunk_index=2,  # should be 1
-                source_file="clean/000.md",
+                source_file="clean/0000.md",
                 block_range=(0, 1),
                 token_count=10,
                 text="a\n\nb",
@@ -626,27 +626,27 @@ class TestValidation:
 
 class TestChunkSpineItem:
     def test_writes_chunk_files(self, tmp_path: Path):
-        """Chunk files are written to chunks/NNN/ directory."""
+        """Chunk files are written to chunks/NNNN/ directory."""
         work_dir = tmp_path / "work"
         (work_dir / "clean").mkdir(parents=True)
         (work_dir / "chunks").mkdir(parents=True)
 
         # Write a test markdown file.
         md = _load_fixture("two_chunk_chapter.md")
-        (work_dir / "clean" / "003.md").write_text(md, encoding="utf-8")
+        (work_dir / "clean" / "0003.md").write_text(md, encoding="utf-8")
 
         item = ManifestItem(
             spine_index=3,
-            original_href="text/003.xhtml",
-            raw_path="raw/003.xhtml",
-            clean_path="clean/003.md",
+            original_href="text/0003.xhtml",
+            raw_path="raw/0003.xhtml",
+            clean_path="clean/0003.md",
             classification="chapter",
         )
         config = _default_config()
         n_chunks = chunk_spine_item(work_dir, item, config)
 
         assert n_chunks >= 2
-        chunk_d = work_dir / "chunks" / "003"
+        chunk_d = work_dir / "chunks" / "0003"
         assert chunk_d.exists()
         chunk_files = sorted(chunk_d.glob("*.json"))
         assert len(chunk_files) == n_chunks
@@ -656,20 +656,20 @@ class TestChunkSpineItem:
             raw = json.loads(cf.read_text(encoding="utf-8"))
             c = Chunk(**raw)
             assert c.spine_index == 3
-            assert c.source_file == "clean/003.md"
+            assert c.source_file == "clean/0003.md"
 
     def test_empty_file_zero_chunks(self, tmp_path: Path):
         work_dir = tmp_path / "work"
         (work_dir / "clean").mkdir(parents=True)
         (work_dir / "chunks").mkdir(parents=True)
 
-        (work_dir / "clean" / "000.md").write_text("", encoding="utf-8")
+        (work_dir / "clean" / "0000.md").write_text("", encoding="utf-8")
 
         item = ManifestItem(
             spine_index=0,
-            original_href="text/000.xhtml",
-            raw_path="raw/000.xhtml",
-            clean_path="clean/000.md",
+            original_href="text/0000.xhtml",
+            raw_path="raw/0000.xhtml",
+            clean_path="clean/0000.md",
             classification="chapter",
         )
         n_chunks = chunk_spine_item(work_dir, item, _default_config())
@@ -681,9 +681,9 @@ class TestChunkSpineItem:
 
         item = ManifestItem(
             spine_index=0,
-            original_href="text/000.xhtml",
-            raw_path="raw/000.xhtml",
-            clean_path="clean/000.md",
+            original_href="text/0000.xhtml",
+            raw_path="raw/0000.xhtml",
+            clean_path="clean/0000.md",
             classification="chapter",
         )
         with pytest.raises(FileNotFoundError):
@@ -702,7 +702,7 @@ class TestFixturePacking:
         md = _load_fixture("short_chapter.md")
         config = _default_config()
         blocks = parse_blocks(md, config)
-        chunks = chunk_blocks(blocks, config, 0, "clean/000.md")
+        chunks = chunk_blocks(blocks, config, 0, "clean/0000.md")
         assert len(chunks) == 1
         assert not chunks[0].extended_for_remainder
 
@@ -710,14 +710,14 @@ class TestFixturePacking:
         md = _load_fixture("single_chunk_chapter.md")
         config = _default_config()
         blocks = parse_blocks(md, config)
-        chunks = chunk_blocks(blocks, config, 0, "clean/000.md")
+        chunks = chunk_blocks(blocks, config, 0, "clean/0000.md")
         assert len(chunks) == 1
 
     def test_two_chunk_chapter(self):
         md = _load_fixture("two_chunk_chapter.md")
         config = _default_config()
         blocks = parse_blocks(md, config)
-        chunks = chunk_blocks(blocks, config, 0, "clean/000.md")
+        chunks = chunk_blocks(blocks, config, 0, "clean/0000.md")
         assert len(chunks) >= 2
         validate_chunks(blocks, chunks)
 
@@ -725,7 +725,7 @@ class TestFixturePacking:
         md = _load_fixture("scene_break_chapter.md")
         config = _default_config()
         blocks = parse_blocks(md, config)
-        chunks = chunk_blocks(blocks, config, 0, "clean/000.md")
+        chunks = chunk_blocks(blocks, config, 0, "clean/0000.md")
         assert len(chunks) >= 2
         validate_chunks(blocks, chunks)
 
@@ -733,7 +733,7 @@ class TestFixturePacking:
         md = _load_fixture("oversized_paragraph.md")
         config = _default_config()
         blocks = parse_blocks(md, config)
-        chunks = chunk_blocks(blocks, config, 0, "clean/000.md")
+        chunks = chunk_blocks(blocks, config, 0, "clean/0000.md")
         assert len(chunks) == 1
         validate_chunks(blocks, chunks)
 
@@ -741,7 +741,7 @@ class TestFixturePacking:
         md = _load_fixture("tiny_remainder.md")
         config = _default_config()
         blocks = parse_blocks(md, config)
-        chunks = chunk_blocks(blocks, config, 0, "clean/000.md")
+        chunks = chunk_blocks(blocks, config, 0, "clean/0000.md")
         validate_chunks(blocks, chunks)
         # At least one chunk should be extended.
         extended = [c for c in chunks if c.extended_for_remainder]
@@ -759,7 +759,7 @@ class TestPackingEdgeCases:
         config = _default_config(target_tokens=100)
         # 10 blocks of 10 tokens each = 100 tokens total
         blocks = [Block(i, "paragraph", _make_sentence(1), 10) for i in range(10)]
-        chunks = chunk_blocks(blocks, config, 0, "clean/000.md")
+        chunks = chunk_blocks(blocks, config, 0, "clean/0000.md")
         assert len(chunks) == 1
 
     def test_target_plus_one_splits(self):
@@ -767,7 +767,7 @@ class TestPackingEdgeCases:
         config = _default_config(target_tokens=100, min_chunk_tokens=10)
         # 11 blocks of 10 tokens = 110 tokens
         blocks = [Block(i, "paragraph", _make_sentence(1), 10) for i in range(11)]
-        chunks = chunk_blocks(blocks, config, 0, "clean/000.md")
+        chunks = chunk_blocks(blocks, config, 0, "clean/0000.md")
         assert len(chunks) >= 2
 
     def test_scene_break_outside_flex_window_not_used(self):
@@ -782,7 +782,7 @@ class TestPackingEdgeCases:
             Block(3, "paragraph", "text", 50),  # cumulative: 153
             Block(4, "paragraph", "text", 50),  # cumulative: 203 > 200
         ]
-        chunks = chunk_blocks(blocks, config, 0, "clean/000.md")
+        chunks = chunk_blocks(blocks, config, 0, "clean/0000.md")
         # The scene break is below flex_min, so it won't be used.
         # Split should happen at target boundary.
         assert len(chunks) >= 2
@@ -800,7 +800,7 @@ class TestPackingEdgeCases:
             Block(3, "heading", "# X", 3),  # cumulative: 156, in flex — latest
             Block(4, "paragraph", "text", 50),  # cumulative: 206 > 200
         ]
-        chunks = chunk_blocks(blocks, config, 0, "clean/000.md")
+        chunks = chunk_blocks(blocks, config, 0, "clean/0000.md")
         assert len(chunks) >= 2
         # First chunk should end at block 3 (the heading, latest break in flex).
         assert chunks[0].block_range[1] == 3

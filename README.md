@@ -67,23 +67,23 @@ work/
   manifest.json        # Book metadata, spine items, counts
   state.json           # Pipeline progress tracking
   raw/                 # Extracted XHTML (one per spine item)
-    000.xhtml
-    001.xhtml
+    0000.xhtml
+    0001.xhtml
     ...
   clean/               # Cleaned markdown (one per spine item)
-    000.md
-    001.md
+    0000.md
+    0001.md
     ...
   chunks/              # Chunked content for translation
-    000/               #   Per-spine chunk directories
-      000.001.json     #     Chunk JSON (Chunk schema)
-      000.002.json
-    001/
-      001.001.json
+    0000/               #   Per-spine chunk directories
+      0000.001.json     #     Chunk JSON (Chunk schema)
+      0000.002.json
+    0001/
+      0001.001.json
   translations/        # (future) Per-chunk translations
   assembled/           # Reassembled translated markdown
-    000.md
-    001.md
+    0000.md
+    0001.md
   summaries/           # (future) Rolling translation summaries
   glossary.json        # (future) Per-book glossary
   logs/

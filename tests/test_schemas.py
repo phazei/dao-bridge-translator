@@ -20,14 +20,6 @@ from dao_bridge.schemas import (
 
 
 class TestManifestItem:
-    def test_padded_id_computed(self):
-        item = ManifestItem(spine_index=5, original_href="ch05.xhtml", raw_path="raw/005.xhtml")
-        assert item.padded_id == "005"
-
-    def test_padded_id_triple_digit(self):
-        item = ManifestItem(spine_index=123, original_href="x.xhtml", raw_path="raw/123.xhtml")
-        assert item.padded_id == "123"
-
     def test_nullable_fields_default_none(self):
         item = ManifestItem(spine_index=0, original_href="x", raw_path="r")
         assert item.clean_path is None
@@ -63,7 +55,6 @@ class TestManifestItem:
         data = item.model_dump()
         restored = ManifestItem(**data)
         assert restored.spine_index == 7
-        assert restored.padded_id == "007"
         assert restored.classification == "chapter"
         assert restored.token_count == 1500
 
@@ -80,20 +71,43 @@ class TestManifest:
         assert m.images == []
         assert m.metadata == {}
         assert m.opf_dir == ""
+        assert m.spine_padding_width == 4
+
+    def test_spine_padding_width_custom(self):
+        m = Manifest(
+            source_epub_path="/books/test.epub",
+            book_id="test-book",
+            spine_padding_width=5,
+        )
+        assert m.spine_padding_width == 5
+
+    def test_spine_padding_width_round_trip(self):
+        m = Manifest(
+            source_epub_path="/books/test.epub",
+            book_id="test-book",
+            spine_padding_width=5,
+        )
+        data = m.model_dump(mode="json")
+        restored = Manifest(**data)
+        assert restored.spine_padding_width == 5
 
     def test_round_trip_json(self):
         m = Manifest(
             source_epub_path="/books/test.epub",
             book_id="test-book",
             opf_dir="OEBPS",
-            spine=[ManifestItem(spine_index=0, original_href="ch.xhtml", raw_path="raw/000.xhtml")],
+            spine_padding_width=4,
+            spine=[
+                ManifestItem(spine_index=0, original_href="ch.xhtml", raw_path="raw/0000.xhtml")
+            ],
             images=["images/cover.jpg"],
             metadata={"title": "Test Book", "author": "Author"},
         )
         data = m.model_dump()
         restored = Manifest(**data)
         assert len(restored.spine) == 1
-        assert restored.spine[0].padded_id == "000"
+        assert restored.spine[0].spine_index == 0
+        assert restored.spine_padding_width == 4
         assert restored.images == ["images/cover.jpg"]
         assert restored.metadata["title"] == "Test Book"
         assert restored.opf_dir == "OEBPS"

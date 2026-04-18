@@ -14,14 +14,28 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 
 
-def pad_spine(spine_index: int) -> str:
-    """Return a zero-padded 3-digit string for *spine_index*."""
-    return f"{spine_index:03d}"
+def pad_spine(spine_index: int, width: int = 4) -> str:
+    """Return a zero-padded string for *spine_index*.
+
+    Parameters
+    ----------
+    spine_index:
+        The spine index to pad.
+    width:
+        Minimum number of digits.  Defaults to 4.  Pipeline code should
+        always pass ``manifest.spine_padding_width`` explicitly; the
+        default is a safety net for tests and ad-hoc usage.
+    """
+    return f"{spine_index:0{width}d}"
 
 
-def format_chunk_id(spine_index: int, chunk_index: int) -> str:
-    """Return ``"NNN.MMM"`` chunk identifier."""
-    return f"{pad_spine(spine_index)}.{chunk_index:03d}"
+def format_chunk_id(spine_index: int, chunk_index: int, spine_width: int = 4) -> str:
+    """Return chunk identifier, e.g. ``"NNNN.MMM"``.
+
+    The spine portion uses *spine_width* digits (default 4).
+    The chunk portion is always 3 digits.
+    """
+    return f"{pad_spine(spine_index, spine_width)}.{chunk_index:03d}"
 
 
 def parse_chunk_id(chunk_id: str) -> tuple[int, int]:
@@ -37,41 +51,41 @@ def parse_chunk_id(chunk_id: str) -> tuple[int, int]:
 # ---------------------------------------------------------------------------
 
 
-def raw_path(work_dir: Path, spine_index: int) -> Path:
-    """``raw/NNN.xhtml``"""
-    return work_dir / "raw" / f"{pad_spine(spine_index)}.xhtml"
+def raw_path(work_dir: Path, spine_index: int, spine_width: int = 4) -> Path:
+    """``raw/NNNN.xhtml``"""
+    return work_dir / "raw" / f"{pad_spine(spine_index, spine_width)}.xhtml"
 
 
-def clean_path(work_dir: Path, spine_index: int) -> Path:
-    """``clean/NNN.md``"""
-    return work_dir / "clean" / f"{pad_spine(spine_index)}.md"
+def clean_path(work_dir: Path, spine_index: int, spine_width: int = 4) -> Path:
+    """``clean/NNNN.md``"""
+    return work_dir / "clean" / f"{pad_spine(spine_index, spine_width)}.md"
 
 
-def chunk_dir(work_dir: Path, spine_index: int) -> Path:
-    """``chunks/NNN/``"""
-    return work_dir / "chunks" / pad_spine(spine_index)
+def chunk_dir(work_dir: Path, spine_index: int, spine_width: int = 4) -> Path:
+    """``chunks/NNNN/``"""
+    return work_dir / "chunks" / pad_spine(spine_index, spine_width)
 
 
-def chunk_path(work_dir: Path, chunk_id: str) -> Path:
-    """``chunks/NNN/NNN.MMM.json``"""
+def chunk_path(work_dir: Path, chunk_id: str, spine_width: int = 4) -> Path:
+    """``chunks/NNNN/NNNN.MMM.json``"""
     spine_index, _ = parse_chunk_id(chunk_id)
-    return work_dir / "chunks" / pad_spine(spine_index) / f"{chunk_id}.json"
+    return work_dir / "chunks" / pad_spine(spine_index, spine_width) / f"{chunk_id}.json"
 
 
-def translation_dir(work_dir: Path, spine_index: int) -> Path:
-    """``translations/NNN/``"""
-    return work_dir / "translations" / pad_spine(spine_index)
+def translation_dir(work_dir: Path, spine_index: int, spine_width: int = 4) -> Path:
+    """``translations/NNNN/``"""
+    return work_dir / "translations" / pad_spine(spine_index, spine_width)
 
 
-def translation_path(work_dir: Path, chunk_id: str) -> Path:
-    """``translations/NNN/NNN.MMM.json``"""
+def translation_path(work_dir: Path, chunk_id: str, spine_width: int = 4) -> Path:
+    """``translations/NNNN/NNNN.MMM.json``"""
     spine_index, _ = parse_chunk_id(chunk_id)
-    return work_dir / "translations" / pad_spine(spine_index) / f"{chunk_id}.json"
+    return work_dir / "translations" / pad_spine(spine_index, spine_width) / f"{chunk_id}.json"
 
 
-def assembled_path(work_dir: Path, spine_index: int) -> Path:
-    """``assembled/NNN.md``"""
-    return work_dir / "assembled" / f"{pad_spine(spine_index)}.md"
+def assembled_path(work_dir: Path, spine_index: int, spine_width: int = 4) -> Path:
+    """``assembled/NNNN.md``"""
+    return work_dir / "assembled" / f"{pad_spine(spine_index, spine_width)}.md"
 
 
 def summary_path(work_dir: Path) -> Path:

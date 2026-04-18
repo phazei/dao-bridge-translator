@@ -53,12 +53,12 @@
 >   manifest.json
 >   state.json
 >   raw/
->     001.xhtml
->     002.xhtml
+>     0001.xhtml
+>     0002.xhtml
 >     ...
 >   clean/
->     001.md
->     002.md
+>     0001.md
+>     0002.md
 >     ...
 >   chunks/                  # populated by chunker (later prompt)
 >   translations/            # populated by translator (later prompt)
@@ -69,7 +69,7 @@
 >     run.log
 > ```
 > 
-> Spine items are zero-padded 3-digit for lexical sort ordering. Later, chunks will use dot notation `NNN.MMM` (spine.chunk_index).
+> Spine items use dynamic zero-padding with a minimum of 4 digits for lexical sort ordering. The width is computed at extract time as `max(4, len(str(spine_count)))` and stored in `manifest.spine_padding_width`. This supports books with 1000+ chapters (common in web novels). Chunk indices stay at 3 digits. Later, chunks will use dot notation `NNNN.MMM` (spine.chunk_index).
 > 
 > **Config schema (YAML, loaded into pydantic models):**
 > 
@@ -184,9 +184,9 @@
 > 
 > These are the complete schemas for the entire pipeline. Later prompts will use them as-is. Fields not populated by early stages are nullable and default to None.
 > 
-> - `ManifestItem`: `spine_index` (int), `padded_id` (str, computed property, zero-padded-3), `original_href` (str), `raw_path` (str), `clean_path` (str | None), `classification` (literal: `"chapter" | "frontmatter" | "backmatter" | "toc_auto" | "toc_authored" | "illustration" | "unknown"` | None, default None), `title` (str | None), `token_count` (int | None), `paragraph_count` (int | None), `chunk_count` (int | None — set by chunker later).
-> - `Manifest`: `source_epub_path` (str), `book_id` (str — derived from EPUB metadata at init: prefer ISBN, fall back to normalized title+volume, fall back to filename stem), `spine` (list[ManifestItem]), `images` (list[str] — image item paths), `metadata` (dict — original EPUB metadata: title, author, language, identifier, etc.).
-> - `Chunk`: `chunk_id` (str, format "NNN.MMM"), `spine_index` (int), `chunk_index` (int — per-spine, starting at 1), `source_file` (str — path to clean markdown file), `block_range` (tuple[int, int] — inclusive start, inclusive end of block indices in source file), `token_count` (int), `extended_for_remainder` (bool), `text` (str), `ends_at_scene_break` (bool).
+> - `ManifestItem`: `spine_index` (int), `original_href` (str), `raw_path` (str), `clean_path` (str | None), `classification` (literal: `"chapter" | "frontmatter" | "backmatter" | "toc_auto" | "toc_authored" | "illustration" | "unknown"` | None, default None), `title` (str | None), `token_count` (int | None), `paragraph_count` (int | None), `chunk_count` (int | None — set by chunker later).
+> - `Manifest`: `source_epub_path` (str), `book_id` (str — derived from EPUB metadata at init: prefer ISBN, fall back to normalized title+volume, fall back to filename stem), `spine_padding_width` (int, default 4 — computed at extract time as `max(4, len(str(spine_count)))`; all spine-related path helpers and ID formatters consult this width), `spine` (list[ManifestItem]), `images` (list[str] — image item paths), `metadata` (dict — original EPUB metadata: title, author, language, identifier, etc.).
+> - `Chunk`: `chunk_id` (str, format "NNNN.MMM" — spine portion uses dynamic padding width, chunk portion always 3 digits), `spine_index` (int), `chunk_index` (int — per-spine, starting at 1), `source_file` (str — path to clean markdown file), `block_range` (tuple[int, int] — inclusive start, inclusive end of block indices in source file), `token_count` (int), `extended_for_remainder` (bool), `text` (str), `ends_at_scene_break` (bool).
 >   - Note: no `mode` field, no `overlap_range`, no `new_text_starts_at_block`. Chunks are phase-agnostic. Each phase assembles calls from them.
 > - `GlossaryEntry`: `japanese` (str | None — None for English-reference-only entries from import-reference), `reading` (str | None — from furigana), `english` (str), `category` (str — validated against `config.glossary.categories` at load time), `first_seen_chunk` (str | None), `aliases` (list[str] = []), `nicknames` (dict[str, str] = {} — `{speaker_english_name: nickname_english}`, only used by specific speakers), `speech_style` (str | None = None — prose description, characters only), `notes` (str | None = None), `source` (literal: `"seed" | "extracted" | "user" | "master"`), `source_books` (list[str] = [] — populated for master-glossary entries).
 > - `Glossary`: `entries` (list[GlossaryEntry]), `version` (int — bumped on merges), `book_id` (str | None — None for master, set for per-book), `book_metadata` (dict = {} — title, author, volume; per-book only), `created_at` (datetime), `updated_at` (datetime).
@@ -219,14 +219,14 @@
 >     "clean": {"status": "running", "started_at": "...", "completed_at": null, "error_message": null}
 >   },
 >   "items": {
->     "extract:001": {"status": "completed", "completed_at": "..."},
->     "translate:003.015": {"status": "failed_qa", "error_message": "...", "completed_at": "..."}
+>     "extract:0001": {"status": "completed", "completed_at": "..."},
+>     "translate:0003.015": {"status": "failed_qa", "error_message": "...", "completed_at": "..."}
 >   }
 > }
 > ```
 > 
 > - `stages` keys: `extract`, `clean`, `classify`, `chunk`, `glossary_build`, `glossary_reconcile`, `glossary_crosscheck`, `translate`, `assemble`, `rebuild`
-> - `items` keys: `stage:item_id` where `item_id` is a padded spine id like `003` for per-spine work, a chunk id like `003.027` for per-chunk work, or a batch id like `glossary_build.batch.001` for batch work.
+> - `items` keys: `stage:item_id` where `item_id` is a padded spine id like `0003` for per-spine work, a chunk id like `0003.027` for per-chunk work, or a batch id like `glossary_build.batch.001` for batch work.
 > - Item status values: `pending`, `started`, `completed`, `failed`, `failed_qa` (translation-specific: produced output but failed quality check).
 > 
 > Define Pydantic models for the state structure. Validate on load.
@@ -246,13 +246,13 @@
 > 
 > Path helpers for all file locations used throughout the pipeline. Every module uses these instead of constructing paths manually.
 > 
-> - `raw_path(work_dir, spine_index) -> Path` — `raw/NNN.xhtml`
-> - `clean_path(work_dir, spine_index) -> Path` — `clean/NNN.md`
-> - `chunk_dir(work_dir, spine_index) -> Path` — `chunks/NNN/`
-> - `chunk_path(work_dir, chunk_id) -> Path` — `chunks/NNN/NNN.MMM.json`
-> - `translation_dir(work_dir, spine_index) -> Path` — `translations/NNN/`
-> - `translation_path(work_dir, chunk_id) -> Path` — `translations/NNN/NNN.MMM.json`
-> - `assembled_path(work_dir, spine_index) -> Path` — `assembled/NNN.md`
+> - `raw_path(work_dir, spine_index, spine_width) -> Path` — `raw/NNNN.xhtml`
+> - `clean_path(work_dir, spine_index, spine_width) -> Path` — `clean/NNNN.md`
+> - `chunk_dir(work_dir, spine_index, spine_width) -> Path` — `chunks/NNNN/`
+> - `chunk_path(work_dir, chunk_id, spine_width) -> Path` — `chunks/NNNN/NNNN.MMM.json`
+> - `translation_dir(work_dir, spine_index, spine_width) -> Path` — `translations/NNNN/`
+> - `translation_path(work_dir, chunk_id, spine_width) -> Path` — `translations/NNNN/NNNN.MMM.json`
+> - `assembled_path(work_dir, spine_index, spine_width) -> Path` — `assembled/NNNN.md`
 > - `summary_path(work_dir) -> Path` — `summaries/rolling_summary.json`
 > - `glossary_path(work_dir) -> Path` — `glossary.json`
 > - `manifest_path(work_dir) -> Path` — `manifest.json`
@@ -260,9 +260,9 @@
 > - `log_dir(work_dir) -> Path` — `logs/`
 > - `ensure_dirs(work_dir)` — creates all subdirectories if they don't exist.
 > - `atomic_write(path: Path, data: str | bytes)` — writes to `path.tmp`, then `os.replace()` to `path`. Used for all JSON writes (manifest, state, glossary, chunks, translations).
-> - `pad_spine(spine_index: int) -> str` — zero-padded 3-digit string.
-> - `format_chunk_id(spine_index: int, chunk_index: int) -> str` — "NNN.MMM" string.
-> - `parse_chunk_id(chunk_id: str) -> tuple[int, int]` — returns (spine_index, chunk_index).
+> - `pad_spine(spine_index: int, width: int = 4) -> str` — zero-padded string with dynamic width (minimum 4 digits). Pipeline code always passes `manifest.spine_padding_width` explicitly; the default is a safety net for tests.
+> - `format_chunk_id(spine_index: int, chunk_index: int, spine_width: int = 4) -> str` — "NNNN.MMM" string (spine portion uses dynamic width, chunk portion always 3 digits).
+> - `parse_chunk_id(chunk_id: str) -> tuple[int, int]` — returns (spine_index, chunk_index). Width-agnostic.
 > 
 > **CLI (`cli.py` with click):**
 > ```
@@ -284,7 +284,7 @@
 > **`extract.py`:**
 > 1. Open EPUB with ebooklib.
 > 2. Iterate `book.spine` in order. For each item of type `ITEM_DOCUMENT`:
->    - Write raw XHTML to `raw/NNN.xhtml` (zero-padded).
+>    - Write raw XHTML to `raw/NNNN.xhtml` (zero-padded with dynamic width).
 >    - Record original href in manifest.
 > 3. Enumerate all `ITEM_IMAGE` items and record paths (for rebuild).
 > 4. Preserve original EPUB metadata (title, author, language, identifier, etc.) in manifest.
@@ -293,14 +293,14 @@
 > 
 > **`clean.py`:**
 > 
-> For each `raw/NNN.xhtml`:
+> For each `raw/NNNN.xhtml`:
 > 1. Parse with BeautifulSoup (lxml).
 > 2. Pre-process ruby: replace each `<ruby>X<rt>Y</rt></ruby>` with text `{X|Y}`. Handle nested `<rb>`/`<rt>` variants and `<rp>` fallback parens.
 > 3. Strip `<style>` and `<script>` entirely.
 > 4. Strip purely presentational elements: empty `<div>`/`<span>`, elements with only class/id attributes and no semantic tag, etc.
 > 5. Convert to markdown with `markdownify`, configured to preserve `<br>`, `<b>`/`<strong>`, `<i>`/`<em>`, headings, `<hr>` (converted to scene break marker). Strip classes/ids.
 > 6. Normalize whitespace: collapse runs of blank lines to exactly two, strip trailing whitespace.
-> 7. Write to `clean/NNN.md`.
+> 7. Write to `clean/NNNN.md`.
 > 8. Count paragraphs (blocks separated by blank lines) and tokens (tiktoken cl100k).
 > 9. Update manifest with counts (using atomic write).
 > 
@@ -352,7 +352,7 @@
 > 
 > ### Block parsing
 > 
-> Parse `clean/NNN.md` into a list of `Block` objects. A block is the atomic unit the chunker works with — blocks are never split across chunks.
+> Parse `clean/NNNN.md` into a list of `Block` objects. A block is the atomic unit the chunker works with — blocks are never split across chunks.
 > 
 > Block types:
 > - `paragraph` — a run of non-empty lines separated from neighbors by blank lines. Lines joined by `<br>` or markdown hard line breaks (two trailing spaces) stay in one paragraph block.
@@ -374,7 +374,7 @@
 > 
 > When parsing blocks, test each paragraph's text against the configured `scene_break_patterns` regex list (strip surrounding whitespace first). If any pattern matches, the block's `kind` becomes `scene_break`. `hr` blocks are always treated as scene breaks by the chunker.
 > 
-> If `normalize_scene_breaks` is set in config (non-null), the block's `text` field is replaced with the normalized form during block parsing. This applies to both `scene_break` and `hr` blocks. The original `clean/NNN.md` file is not modified — normalization only affects the in-memory block and the chunk's saved `text`.
+> If `normalize_scene_breaks` is set in config (non-null), the block's `text` field is replaced with the normalized form during block parsing. This applies to both `scene_break` and `hr` blocks. The original `clean/NNNN.md` file is not modified — normalization only affects the in-memory block and the chunk's saved `text`.
 > 
 > ### The greedy packing algorithm
 > 
@@ -433,13 +433,13 @@
 > 
 > ### Chunk output
 > 
-> Each chunk is written (via `atomic_write`) to `chunks/NNN/NNN.MMM.json` (zero-padded 3-digit for both spine and chunk index). Uses the `Chunk` pydantic model from `schemas.py`.
+> Each chunk is written (via `atomic_write`) to `chunks/NNNN/NNNN.MMM.json` (spine portion uses dynamic padding width from `manifest.spine_padding_width`, chunk portion always 3 digits). Uses the `Chunk` pydantic model from `schemas.py`.
 > 
 > The `text` field is the LLM-ready content: blocks joined by `\n\n` (paragraph separator), scene breaks already normalized if configured.
 > 
 > ### Classification filtering
 > 
-> Before chunking any spine item, check its `classification` against `chunking.chunkable_classifications`. If not in the list (or classification is `unknown` — treat `unknown` as chunkable with a warning), skip chunking for that item. Set `manifest.spine[i].chunk_count = 0`, leave the `chunks/NNN/` directory empty (or don't create it), and record the stage as complete for that item.
+> Before chunking any spine item, check its `classification` against `chunking.chunkable_classifications`. If not in the list (or classification is `unknown` — treat `unknown` as chunkable with a warning), skip chunking for that item. Set `manifest.spine[i].chunk_count = 0`, leave the `chunks/NNNN/` directory empty (or don't create it), and record the stage as complete for that item.
 > 
 > ### Validation before emitting chunks
 > 
@@ -471,7 +471,7 @@
 > 
 > - No `--spine`: chunk all eligible items that haven't been chunked yet.
 > - `--spine N`: chunk just spine N (by integer index). Useful for iterating during development.
-> - `--force`: rechunk even if already complete. Deletes existing `chunks/NNN/` directory first.
+> - `--force`: rechunk even if already complete. Deletes existing `chunks/NNNN/` directory first.
 > 
 > Progress via `rich.progress.Progress`.
 > 
@@ -486,11 +486,11 @@
 > ### Behavior
 > 
 > For each spine item in the manifest where `chunk_count > 0`:
-> 1. Load all chunks from `chunks/NNN/` (sorted by `chunk_index`).
-> 2. Load corresponding translations from `translations/NNN/NNN.MMM.json` (assumed to exist — translation stage is a future prompt, but assembler should work with whatever produces files matching the `TranslatedChunk` schema).
+> 1. Load all chunks from `chunks/NNNN/` (sorted by `chunk_index`).
+> 2. Load corresponding translations from `translations/NNNN/NNNN.MMM.json` (assumed to exist — translation stage is a future prompt, but assembler should work with whatever produces files matching the `TranslatedChunk` schema).
 > 3. Verify all chunk IDs have corresponding translations. If any are missing, raise an error listing the missing ones.
 > 4. Concatenate `translated_text` of each chunk in order, joined by `\n\n`.
-> 5. Write to `assembled/NNN.md` (via `atomic_write`).
+> 5. Write to `assembled/NNNN.md` (via `atomic_write`).
 > 
 > For spine items with `chunk_count == 0` (skipped by chunker — illustrations, auto-tocs): no assembly work. The rebuild stage will handle these by passing through raw XHTML.
 > 
@@ -510,7 +510,7 @@
 > 
 > ### Validation
 > 
-> Before writing `assembled/NNN.md`:
+> Before writing `assembled/NNNN.md`:
 > - All expected chunk translations are present.
 > - Concatenated output is non-empty.
 > - Rough token count of output is within reasonable bounds of sum of input translation token counts (sanity check).
@@ -589,7 +589,7 @@
 > 
 > **Classification strategy — three layers:**
 > 
-> **Layer 1: Structural hints (no LLM).** Inspect the raw XHTML (`raw/NNN.xhtml`) for deterministic signals:
+> **Layer 1: Structural hints (no LLM).** Inspect the raw XHTML (`raw/NNNN.xhtml`) for deterministic signals:
 > 
 > - If the root element or any ancestor has `epub:type="toc"` or contains `<nav epub:type="toc">`: classify as `toc_auto`.
 > - If the file's visible text content (after stripping tags) is under 30 tokens AND it contains at least one `<img>` tag: classify as `illustration`.
@@ -649,7 +649,7 @@
 > 
 > **State tracking:**
 > 
-> `classify` is a per-item stage. `item_id` format is the padded spine id (e.g., `003`). Mark started/completed/failed. Idempotent — re-running skips already-classified items.
+> `classify` is a per-item stage. `item_id` format is the padded spine id (e.g., `0003`). Mark started/completed/failed. Idempotent — re-running skips already-classified items.
 > 
 > **Tests:**
 > 
@@ -687,7 +687,7 @@
 > 
 > **Prerequisites:**
 > - All from Prompts 1, 2, 3a.
-> - Chunks written to `chunks/NNN/NNN.MMM.json`.
+> - Chunks written to `chunks/NNNN/NNNN.MMM.json`.
 > - `LLMClient.complete_json()` available (accepts Pydantic model class).
 > - `GlossaryEntry` and `Glossary` schemas already defined in `schemas.py` from Prompt 1 (with all fields: nicknames, speech_style, source, source_books, book_id, book_metadata, timestamps).
 > - Config `glossary` and `glossary_phase` sections already loaded from Prompt 1.
@@ -964,7 +964,7 @@
 > 
 > **Prerequisites:**
 > - All from Prompts 1, 2, 3a, 3b.
-> - Chunks at `chunks/NNN/NNN.MMM.json`.
+> - Chunks at `chunks/NNNN/NNNN.MMM.json`.
 > - Per-book glossary at `<work_dir>/glossary.json`.
 > - `LLMClient` with `complete()` and `complete_json()` methods.
 > - State tracking with per-chunk granularity.
@@ -1004,9 +1004,9 @@
 > Include `speech_style` and `nicknames` only for character entries. Omit fields that are null/empty.
 > 
 > **Overlap:**
-> - If this chunk is `NNN.MMM` where `MMM > 1`: load the translation for `NNN.(MMM-1)`. Use its `source_text` and `translated_text`.
-> - If this chunk is `NNN.001` and `cross_spine_overlap` is enabled: find the previous spine in the manifest that has `chunk_count > 0`. Load its last chunk's translation.
-> - If this is the very first chunk of the book (`001.001`) or if `overlap_chunks: 0`: no overlap.
+> - If this chunk is `NNNN.MMM` where `MMM > 1`: load the translation for `NNNN.(MMM-1)`. Use its `source_text` and `translated_text`.
+> - If this chunk is `NNNN.001` and `cross_spine_overlap` is enabled: find the previous spine in the manifest that has `chunk_count > 0`. Load its last chunk's translation.
+> - If this is the very first chunk of the book (`0001.001`) or if `overlap_chunks: 0`: no overlap.
 > - If the required overlap chunk hasn't been translated: raise an error. Translation must proceed sequentially when overlap is enabled.
 > 
 > **Rolling summary:**
@@ -1115,9 +1115,9 @@
 > 
 > ### 5. Save results
 > 
-> Write `TranslatedChunk` to `translations/NNN/NNN.MMM.json` (via `atomic_write`).
+> Write `TranslatedChunk` to `translations/NNNN/NNNN.MMM.json` (via `atomic_write`).
 > 
-> Create the `translations/NNN/` directory if it doesn't exist.
+> Create the `translations/NNNN/` directory if it doesn't exist.
 > 
 > ---
 > 
@@ -1217,22 +1217,22 @@
 > ## CLI
 > 
 > ```
-> dao-bridge translate [--work-dir ./work] [--spine N] [--chunk NNN.MMM] [--from NNN.MMM] [--to NNN.MMM] [--force] [--verbose]
+> dao-bridge translate [--work-dir ./work] [--spine N] [--chunk NNNN.MMM] [--from NNNN.MMM] [--to NNNN.MMM] [--force] [--verbose]
 > ```
 > 
 > - Default: translate all untranslated chunks in sequential order.
 > - `--spine N`: only chunks in spine N.
-> - `--chunk NNN.MMM`: translate a single specific chunk (shorthand for `--from NNN.MMM --to NNN.MMM`).
-> - `--from NNN.MMM`: start translating from this chunk (inclusive). Without `--to`, continues to end of book.
-> - `--to NNN.MMM`: stop translating after this chunk (inclusive). Must be used with `--from`.
+> - `--chunk NNNN.MMM`: translate a single specific chunk (shorthand for `--from NNNN.MMM --to NNNN.MMM`).
+> - `--from NNNN.MMM`: start translating from this chunk (inclusive). Without `--to`, continues to end of book.
+> - `--to NNNN.MMM`: stop translating after this chunk (inclusive). Must be used with `--from`.
 > - `--force`: retranslate even if already completed.
 > 
-> Range semantics: `--from 003.005 --to 005.002` translates all chunks whose chunk_id falls within that range (zero-padded string comparison). This naturally spans across spines.
+> Range semantics: `--from 0003.005 --to 0005.002` translates all chunks whose chunk_id falls within that range (zero-padded string comparison). This naturally spans across spines.
 > 
 > **End-of-run summary:** On exit (success or failure), print a summary:
 > - On success: "Translated X chunks. Total tokens: Y. Average time per chunk: Z seconds."
-> - On QA halt: "Translated X chunks successfully. Halted at chunk NNN.MMM: [QA failure reason]. Fix the issue and re-run to continue."
-> - On infrastructure failure: "Translated X chunks successfully. Failed at chunk NNN.MMM: [error]. Re-run to retry."
+> - On QA halt: "Translated X chunks successfully. Halted at chunk NNNN.MMM: [QA failure reason]. Fix the issue and re-run to continue."
+> - On infrastructure failure: "Translated X chunks successfully. Failed at chunk NNNN.MMM: [error]. Re-run to retry."
 > 
 > Progress display via `rich`:
 > - Current chunk ID.
@@ -1246,7 +1246,7 @@
 > 
 > ## State tracking
 > 
-> `translate` stage is per-chunk. `item_id` is the chunk_id (`003.015`). States: `pending`, `started`, `completed`, `failed`, `failed_qa`.
+> `translate` stage is per-chunk. `item_id` is the chunk_id (`0003.015`). States: `pending`, `started`, `completed`, `failed`, `failed_qa`.
 > 
 > `failed_qa` is distinct from `failed` (infrastructure error). `failed_qa` means the translation was produced but didn't pass quality checks. The translation is still saved (it might be usable with manual review).
 > 
@@ -1256,7 +1256,7 @@
 > - Retries `failed_qa` items (user presumably fixed the issue — swapped model, edited glossary, adjusted prompts).
 > - Halts on new QA failure after retries exhausted.
 > 
-> Sequential enforcement: when `overlap_chunks > 0`, before translating chunk N, verify chunk N-1 is `completed`. If not, error: "Chunk NNN.MMM depends on NNN.{MMM-1} which has not been translated."
+> Sequential enforcement: when `overlap_chunks > 0`, before translating chunk N, verify chunk N-1 is `completed`. If not, error: "Chunk NNNN.MMM depends on NNNN.{MMM-1} which has not been translated."
 > 
 > ---
 > 
@@ -1266,8 +1266,8 @@
 > 
 > ```json
 > [
->   {"chunk_id": "001.001", "summary": "Subaru arrives at..."},
->   {"chunk_id": "001.002", "summary": "Priscilla proposes..."},
+>   {"chunk_id": "0001.001", "summary": "Subaru arrives at..."},
+>   {"chunk_id": "0001.002", "summary": "Priscilla proposes..."},
 >   ...
 > ]
 > ```
@@ -1288,9 +1288,9 @@
 > - Message extension: verify QA messages append to Pass 2 messages correctly.
 > 
 > **Overlap:**
-> - Same-spine overlap: chunk 003.015 includes 003.014's source + translation in user message.
-> - Cross-spine overlap: chunk 003.001 includes last chunk of spine 002.
-> - Cross-spine disabled: chunk 003.001 has no overlap.
+> - Same-spine overlap: chunk 0003.015 includes 0003.014's source + translation in user message.
+> - Cross-spine overlap: chunk 0003.001 includes last chunk of spine 0002.
+> - Cross-spine disabled: chunk 0003.001 has no overlap.
 > - First chunk of book: no overlap, overlap messages omitted.
 > - Missing overlap chunk: raises error when overlap is enabled.
 > 
@@ -1322,7 +1322,7 @@
 > - Completed chunks skipped on re-run.
 > - Failed chunks retried on re-run.
 > - failed_qa chunks retried on re-run (no --force needed).
-> - `--chunk NNN.MMM` translates only that chunk.
+> - `--chunk NNNN.MMM` translates only that chunk.
 > - `--from`/`--to` range translates the specified range.
 > - Sequential enforcement: error when previous chunk not completed (overlap enabled).
 > 
@@ -1365,7 +1365,7 @@
 > 
 > **Prerequisites:**
 > - All from Prompts 1–4.
-> - `assembled/NNN.md` files for all translated spine items.
+> - `assembled/NNNN.md` files for all translated spine items.
 > - Per-book glossary at `<work_dir>/glossary.json`.
 > - Original source EPUB accessible (path from config or manifest).
 > - Config `output` section already loaded from Prompt 1.
@@ -1409,7 +1409,7 @@
 > For each spine item in the manifest where `chunk_count > 0` (it was translated):
 > 
 > 1. Read the original XHTML from the source EPUB ZIP (using the resolved ZIP path from `original_href`).
-> 2. Read the translated markdown from `assembled/NNN.md`.
+> 2. Read the translated markdown from `assembled/NNNN.md`.
 > 3. Convert the markdown to HTML using a ruby-safe pipeline:
 >    a. **Before markdown conversion:** Replace all `{kanji|reading}` notation with unique placeholders (e.g., `RUBY_0001`, `RUBY_0002`). This prevents the `markdown` library's `attr_list` extension (included in `extra`) from mangling the `{...}` syntax.
 >    b. **Markdown conversion:** Use the `markdown` library with the `extra` extension.
@@ -1567,7 +1567,7 @@
 > ```
 > 
 > Validates before running:
-> - All translatable spine items have corresponding `assembled/NNN.md` files.
+> - All translatable spine items have corresponding `assembled/NNNN.md` files.
 > - Source EPUB is accessible.
 > - Output path is writable.
 > 

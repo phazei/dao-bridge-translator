@@ -37,7 +37,7 @@ def _write_chunk(work_dir: Path, spine_index: int, chunk_index: int, text: str) 
         chunk_id=chunk_id,
         spine_index=spine_index,
         chunk_index=chunk_index,
-        source_file=f"clean/{spine_index:03d}.md",
+        source_file=f"clean/{spine_index:04d}.md",
         block_range=(chunk_index - 1, chunk_index - 1),  # simplified
         token_count=len(text.split()),
         text=text,
@@ -133,7 +133,7 @@ class TestMissingTranslation:
         # Only write translation for chunk 1, not chunk 2.
         _write_translation(work_dir, 1, 1, "Translation 1.")
 
-        with pytest.raises(FileNotFoundError, match="Missing translations.*001\\.002"):
+        with pytest.raises(FileNotFoundError, match="Missing translations.*0001\\.002"):
             assemble_spine_item(work_dir, 1, 2)
 
     def test_multiple_missing_translations_listed(self, tmp_path: Path):

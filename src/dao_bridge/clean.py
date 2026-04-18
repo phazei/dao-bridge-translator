@@ -333,6 +333,7 @@ def clean_all(
         The updated manifest.
     """
     work_dir = config.work_dir_path
+    sw = manifest.spine_padding_width
 
     if not force and is_stage_completed(state, "clean"):
         logger.info("Clean stage already completed — skipping (use --force to re-run)")
@@ -344,10 +345,10 @@ def clean_all(
     mark_stage_started(work_dir, state, "clean")
 
     for item in manifest.spine:
-        padded = pad_spine(item.spine_index)
+        padded = pad_spine(item.spine_index, sw)
         mark_item_started(work_dir, state, "clean", padded)
 
-        rp = raw_path(work_dir, item.spine_index)
+        rp = raw_path(work_dir, item.spine_index, sw)
         if not rp.exists():
             logger.warning("Raw file missing for spine %s: %s", padded, rp)
             continue
@@ -355,7 +356,7 @@ def clean_all(
         raw_xhtml = rp.read_text(encoding="utf-8")
         md = clean_spine_item(raw_xhtml)
 
-        cp = clean_path(work_dir, item.spine_index)
+        cp = clean_path(work_dir, item.spine_index, sw)
         cp.parent.mkdir(parents=True, exist_ok=True)
 
         # Count before writing.

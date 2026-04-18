@@ -10,7 +10,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Literal
 
-from pydantic import BaseModel, Field, computed_field
+from pydantic import BaseModel, Field
 
 # ---------------------------------------------------------------------------
 # Classification literal
@@ -44,12 +44,6 @@ class ManifestItem(BaseModel):
     paragraph_count: int | None = None
     chunk_count: int | None = None  # set by chunker later
 
-    @computed_field  # type: ignore[prop-decorator]
-    @property
-    def padded_id(self) -> str:
-        """Zero-padded 3-digit spine index string."""
-        return f"{self.spine_index:03d}"
-
 
 class Manifest(BaseModel):
     """Book-level manifest persisted to ``manifest.json``."""
@@ -57,6 +51,7 @@ class Manifest(BaseModel):
     source_epub_path: str
     book_id: str
     opf_dir: str = ""  # OPF directory within the EPUB ZIP (e.g. "OEBPS")
+    spine_padding_width: int = 4  # computed at extract time as max(4, len(str(spine_count)))
     spine: list[ManifestItem] = []
     images: list[str] = []
     metadata: dict = {}

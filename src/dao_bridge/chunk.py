@@ -259,12 +259,13 @@ def _make_chunk(
     source_file: str,
     *,
     extended_for_remainder: bool = False,
+    spine_width: int = 4,
 ) -> Chunk:
     """Build a :class:`Chunk` from a list of blocks."""
     text = "\n\n".join(b.text for b in blocks)
     last_kind = blocks[-1].kind if blocks else "paragraph"
     return Chunk(
-        chunk_id=format_chunk_id(spine_index, chunk_index),
+        chunk_id=format_chunk_id(spine_index, chunk_index, spine_width),
         spine_index=spine_index,
         chunk_index=chunk_index,
         source_file=source_file,
@@ -286,6 +287,7 @@ def chunk_blocks(
     config: ChunkingConfig,
     spine_index: int,
     source_file: str,
+    spine_width: int = 4,
 ) -> list[Chunk]:
     """Pack *blocks* into chunks using the greedy algorithm.
 
@@ -299,6 +301,8 @@ def chunk_blocks(
         Spine index for chunk ID generation.
     source_file:
         Path to the clean markdown file (stored in each chunk).
+    spine_width:
+        Zero-padding width for spine indices in chunk IDs.
 
     Returns
     -------
@@ -334,6 +338,7 @@ def chunk_blocks(
                         chunk_index,
                         spine_index,
                         source_file,
+                        spine_width=spine_width,
                     )
                 )
                 current_blocks = leftover + [block]
@@ -345,6 +350,7 @@ def chunk_blocks(
                         chunk_index,
                         spine_index,
                         source_file,
+                        spine_width=spine_width,
                     )
                 )
                 current_blocks = [block]
@@ -372,6 +378,7 @@ def chunk_blocks(
                     spine_index,
                     source_file,
                     extended_for_remainder=True,
+                    spine_width=spine_width,
                 )
             )
         else:
@@ -381,6 +388,7 @@ def chunk_blocks(
                     chunk_index,
                     spine_index,
                     source_file,
+                    spine_width=spine_width,
                 )
             )
 
@@ -468,6 +476,7 @@ def chunk_spine_item(
     work_dir: Path,
     item: ManifestItem,
     config: ChunkingConfig,
+    spine_width: int = 4,
 ) -> int:
     """Chunk a single spine item, writing chunk files to disk.
 
@@ -479,21 +488,24 @@ def chunk_spine_item(
         Manifest item to chunk.
     config:
         Chunking configuration.
+    spine_width:
+        Zero-padding width for spine indices.
 
     Returns
     -------
     int
         Number of chunks produced.
     """
-    cp = clean_path(work_dir, item.spine_index)
+    padded = pad_spine(item.spine_index, spine_width)
+    cp = clean_path(work_dir, item.spine_index, spine_width)
     if not cp.exists():
-        raise FileNotFoundError(f"Clean file missing for spine {item.padded_id}: {cp}")
+        raise FileNotFoundError(f"Clean file missing for spine {padded}: {cp}")
 
     md_text = cp.read_text(encoding="utf-8")
     blocks = parse_blocks(md_text, config)
 
     if not blocks:
-        logger.warning("Spine %s: empty file, producing zero chunks", item.padded_id)
+        logger.warning("Spine %s: empty file, producing zero chunks", padded)
         return 0
 
     # Check for oversized single blocks.
@@ -502,7 +514,7 @@ def chunk_spine_item(
             logger.warning(
                 "Spine %s: block %d has %d tokens (exceeds max_tokens=%d). "
                 "This block will become its own oversized chunk.",
-                item.padded_id,
+                padded,
                 b.index,
                 b.token_count,
                 config.max_tokens,
@@ -510,15 +522,15 @@ def chunk_spine_item(
 
     # Use forward slashes for cross-platform consistency in stored paths.
     source_file = cp.relative_to(work_dir).as_posix()
-    chunks = chunk_blocks(blocks, config, item.spine_index, source_file)
+    chunks = chunk_blocks(blocks, config, item.spine_index, source_file, spine_width)
     validate_chunks(blocks, chunks)
 
     # Write chunk files.
-    cd = chunk_dir(work_dir, item.spine_index)
+    cd = chunk_dir(work_dir, item.spine_index, spine_width)
     cd.mkdir(parents=True, exist_ok=True)
 
     for c in chunks:
-        cp_out = chunk_path(work_dir, c.chunk_id)
+        cp_out = chunk_path(work_dir, c.chunk_id, spine_width)
         atomic_write(cp_out, c.model_dump_json(indent=2))
 
     return len(chunks)
@@ -569,11 +581,12 @@ def chunk_all(
     work_dir = config.work_dir_path
     chunk_cfg = config.chunking
     chunkable = set(chunk_cfg.chunkable_classifications)
+    sw = manifest.spine_padding_width
 
     # Gate: classification must be set for all items.
     unclassified = [item for item in manifest.spine if item.classification is None]
     if unclassified:
-        ids = ", ".join(item.padded_id for item in unclassified)
+        ids = ", ".join(pad_spine(item.spine_index, sw) for item in unclassified)
         raise RuntimeError(
             f"Classification required before chunking. "
             f"Run `dao-bridge classify` first. "
@@ -598,7 +611,7 @@ def chunk_all(
     mark_stage_started(work_dir, state, "chunk")
 
     # Build list of item IDs for pending check.
-    item_ids = [pad_spine(item.spine_index) for item in items]
+    item_ids = [pad_spine(item.spine_index, sw) for item in items]
     pending = set(iter_pending_items(state, "chunk", item_ids))
 
     skipped = 0
@@ -606,7 +619,7 @@ def chunk_all(
     total_chunks = 0
 
     for item in items:
-        padded = pad_spine(item.spine_index)
+        padded = pad_spine(item.spine_index, sw)
 
         # Skip if already completed (unless force).
         if not force and padded not in pending:
@@ -641,11 +654,11 @@ def chunk_all(
         try:
             # Delete existing chunks if forcing.
             if force:
-                cd = chunk_dir(work_dir, item.spine_index)
+                cd = chunk_dir(work_dir, item.spine_index, sw)
                 if cd.exists():
                     shutil.rmtree(cd)
 
-            n_chunks = chunk_spine_item(work_dir, item, chunk_cfg)
+            n_chunks = chunk_spine_item(work_dir, item, chunk_cfg, sw)
             item.chunk_count = n_chunks
             mark_item_completed(work_dir, state, "chunk", padded)
             chunked += 1

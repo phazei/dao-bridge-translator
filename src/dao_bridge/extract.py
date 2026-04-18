@@ -188,6 +188,15 @@ def extract_epub(
     # Track which document items are in the spine.
     spine_doc_ids: set[str] = set()
 
+    # Pre-count spine documents to compute padding width.
+    spine_doc_count = sum(
+        1
+        for item_id, _linear in book.spine
+        if item_id in all_items and all_items[item_id].get_type() == ebooklib.ITEM_DOCUMENT
+    )
+    spine_padding_width = max(4, len(str(spine_doc_count)))
+    logger.debug("Spine padding width: %d (for %d items)", spine_padding_width, spine_doc_count)
+
     for spine_index, (item_id, _linear) in enumerate(book.spine):
         item = all_items.get(item_id)
         if item is None:
@@ -200,8 +209,8 @@ def extract_epub(
             continue
 
         spine_doc_ids.add(item_id)
-        padded = pad_spine(spine_index)
-        rp = raw_path(work_dir, spine_index)
+        padded = pad_spine(spine_index, spine_padding_width)
+        rp = raw_path(work_dir, spine_index, spine_padding_width)
         href = item.get_name()
 
         mark_item_started(work_dir, state, "extract", padded)
@@ -254,6 +263,7 @@ def extract_epub(
         source_epub_path=str(epub_path),
         book_id=book_id,
         opf_dir=opf_dir,
+        spine_padding_width=spine_padding_width,
         spine=spine_items,
         images=images,
         metadata=metadata,

@@ -172,6 +172,12 @@ class GlossarySpeechMergeResponse(BaseModel):
     consolidated_speech_style: str
 
 
+class TocTranslationResponse(BaseModel):
+    """LLM response for ToC title translation."""
+
+    titles: list[str]
+
+
 # ---------------------------------------------------------------------------
 # TranslatedChunk
 # ---------------------------------------------------------------------------

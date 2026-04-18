@@ -1,0 +1,15 @@
+Translate these {source_language} chapter/section titles to {target_language}.
+
+Rules:
+- Use the glossary below for proper nouns and character names.
+- Maintain the original style and tone of each title.
+- If a title is already in {target_language} or is a language-neutral label (e.g. "Prologue", "Epilogue"), return it unchanged.
+- Preserve any numbering patterns (e.g. chapter numbers, volume numbers).
+- Preserve any punctuation conventions (e.g. em-dashes, colons separating number from subtitle).
+- Return a JSON object with a "titles" key containing an array of translated titles in the exact same order as the input.  The array must have exactly the same length as the input array.
+
+Glossary:
+{glossary}
+
+Titles to translate:
+{titles_json}

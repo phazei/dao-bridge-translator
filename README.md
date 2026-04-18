@@ -18,6 +18,22 @@ pip install -e ".[dev]"
 
 ## Quickstart
 
+Translate an EPUB from start to finish in two commands:
+
+```bash
+# 1. Initialise a work directory from an EPUB
+dao-bridge init /path/to/book.epub --work-dir ./work
+
+# 2. Run the full pipeline (extract through rebuild)
+dao-bridge run --work-dir ./work
+```
+
+The `run` command chains all stages automatically.  If interrupted, re-run
+to pick up where it left off.  Each stage is idempotent and skips completed
+work.
+
+### Step-by-step (individual commands)
+
 ```bash
 # 1. Initialise a work directory from an EPUB
 dao-bridge init /path/to/book.epub --work-dir ./work
@@ -43,13 +59,14 @@ dao-bridge glossary-reconcile --work-dir ./work
 # 8. Export glossary for human review
 dao-bridge glossary-export --work-dir ./work
 
-# 9. (translate — not yet implemented)
+# 9. Translate all chunks (LLM-powered)
+dao-bridge translate --work-dir ./work
 
 # 10. Assemble translated chunks into per-spine markdown
 dao-bridge assemble --work-dir ./work
 
-# Run all stages through glossary in one command
-dao-bridge run --work-dir ./work
+# 11. Build the output EPUB
+dao-bridge rebuild --work-dir ./work
 
 # Check pipeline status at any time
 dao-bridge status --work-dir ./work
@@ -58,7 +75,7 @@ dao-bridge status --work-dir ./work
 Each command is idempotent: re-running skips completed work unless `--force`
 is passed. Add `--verbose` to any command for DEBUG-level console output.
 
-## Currently Working Commands
+## Commands
 
 | Command | Description |
 |---------|-------------|
@@ -70,12 +87,17 @@ is passed. Add `--verbose` to any command for DEBUG-level console output.
 | `glossary-build` | Extract per-book glossary from chunked source text |
 | `glossary-reconcile` | Resolve within-book glossary conflicts via LLM |
 | `glossary-export` | Export glossary as human-readable markdown |
+| `translate` | Translate all chunks using LLM (double-pass, QA) |
 | `assemble` | Reassemble translated chunks into `assembled/NNN.md` |
-| `run` | Chain all stages (extract through glossary-reconcile) |
+| `rebuild` | Build output EPUB from assembled translations |
+| `run` | Chain all stages (extract through rebuild) |
 | `status` | Display pipeline stage completion status |
 
 The `classify`, `chunk`, and `assemble` commands support `--spine N` to process
 a single spine item, and `--force` to reprocess even if already complete.
+
+The `translate` command supports `--spine N`, `--chunk ID`, `--from/--to` for
+range-based translation, and `--force` to retranslate completed chunks.
 
 ### Glossary Flow
 
@@ -103,6 +125,37 @@ overwriting them.
 **Master glossary features** (`glossary-crosscheck`, `glossary-promote`,
 `glossary-import-reference`) for multi-book series with consistent terminology
 are planned for a future release.
+
+### Translation
+
+The `translate` command runs a multi-pass translation pipeline for each chunk:
+
+1. **Pass 1** -- Initial translation with glossary injection, overlap context
+   from the previous chunk, and rolling narrative summary for continuity.
+2. **Pass 2** (optional) -- Revision pass comparing the draft against the
+   original, with instructions to improve naturalness and accuracy.
+3. **QA** (optional) -- Programmatic length-ratio check plus LLM-based quality
+   assessment.  On QA failure after retries, the pipeline halts for manual
+   intervention.
+
+Rolling summaries are generated after each chunk for story continuity across
+the book.
+
+### Rebuild
+
+The `rebuild` command produces the output EPUB:
+
+- **Modified copy approach** -- copies the source EPUB at the ZIP level,
+  replacing only translated XHTML body content, ToC entries, and metadata.
+  Preserves all original structure: images, fonts, CSS, DRM metadata, and
+  everything else.
+- **ToC translation** -- Translates chapter/section titles in both
+  `toc.ncx` (EPUB 2) and `nav.xhtml` (EPUB 3) via a single LLM call.
+- **Metadata updates** -- Sets language to target, appends title suffix,
+  optionally adds a machine-translation note and new identifier.
+- **CSS options** -- By default preserves original CSS (`css: original`).
+  Set `css: default` to inject a minimal fallback stylesheet.
+- **Validation** -- Optionally runs `epubcheck` if available on PATH.
 
 ### Manual Classification Override
 
@@ -134,11 +187,14 @@ work/
       0000.002.json
     0001/
       0001.001.json
-  translations/        # (future) Per-chunk translations
+  translations/        # Per-chunk translation results
+    0000/
+      0000.001.json    #     TranslatedChunk JSON
   assembled/           # Reassembled translated markdown
     0000.md
     0001.md
-  summaries/           # (future) Rolling translation summaries
+  summaries/           # Rolling translation summaries
+    rolling_summary.json
   glossary.json        # Per-book glossary (build -> reconcile -> user edit)
   glossary.md          # Exported glossary for human review
   glossary_reconcile_report.md  # Reconciliation decisions and reasoning
@@ -183,6 +239,28 @@ by `dao-bridge init`. Key sections:
 - **output**: EPUB output path, metadata options
 - **languages**: Source and target language codes
 - **llm**: Global retry and timeout settings
+
+### Output Configuration
+
+The `output` section controls the rebuilt EPUB:
+
+```yaml
+output:
+    epub_path: ./book.en.epub           # Output file path (relative to work dir parent)
+    title_suffix: ' (English Translation)'  # Appended to the book title
+    new_identifier: false               # Generate new UUID for dc:identifier
+    css: original                       # 'original' (keep source CSS) or 'default' (inject fallback)
+    add_translation_note: true          # Add machine-translation note to dc:description
+    validate: false                     # Run epubcheck on output (if available on PATH)
+```
+
+### epubcheck Integration
+
+If `validate: true` is set and `epubcheck` is on your PATH, the rebuild
+stage will run it on the output EPUB and log the results.  Validation failure
+is logged as a warning but does not prevent the EPUB from being written.
+
+Install epubcheck from https://github.com/w3c/epubcheck.
 
 See `src/dao_bridge/config.py` for the full schema with defaults.
 

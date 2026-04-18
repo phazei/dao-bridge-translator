@@ -763,7 +763,35 @@ def translate(
 
 
 # ---------------------------------------------------------------------------
-# run (chains all implemented stages)
+# rebuild
+# ---------------------------------------------------------------------------
+
+
+@cli.command()
+@click.option(
+    "--work-dir", type=click.Path(exists=True), default="./work", help="Work directory path."
+)
+@click.option("--force", is_flag=True, help="Force rebuild even if already completed.")
+@click.pass_context
+def rebuild(ctx: click.Context, work_dir: str, force: bool) -> None:
+    """Build translated EPUB from assembled markdown files.
+
+    Copies the source EPUB at the ZIP level, replacing only translated
+    XHTML body content, ToC entries, and metadata.  Preserves all original
+    structure, images, fonts, and CSS.
+    """
+    work = Path(work_dir).resolve()
+    setup_logging(work, ctx.obj["verbose"])
+    config = _resolve_config(work)
+
+    from dao_bridge.rebuild import run_rebuild_stage
+
+    run_rebuild_stage(work, config, force=force)
+    click.echo(f"Output EPUB: {config.output.epub_path}")
+
+
+# ---------------------------------------------------------------------------
+# run (chains all stages)
 # ---------------------------------------------------------------------------
 
 
@@ -774,11 +802,13 @@ def translate(
 @click.option("--force", is_flag=True, help="Force re-run of all stages.")
 @click.pass_context
 def run(ctx: click.Context, work_dir: str, force: bool) -> None:
-    """Run the full pipeline through glossary stages.
+    """Run the full translation pipeline.
 
     Chains: extract -> clean -> classify -> chunk -> glossary-build ->
-    glossary-reconcile.  Each stage skips completed work unless --force
-    is passed.
+    glossary-reconcile -> translate -> assemble -> rebuild.
+
+    Each stage skips completed work unless --force is passed.
+    Stops immediately on first stage failure.
     """
     work = Path(work_dir).resolve()
     setup_logging(work, ctx.obj["verbose"])
@@ -793,61 +823,139 @@ def run(ctx: click.Context, work_dir: str, force: bool) -> None:
 
     manifest = Manifest(**json.loads(mp.read_text(encoding="utf-8")))
 
-    # --- Stage 1: extract ---
-    click.echo("=== extract ===")
-    from dao_bridge.extract import extract_epub
+    def _run_stage(name: str, fn):
+        """Execute a stage, halting the pipeline on failure."""
+        click.echo(f"=== {name} ===")
+        try:
+            return fn()
+        except Exception as e:
+            click.echo(f"\nPipeline halted at stage '{name}': {e}", err=True)
+            click.echo("Fix the issue and re-run.  Completed stages will be skipped.", err=True)
+            sys.exit(1)
 
-    manifest = extract_epub(config, state, force=force)
-    click.echo(f"  {len(manifest.spine)} spine items, {len(manifest.images)} images")
+    # --- Stage 1: extract ---
+    def _extract():
+        nonlocal manifest
+        from dao_bridge.extract import extract_epub
+
+        manifest = extract_epub(config, state, force=force)
+        click.echo(f"  {len(manifest.spine)} spine items, {len(manifest.images)} images")
+
+    _run_stage("extract", _extract)
 
     # --- Stage 2: clean ---
-    click.echo("=== clean ===")
-    from dao_bridge.clean import clean_all
+    def _clean():
+        nonlocal manifest
+        from dao_bridge.clean import clean_all
 
-    manifest = clean_all(config, manifest, state, force=force)
-    total_tokens = sum(i.token_count or 0 for i in manifest.spine)
-    click.echo(f"  {len(manifest.spine)} items ({total_tokens:,} total tokens)")
+        manifest = clean_all(config, manifest, state, force=force)
+        total_tokens = sum(i.token_count or 0 for i in manifest.spine)
+        click.echo(f"  {len(manifest.spine)} items ({total_tokens:,} total tokens)")
+
+    _run_stage("clean", _clean)
 
     # --- Stage 3: classify ---
-    click.echo("=== classify ===")
-    from dao_bridge.classify import run_classify_stage
+    def _classify():
+        nonlocal manifest
+        from dao_bridge.classify import run_classify_stage
 
-    manifest = run_classify_stage(work, config, state, force=force)
-    from collections import Counter
+        manifest = run_classify_stage(work, config, state, force=force)
+        from collections import Counter
 
-    counts = Counter(item.classification for item in manifest.spine)
-    click.echo(f"  {dict(counts)}")
+        counts = Counter(item.classification for item in manifest.spine)
+        click.echo(f"  {dict(counts)}")
+
+    _run_stage("classify", _classify)
 
     # --- Stage 4: chunk ---
-    click.echo("=== chunk ===")
-    from dao_bridge.chunk import chunk_all
+    def _chunk():
+        nonlocal manifest
+        from dao_bridge.chunk import chunk_all
 
-    manifest = chunk_all(config, manifest, state, force=force)
-    total_chunks = sum(i.chunk_count or 0 for i in manifest.spine)
-    click.echo(f"  {total_chunks} total chunks")
+        manifest = chunk_all(config, manifest, state, force=force)
+        total_chunks = sum(i.chunk_count or 0 for i in manifest.spine)
+        click.echo(f"  {total_chunks} total chunks")
+
+    _run_stage("chunk", _chunk)
 
     # --- Stage 5: glossary-build ---
-    click.echo("=== glossary-build ===")
-    from dao_bridge.glossary import glossary_build, glossary_reconcile
+    def _glossary_build():
+        from dao_bridge.glossary import glossary_build
 
-    glossary = glossary_build(work, config, state, force=force)
-    click.echo(f"  {len(glossary.entries)} entries extracted")
+        glossary = glossary_build(work, config, state, force=force)
+        click.echo(f"  {len(glossary.entries)} entries extracted")
+
+    _run_stage("glossary-build", _glossary_build)
 
     # --- Stage 6: glossary-reconcile ---
-    click.echo("=== glossary-reconcile ===")
-    glossary = glossary_reconcile(work, config, state, force=force)
-    click.echo(f"  {len(glossary.entries)} entries (reconciled)")
+    def _glossary_reconcile():
+        from dao_bridge.glossary import glossary_reconcile
 
-    click.echo("\nPipeline complete through glossary stages.")
+        glossary = glossary_reconcile(work, config, state, force=force)
+        click.echo(f"  {len(glossary.entries)} entries (reconciled)")
+
+    _run_stage("glossary-reconcile", _glossary_reconcile)
+
+    # --- Stage 6b: glossary-crosscheck (skip with warning if not implemented) ---
+    if config.glossary.crosscheck.enabled:
+        click.echo("=== glossary-crosscheck ===")
+        click.echo("  WARNING: glossary-crosscheck is not yet implemented, skipping.")
+
+    # --- Stage 7: translate ---
+    def _translate():
+        # Re-load manifest in case chunk stage updated it.
+        nonlocal manifest
+        manifest = Manifest(**json.loads(mp.read_text(encoding="utf-8")))
+
+        from dao_bridge.translate import run_translate_stage
+
+        result = run_translate_stage(
+            work_dir=work,
+            config=config,
+            state=state,
+            manifest=manifest,
+            force=force,
+        )
+        if result["error"] is not None:
+            raise RuntimeError(
+                f"Translation failed at chunk {result['failed_chunk']}: {result['error']}"
+            )
+        click.echo(
+            f"  {result['completed']} chunks translated, {result['total_tokens']:,} total tokens"
+        )
+
+    _run_stage("translate", _translate)
+
+    # --- Stage 8: assemble ---
+    def _assemble():
+        nonlocal manifest
+        manifest = Manifest(**json.loads(mp.read_text(encoding="utf-8")))
+
+        from dao_bridge.assemble import assemble_all
+
+        manifest = assemble_all(config, manifest, state, force=force)
+        assembled_count = sum(
+            1 for item in manifest.spine if item.chunk_count and item.chunk_count > 0
+        )
+        click.echo(f"  {assembled_count} spine items assembled")
+
+    _run_stage("assemble", _assemble)
+
+    # --- Stage 9: rebuild ---
+    def _rebuild():
+        from dao_bridge.rebuild import run_rebuild_stage
+
+        run_rebuild_stage(work, config, force=force)
+        click.echo(f"  Output EPUB: {config.output.epub_path}")
+
+    _run_stage("rebuild", _rebuild)
+
+    click.echo(f"\nPipeline complete.  Output: {config.output.epub_path}")
 
 
 # ---------------------------------------------------------------------------
 # Placeholder commands (not yet implemented)
 # ---------------------------------------------------------------------------
-
-_PLACEHOLDER_COMMANDS = [
-    "rebuild",
-]
 
 _MASTER_GLOSSARY_COMMANDS = [
     "glossary-crosscheck",
@@ -866,9 +974,6 @@ def _make_placeholder(name: str, message: str | None = None):
     placeholder.__doc__ = f"{name} (not yet implemented)."
     return placeholder
 
-
-for _cmd_name in _PLACEHOLDER_COMMANDS:
-    _make_placeholder(_cmd_name)
 
 for _cmd_name in _MASTER_GLOSSARY_COMMANDS:
     _make_placeholder(

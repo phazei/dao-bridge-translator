@@ -1,0 +1,46 @@
+/* dao-bridge-translator default stylesheet
+ * Injected when config.output.css = "default".
+ * Provides minimal fallback typography for translated content.
+ */
+
+body {
+    margin: 1em;
+    line-height: 1.6;
+    font-family: serif;
+}
+
+p {
+    margin: 0.5em 0;
+    text-indent: 1.5em;
+}
+
+p:first-child {
+    text-indent: 0;
+}
+
+h1, h2, h3, h4, h5, h6 {
+    text-indent: 0;
+    margin: 1.2em 0 0.6em;
+    line-height: 1.3;
+}
+
+hr {
+    border: none;
+    text-align: center;
+    margin: 1.5em 0;
+}
+
+hr::after {
+    content: "\2217\2003\2217\2003\2217";
+    display: block;
+    font-size: 1.2em;
+}
+
+ruby {
+    ruby-align: center;
+}
+
+rt {
+    font-size: 0.6em;
+    font-weight: normal;
+}

@@ -1,7 +1,7 @@
-"""Integration tests: EPUB -> init -> extract -> clean -> classify -> chunk -> assemble.
+"""Integration tests: EPUB -> init -> extract -> clean -> classify -> chunk -> assemble -> rebuild.
 
 Uses the Japanese mini EPUB fixture to exercise the full pipeline
-end-to-end through chunk and assemble stages.
+end-to-end through chunk, assemble, and rebuild stages.
 """
 
 from __future__ import annotations
@@ -10,11 +10,13 @@ import json
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from dao_bridge.classify import run_classify_stage
 from dao_bridge.clean import clean_all
 from dao_bridge.config import load_config
 from dao_bridge.extract import extract_epub
-from dao_bridge.schemas import ClassificationResponse, Manifest, TranslatedChunk
+from dao_bridge.schemas import ClassificationResponse, Glossary, Manifest, TranslatedChunk
 from dao_bridge.state import (
     is_stage_completed,
     load_state,
@@ -423,3 +425,172 @@ class TestChunkAssemblePipeline:
         second_counts = [i.chunk_count for i in manifest2.spine]
 
         assert first_counts == second_counts
+
+
+# ---------------------------------------------------------------------------
+# Full pipeline through rebuild
+# ---------------------------------------------------------------------------
+
+
+class TestFullPipelineWithRebuild:
+    """End-to-end: extract -> clean -> classify -> chunk -> translate (mock)
+    -> assemble -> rebuild, using the real JP EPUB fixture."""
+
+    def test_full_pipeline_produces_output_epub(self, jp_epub_path: Path, tmp_path: Path):
+        """Run the complete pipeline and verify the output EPUB."""
+        import zipfile
+
+        from dao_bridge.assemble import assemble_all
+        from dao_bridge.chunk import chunk_all
+        from dao_bridge.rebuild import run_rebuild_stage
+        from dao_bridge.schemas import Glossary, TocTranslationResponse
+
+        work_dir = tmp_path / "work"
+        ensure_dirs(work_dir)
+        cfg_path = _write_config(work_dir, jp_epub_path)
+        config = load_config(cfg_path)
+        state = load_state(work_dir)
+
+        # --- Extract ---
+        manifest = extract_epub(config, state, force=False)
+
+        # --- Clean ---
+        manifest = clean_all(config, manifest, state, force=False)
+
+        # --- Classify (structural hints + mocked LLM) ---
+        state = load_state(work_dir)
+        with patch("dao_bridge.classify.LLMClient") as mock_llm_cls:
+            mock_client = MagicMock()
+            mock_client.complete_json.return_value = ClassificationResponse(
+                classification="chapter",
+                title=None,
+                confidence="high",
+                reasoning="integration test",
+            )
+            mock_llm_cls.return_value = mock_client
+            manifest = run_classify_stage(work_dir, config, state, force=False)
+
+        # --- Chunk ---
+        state = load_state(work_dir)
+        manifest = chunk_all(config, manifest, state, force=False)
+
+        # --- Inject mock translations ---
+        from dao_bridge.workdir import chunk_path
+
+        for item in manifest.spine:
+            n = item.chunk_count or 0
+            for ci in range(1, n + 1):
+                chunk_id = format_chunk_id(item.spine_index, ci)
+                cp = chunk_path(work_dir, chunk_id)
+                chunk_data = json.loads(cp.read_text(encoding="utf-8"))
+                source_text = chunk_data["text"]
+
+                tc = TranslatedChunk(
+                    chunk_id=chunk_id,
+                    source_text=source_text,
+                    pass1_translation=f"[Translated] {source_text[:80]}",
+                    translated_text=f"[Translated] {source_text[:80]}",
+                    pass_count=1,
+                    total_attempts=1,
+                    model_used="test-model",
+                )
+                tp = translation_path(work_dir, chunk_id)
+                tp.parent.mkdir(parents=True, exist_ok=True)
+                tp.write_text(tc.model_dump_json(indent=2), encoding="utf-8")
+
+        # --- Assemble ---
+        state = load_state(work_dir)
+        manifest = assemble_all(config, manifest, state, force=False)
+
+        # --- Create minimal glossary ---
+        glossary = Glossary(
+            created_at="2025-01-01T00:00:00Z",
+            updated_at="2025-01-01T00:00:00Z",
+        )
+        (work_dir / "glossary.json").write_text(glossary.model_dump_json(), encoding="utf-8")
+
+        # --- Rebuild (mock ToC translation LLM call) ---
+        with patch("dao_bridge.rebuild.translate_toc") as mock_translate_toc:
+            mock_translate_toc.return_value = {}  # No ToC modifications for simplicity.
+
+            run_rebuild_stage(work_dir, config, force=False)
+
+        # --- Verify output ---
+        output_path = (work_dir.parent / config.output.epub_path).resolve()
+        assert output_path.exists(), f"Output EPUB not written: {output_path}"
+
+        # Verify it's a valid ZIP.
+        assert zipfile.is_zipfile(output_path)
+
+        with zipfile.ZipFile(output_path, "r") as zf:
+            names = zf.namelist()
+
+            # Mimetype is first entry.
+            assert zf.infolist()[0].filename == "mimetype"
+            assert zf.infolist()[0].compress_type == zipfile.ZIP_STORED
+
+            # All source entries present.
+            with zipfile.ZipFile(jp_epub_path, "r") as src:
+                for item in src.infolist():
+                    assert item.filename in names, f"Missing entry: {item.filename}"
+
+        # Verify translated items have different content from source.
+        translated_items = [i for i in manifest.spine if (i.chunk_count or 0) > 0]
+        non_translated = [i for i in manifest.spine if (i.chunk_count or 0) == 0]
+
+        from dao_bridge.rebuild import resolve_zip_path
+
+        with zipfile.ZipFile(jp_epub_path, "r") as src_zf:
+            with zipfile.ZipFile(output_path, "r") as out_zf:
+                for item in translated_items:
+                    zip_path = resolve_zip_path(manifest.opf_dir, item.original_href)
+                    src_content = src_zf.read(zip_path)
+                    out_content = out_zf.read(zip_path)
+                    assert src_content != out_content, (
+                        f"Translated item {zip_path} should differ from source"
+                    )
+
+                for item in non_translated:
+                    zip_path = resolve_zip_path(manifest.opf_dir, item.original_href)
+                    src_content = src_zf.read(zip_path)
+                    out_content = out_zf.read(zip_path)
+                    assert src_content == out_content, (
+                        f"Non-translated item {zip_path} should be byte-identical"
+                    )
+
+        # Verify rebuild stage marked completed.
+        final_state = load_state(work_dir)
+        assert is_stage_completed(final_state, "rebuild")
+
+    def test_stage_failure_marks_state_failed(self, jp_epub_path: Path, tmp_path: Path):
+        """Rebuild fails gracefully when assembled files are missing."""
+        work_dir = tmp_path / "work"
+        ensure_dirs(work_dir)
+        cfg_path = _write_config(work_dir, jp_epub_path)
+        config = load_config(cfg_path)
+        state = load_state(work_dir)
+
+        manifest = extract_epub(config, state, force=False)
+
+        # Write manifest but NO assembled files.
+        (work_dir / "manifest.json").write_text(manifest.model_dump_json(), encoding="utf-8")
+        # Fake a translatable item.
+        manifest.spine[0].chunk_count = 1
+        (work_dir / "manifest.json").write_text(manifest.model_dump_json(), encoding="utf-8")
+
+        # Create minimal glossary.
+        glossary = Glossary(
+            created_at="2025-01-01T00:00:00Z",
+            updated_at="2025-01-01T00:00:00Z",
+        )
+        (work_dir / "glossary.json").write_text(glossary.model_dump_json(), encoding="utf-8")
+
+        from dao_bridge.rebuild import run_rebuild_stage
+
+        with pytest.raises(FileNotFoundError):
+            run_rebuild_stage(work_dir, config, force=False)
+
+        final_state = load_state(work_dir)
+        stage = final_state.stages.get("rebuild")
+        assert stage is not None
+        assert stage.status == "failed"

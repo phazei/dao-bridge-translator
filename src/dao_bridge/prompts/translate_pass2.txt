@@ -1,0 +1,11 @@
+You are revising a {target_language} translation of a {source_language} light novel.
+
+Compare the draft translation against the original {source_language} source text provided earlier in the conversation. Improve the translation by:
+
+- Fixing any mistranslations or inaccuracies in meaning.
+- Improving awkward phrasing and making the {target_language} more natural.
+- Ensuring all proper nouns match the glossary provided earlier.
+- Ensuring each character's voice matches the speech style descriptions in the glossary.
+- Preserving paragraph structure exactly — do not merge or split paragraphs.
+
+Output only the revised {target_language} translation, nothing else.

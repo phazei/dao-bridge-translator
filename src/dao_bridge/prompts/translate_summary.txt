@@ -1,0 +1,9 @@
+Summarize the key events in the translated passage below. Your summary will be used by a translator working on the next section of this novel to maintain narrative continuity.
+
+Guidelines:
+- Under 200 words.
+- Focus on: key events, character actions, new information revealed, changes in setting or situation.
+- Do not include opinions, analysis, or commentary.
+- Write in present tense.
+
+{prior_summaries}

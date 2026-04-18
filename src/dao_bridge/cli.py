@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import sys
+import time
 from pathlib import Path
 
 import click
@@ -597,6 +598,171 @@ def glossary_export_cmd(
 
 
 # ---------------------------------------------------------------------------
+# translate
+# ---------------------------------------------------------------------------
+
+
+@cli.command()
+@click.option(
+    "--work-dir", type=click.Path(exists=True), default="./work", help="Work directory path."
+)
+@click.option("--spine", "spine_index", type=int, default=None, help="Translate only this spine.")
+@click.option(
+    "--chunk",
+    "single_chunk",
+    type=str,
+    default=None,
+    help="Translate a single chunk (e.g. 0003.015).",
+)
+@click.option(
+    "--from",
+    "from_chunk",
+    type=str,
+    default=None,
+    help="Start translating from this chunk ID (inclusive).",
+)
+@click.option(
+    "--to",
+    "to_chunk",
+    type=str,
+    default=None,
+    help="Stop translating after this chunk ID (inclusive).",
+)
+@click.option("--force", is_flag=True, help="Retranslate even if already completed.")
+@click.pass_context
+def translate(
+    ctx: click.Context,
+    work_dir: str,
+    spine_index: int | None,
+    single_chunk: str | None,
+    from_chunk: str | None,
+    to_chunk: str | None,
+    force: bool,
+) -> None:
+    """Translate chunked source text to English using LLM.
+
+    By default translates all untranslated chunks in sequential order.
+    Use --spine, --chunk, or --from/--to to limit the range.
+
+    On QA failure after retries, the pipeline halts.  Fix the issue
+    (swap model, edit glossary, adjust config) and re-run to continue.
+    Failed and failed_qa chunks are retried automatically on re-run.
+    """
+    work = Path(work_dir).resolve()
+    setup_logging(work, ctx.obj["verbose"])
+    config = _resolve_config(work)
+    state = load_state(work)
+
+    mp = manifest_path(work)
+    if not mp.exists():
+        raise click.ClickException("Manifest not found. Run 'dao-bridge extract' first.")
+
+    from dao_bridge.schemas import Manifest
+
+    manifest = Manifest(**json.loads(mp.read_text(encoding="utf-8")))
+
+    # Resolve range options.
+    if single_chunk is not None:
+        from_chunk = single_chunk
+        to_chunk = single_chunk
+    elif spine_index is not None:
+        from dao_bridge.translate import _spine_range_for_filter
+
+        from_chunk, to_chunk = _spine_range_for_filter(spine_index, manifest)
+
+    if to_chunk is not None and from_chunk is None:
+        raise click.ClickException("--to requires --from.")
+
+    from rich.live import Live
+    from rich.table import Table
+
+    from dao_bridge.translate import TranslationProgress, run_translate_stage
+
+    # Progress display state.
+    progress_state: dict = {
+        "chunk_id": "",
+        "pass_name": "",
+        "tokens": 0,
+        "completed": 0,
+        "total": 0,
+        "start_time": time.monotonic(),
+    }
+
+    def _build_progress_table() -> Table:
+        table = Table(show_header=False, show_edge=False, pad_edge=False)
+        table.add_column("Label", style="bold", width=22)
+        table.add_column("Value")
+        table.add_row("Chunk", progress_state["chunk_id"])
+        table.add_row("Stage", progress_state["pass_name"])
+        table.add_row("Completed", f"{progress_state['completed']}/{progress_state['total']}")
+        table.add_row("Tokens", f"{progress_state['tokens']:,}")
+
+        elapsed = time.monotonic() - progress_state["start_time"]
+        if progress_state["completed"] > 0:
+            avg_time = elapsed / progress_state["completed"]
+            remaining = progress_state["total"] - progress_state["completed"]
+            eta = avg_time * remaining
+            tok_per_sec = progress_state["tokens"] / elapsed if elapsed > 0 else 0
+            table.add_row("Avg time/chunk", f"{avg_time:.1f}s")
+            table.add_row("Tokens/sec", f"{tok_per_sec:.1f}")
+            table.add_row("ETA", f"{eta:.0f}s")
+
+        return table
+
+    def _on_progress(p: TranslationProgress) -> None:
+        progress_state["chunk_id"] = p.chunk_id
+        progress_state["pass_name"] = p.pass_name
+        progress_state["tokens"] = p.tokens_so_far
+        progress_state["completed"] = p.chunks_completed
+        progress_state["total"] = p.chunks_total
+
+    try:
+        with Live(_build_progress_table(), refresh_per_second=2, transient=True) as live:
+
+            def _on_progress_live(p: TranslationProgress) -> None:
+                _on_progress(p)
+                live.update(_build_progress_table())
+
+            result = run_translate_stage(
+                work_dir=work,
+                config=config,
+                state=state,
+                manifest=manifest,
+                force=force,
+                from_chunk=from_chunk,
+                to_chunk=to_chunk,
+                on_progress=_on_progress_live,
+            )
+    except KeyboardInterrupt:
+        click.echo("\nTranslation interrupted by user.")
+        sys.exit(1)
+
+    # End-of-run summary.
+    if result["error"] is None:
+        avg = result["avg_time"]
+        click.echo(
+            f"Translated {result['completed']} chunks. "
+            f"Total tokens: {result['total_tokens']:,}. "
+            f"Average time per chunk: {avg:.1f} seconds."
+        )
+    elif "QA failed" in (result["error"] or ""):
+        click.echo(
+            f"Translated {result['completed']} chunks successfully. "
+            f"Halted at chunk {result['failed_chunk']}: {result['error']}. "
+            "Fix the issue and re-run to continue."
+        )
+    else:
+        click.echo(
+            f"Translated {result['completed']} chunks successfully. "
+            f"Failed at chunk {result['failed_chunk']}: {result['error']}. "
+            "Re-run to retry."
+        )
+
+    if result["error"] is not None:
+        sys.exit(1)
+
+
+# ---------------------------------------------------------------------------
 # run (chains all implemented stages)
 # ---------------------------------------------------------------------------
 
@@ -680,7 +846,6 @@ def run(ctx: click.Context, work_dir: str, force: bool) -> None:
 # ---------------------------------------------------------------------------
 
 _PLACEHOLDER_COMMANDS = [
-    "translate",
     "rebuild",
 ]
 

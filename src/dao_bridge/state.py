@@ -158,6 +158,20 @@ def mark_stage_failed(
     logger.error("Stage [bold]%s[/bold] failed: %s", stage, error)
 
 
+def reset_stage(work_dir: Path, state: PipelineState, stage: StageName) -> None:
+    """Reset *stage* and its items so it can be re-run cleanly.
+
+    Clears the stage status back to ``"pending"`` and removes all item
+    entries belonging to the stage.  Used by ``--force`` to ensure the
+    state file stays consistent while data is being rewritten.
+    """
+    state.stages[stage] = StageState(status="pending")
+    prefix = f"{stage}:"
+    state.items = {k: v for k, v in state.items.items() if not k.startswith(prefix)}
+    save_state(work_dir, state)
+    logger.info("Stage [bold]%s[/bold] reset for re-run", stage)
+
+
 # ---------------------------------------------------------------------------
 # Item helpers
 # ---------------------------------------------------------------------------

@@ -17,6 +17,7 @@ from dao_bridge.state import (
     mark_stage_completed,
     mark_stage_failed,
     mark_stage_started,
+    reset_stage,
     save_state,
 )
 from dao_bridge.workdir import ensure_dirs, state_path
@@ -205,3 +206,74 @@ class TestCrashRecovery:
         state2 = load_state(work_dir)
         assert state2.stages["clean"].status == "running"
         assert state2.items["clean:005"].status == "completed"
+
+
+# ---------------------------------------------------------------------------
+# Reset stage (for --force)
+# ---------------------------------------------------------------------------
+
+
+class TestResetStage:
+    def test_reset_clears_status_and_items(self, work_dir: Path):
+        """reset_stage should set stage to pending and remove its items."""
+        state = load_state(work_dir)
+        mark_stage_started(work_dir, state, "extract")
+        mark_item_completed(work_dir, state, "extract", "001")
+        mark_item_completed(work_dir, state, "extract", "002")
+        mark_item_completed(work_dir, state, "extract", "003")
+        mark_stage_completed(work_dir, state, "extract")
+
+        assert is_stage_completed(state, "extract")
+        assert len([k for k in state.items if k.startswith("extract:")]) == 3
+
+        reset_stage(work_dir, state, "extract")
+
+        assert state.stages["extract"].status == "pending"
+        assert state.stages["extract"].completed_at is None
+        assert len([k for k in state.items if k.startswith("extract:")]) == 0
+
+    def test_reset_preserves_other_stages(self, work_dir: Path):
+        """Resetting one stage should not affect other stages or their items."""
+        state = load_state(work_dir)
+        # Set up extract as completed.
+        mark_stage_started(work_dir, state, "extract")
+        mark_item_completed(work_dir, state, "extract", "001")
+        mark_stage_completed(work_dir, state, "extract")
+        # Set up clean as completed.
+        mark_stage_started(work_dir, state, "clean")
+        mark_item_completed(work_dir, state, "clean", "001")
+        mark_stage_completed(work_dir, state, "clean")
+
+        reset_stage(work_dir, state, "extract")
+
+        # Extract reset.
+        assert state.stages["extract"].status == "pending"
+        assert "extract:001" not in state.items
+        # Clean untouched.
+        assert state.stages["clean"].status == "completed"
+        assert state.items["clean:001"].status == "completed"
+
+    def test_reset_persists_to_disk(self, work_dir: Path):
+        """Reset should be persisted so a reload sees the clean state."""
+        state = load_state(work_dir)
+        mark_stage_started(work_dir, state, "extract")
+        mark_item_completed(work_dir, state, "extract", "001")
+        mark_stage_completed(work_dir, state, "extract")
+
+        reset_stage(work_dir, state, "extract")
+
+        reloaded = load_state(work_dir)
+        assert reloaded.stages["extract"].status == "pending"
+        assert "extract:001" not in reloaded.items
+
+    def test_reset_allows_restart(self, work_dir: Path):
+        """After reset, mark_stage_started should work (not be blocked by idempotency)."""
+        state = load_state(work_dir)
+        mark_stage_started(work_dir, state, "extract")
+        mark_stage_completed(work_dir, state, "extract")
+
+        reset_stage(work_dir, state, "extract")
+        mark_stage_started(work_dir, state, "extract")
+
+        assert state.stages["extract"].status == "running"
+        assert state.stages["extract"].started_at is not None

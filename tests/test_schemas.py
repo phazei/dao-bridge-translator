@@ -79,11 +79,13 @@ class TestManifest:
         assert m.spine == []
         assert m.images == []
         assert m.metadata == {}
+        assert m.opf_dir == ""
 
     def test_round_trip_json(self):
         m = Manifest(
             source_epub_path="/books/test.epub",
             book_id="test-book",
+            opf_dir="OEBPS",
             spine=[ManifestItem(spine_index=0, original_href="ch.xhtml", raw_path="raw/000.xhtml")],
             images=["images/cover.jpg"],
             metadata={"title": "Test Book", "author": "Author"},
@@ -94,6 +96,7 @@ class TestManifest:
         assert restored.spine[0].padded_id == "000"
         assert restored.images == ["images/cover.jpg"]
         assert restored.metadata["title"] == "Test Book"
+        assert restored.opf_dir == "OEBPS"
 
 
 # ---------------------------------------------------------------------------
@@ -159,9 +162,11 @@ class TestGlossaryEntry:
             speech_style="Casual, uses slang",
             notes="Main character",
             source="seed",
+            source_books=["isbn-9784041234567"],
         )
         assert e.japanese == "スバル"
         assert e.nicknames["Rem"] == "Subaru-kun"
+        assert e.source_books == ["isbn-9784041234567"]
 
     def test_invalid_source_literal(self):
         with pytest.raises(ValidationError):
@@ -174,11 +179,13 @@ class TestGlossaryEntry:
             category="character",
             source="extracted",
             notes="Half-elf",
+            source_books=["rezero-vol5", "rezero-vol6"],
         )
         data = e.model_dump()
         restored = GlossaryEntry(**data)
         assert restored.japanese == "エミリア"
         assert restored.notes == "Half-elf"
+        assert restored.source_books == ["rezero-vol5", "rezero-vol6"]
 
 
 class TestGlossary:

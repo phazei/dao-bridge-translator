@@ -7,12 +7,15 @@ Opens an EPUB with ebooklib, iterates the spine in order, writes each
 from __future__ import annotations
 
 import logging
+import posixpath
 import re
 import unicodedata
+import zipfile
 from pathlib import Path
 
 import ebooklib
 from ebooklib import epub
+from lxml import etree
 
 from dao_bridge.config import AppConfig
 from dao_bridge.schemas import Manifest, ManifestItem
@@ -23,6 +26,7 @@ from dao_bridge.state import (
     mark_item_started,
     mark_stage_completed,
     mark_stage_started,
+    reset_stage,
 )
 from dao_bridge.workdir import (
     atomic_write,
@@ -85,6 +89,28 @@ def _normalize_for_id(text: str) -> str:
     return text or "unknown"
 
 
+_CONTAINER_NS = "urn:oasis:names:tc:opendocument:xmlns:container"
+
+
+def _get_opf_dir(epub_path: Path) -> str:
+    """Parse ``META-INF/container.xml`` to find the OPF directory.
+
+    Returns the directory portion of the OPF full-path (e.g. ``"OEBPS"``).
+    Returns ``""`` if the OPF is at the ZIP root.
+    """
+    with zipfile.ZipFile(epub_path, "r") as zf:
+        container_xml = zf.read("META-INF/container.xml")
+    tree = etree.fromstring(container_xml)
+    rootfile = tree.find(
+        f".//{{{_CONTAINER_NS}}}rootfile[@media-type='application/oebps-package+xml']"
+    )
+    if rootfile is None:
+        logger.warning("Could not find rootfile in container.xml, assuming OPF at root")
+        return ""
+    opf_full_path = rootfile.get("full-path", "")
+    return posixpath.dirname(opf_full_path)
+
+
 # ---------------------------------------------------------------------------
 # Extraction
 # ---------------------------------------------------------------------------
@@ -125,11 +151,19 @@ def extract_epub(
         # If manifest is missing despite stage being complete, fall through.
 
     ensure_dirs(work_dir)
+
+    if force:
+        reset_stage(work_dir, state, "extract")
+
     mark_stage_started(work_dir, state, "extract")
 
     epub_path = config.source_epub_path
     logger.info("Reading EPUB: %s", epub_path)
     book = epub.read_epub(str(epub_path))
+
+    # --- OPF directory ---
+    opf_dir = _get_opf_dir(epub_path)
+    logger.debug("OPF directory: %s", opf_dir or "(root)")
 
     # --- Metadata ---
     metadata: dict = {}
@@ -219,6 +253,7 @@ def extract_epub(
     manifest = Manifest(
         source_epub_path=str(epub_path),
         book_id=book_id,
+        opf_dir=opf_dir,
         spine=spine_items,
         images=images,
         metadata=metadata,

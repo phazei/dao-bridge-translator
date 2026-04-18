@@ -62,8 +62,56 @@ def _default_config_yaml(epub_path: str, work_dir: str) -> str:
                 "model": "gemma-4-26b-a4b",
                 "temperature": 0.3,
             },
+            # "summarize" falls back to "translate" if absent.
+            # "summarize": {
+            #     "base_url": "http://localhost:8080/v1",
+            #     "api_key": "not-needed",
+            #     "model": "qwen3-30b-a3b",
+            #     "temperature": 0.2,
+            # },
+        },
+        "chunking": {
+            "target_tokens": 2000,
+            "max_tokens": 2400,
+            "min_chunk_tokens": 400,
+            "flex_window_ratio": 0.2,
+            "normalize_scene_breaks": "* * *",
+        },
+        "glossary": {
+            "master_glossary_path": None,
+            "promote_on_complete": False,
+        },
+        "glossary_phase": {
+            "target_tokens_per_call": 8000,
+            "overlap_chunks": 0,
+        },
+        "translation_phase": {
+            "chunks_per_call": 1,
+            "overlap_chunks": 1,
+            "cross_spine_overlap": True,
+            "double_pass": True,
+            "rolling_summary": True,
+            "summary_max_tokens": 2000,
+            "glossary_injection": "relevant",
+            "qa_check": True,
+            "qa_max_retries": 1,
+            "min_length_ratio": 0.3,
+            "max_length_ratio": 2.0,
+        },
+        "output": {
+            "epub_path": "./book.en.epub",
+            "title_suffix": " (English Translation)",
+            "new_identifier": False,
+            "css": "original",
+            "add_translation_note": True,
+            "validate": False,
         },
         "languages": {"source": "ja", "target": "en"},
+        "llm": {
+            "max_retries": 3,
+            "retry_backoff_seconds": 2,
+            "request_timeout_seconds": 300,
+        },
     }
     return yaml.dump(cfg, default_flow_style=False, allow_unicode=True, sort_keys=False)
 

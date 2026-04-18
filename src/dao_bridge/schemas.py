@@ -56,6 +56,7 @@ class Manifest(BaseModel):
 
     source_epub_path: str
     book_id: str
+    opf_dir: str = ""  # OPF directory within the EPUB ZIP (e.g. "OEBPS")
     spine: list[ManifestItem] = []
     images: list[str] = []
     metadata: dict = {}
@@ -100,6 +101,7 @@ class GlossaryEntry(BaseModel):
     speech_style: str | None = None  # prose description, characters only
     notes: str | None = None
     source: GlossarySource
+    source_books: list[str] = []  # populated for master-glossary entries
 
 
 class Glossary(BaseModel):

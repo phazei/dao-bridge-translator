@@ -76,6 +76,9 @@ class TestFullPipeline:
         # Verify book_id derived.
         assert manifest.book_id, "book_id should be non-empty"
 
+        # Verify opf_dir extracted.
+        assert isinstance(manifest.opf_dir, str)  # may be "" if OPF at root
+
         # Verify metadata.
         assert "title" in manifest.metadata
         assert "language" in manifest.metadata

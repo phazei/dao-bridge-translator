@@ -30,6 +30,7 @@ from dao_bridge.state import (
     mark_item_started,
     mark_stage_completed,
     mark_stage_started,
+    reset_stage,
 )
 from dao_bridge.workdir import (
     atomic_write,
@@ -336,6 +337,9 @@ def clean_all(
     if not force and is_stage_completed(state, "clean"):
         logger.info("Clean stage already completed — skipping (use --force to re-run)")
         return manifest
+
+    if force:
+        reset_stage(work_dir, state, "clean")
 
     mark_stage_started(work_dir, state, "clean")
 

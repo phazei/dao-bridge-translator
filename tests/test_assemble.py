@@ -11,12 +11,16 @@ from pathlib import Path
 
 import pytest
 
-from dao_bridge.assemble import assemble_spine_item
-from dao_bridge.schemas import Chunk, TranslatedChunk
+from dao_bridge.assemble import assemble_all, assemble_spine_item
+from dao_bridge.config import AppConfig
+from dao_bridge.schemas import Chunk, Manifest, ManifestItem, TranslatedChunk
+from dao_bridge.state import PipelineState, is_stage_completed, load_state, save_state
 from dao_bridge.workdir import (
     chunk_dir,
     chunk_path,
+    ensure_dirs,
     format_chunk_id,
+    manifest_path,
     translation_dir,
     translation_path,
 )
@@ -194,3 +198,156 @@ class TestAssembledContent:
 
         with pytest.raises(ValueError, match="empty"):
             assemble_spine_item(work_dir, 1, 1)
+
+
+# =========================================================================
+# Stage completion gating (deferred items)
+# =========================================================================
+
+
+def _make_config(work_dir: Path) -> AppConfig:
+    """Create a minimal AppConfig pointing at work_dir."""
+    return AppConfig(source_epub="dummy.epub", work_dir=str(work_dir))
+
+
+class TestDeferredItemsPreventsStageCompletion:
+    """assemble_all() must NOT mark the stage complete when items are deferred."""
+
+    def test_deferred_prevents_completion(self, tmp_path: Path):
+        """Stage is not marked complete when some translations are missing."""
+        work_dir = _setup_work_dir(tmp_path)
+        ensure_dirs(work_dir)
+
+        # Two spine items, both chunkable with chunk_count > 0.
+        item1 = ManifestItem(
+            spine_index=1,
+            original_href="text/001.xhtml",
+            raw_path="raw/001.xhtml",
+            clean_path="clean/001.md",
+            classification="chapter",
+            chunk_count=1,
+        )
+        item2 = ManifestItem(
+            spine_index=2,
+            original_href="text/002.xhtml",
+            raw_path="raw/002.xhtml",
+            clean_path="clean/002.md",
+            classification="chapter",
+            chunk_count=1,
+        )
+        manifest = Manifest(
+            source_epub_path="dummy.epub",
+            book_id="test",
+            spine=[item1, item2],
+        )
+
+        # Write chunks for both items.
+        _write_chunk(work_dir, 1, 1, "Source text one")
+        _write_chunk(work_dir, 2, 1, "Source text two")
+
+        # Write translation ONLY for item 1 — item 2 is missing.
+        _write_translation(work_dir, 1, 1, "Translated text one.")
+
+        config = _make_config(work_dir)
+        state = load_state(work_dir)
+
+        manifest = assemble_all(config, manifest, state, force=False)
+
+        # Item 1 should be assembled.
+        from dao_bridge.workdir import assembled_path
+
+        ap1 = assembled_path(work_dir, 1)
+        assert ap1.exists()
+        assert "Translated text one." in ap1.read_text(encoding="utf-8")
+
+        # Item 2 should NOT be assembled.
+        ap2 = assembled_path(work_dir, 2)
+        assert not ap2.exists()
+
+        # Stage should NOT be marked complete.
+        reloaded_state = load_state(work_dir)
+        assert not is_stage_completed(reloaded_state, "assemble")
+
+    def test_all_translated_marks_complete(self, tmp_path: Path):
+        """Stage IS marked complete when all items have translations."""
+        work_dir = _setup_work_dir(tmp_path)
+        ensure_dirs(work_dir)
+
+        item1 = ManifestItem(
+            spine_index=1,
+            original_href="text/001.xhtml",
+            raw_path="raw/001.xhtml",
+            clean_path="clean/001.md",
+            classification="chapter",
+            chunk_count=1,
+        )
+        manifest = Manifest(
+            source_epub_path="dummy.epub",
+            book_id="test",
+            spine=[item1],
+        )
+
+        _write_chunk(work_dir, 1, 1, "Source text")
+        _write_translation(work_dir, 1, 1, "Translated text.")
+
+        config = _make_config(work_dir)
+        state = load_state(work_dir)
+
+        manifest = assemble_all(config, manifest, state, force=False)
+
+        reloaded_state = load_state(work_dir)
+        assert is_stage_completed(reloaded_state, "assemble")
+
+    def test_rerun_after_translations_added(self, tmp_path: Path):
+        """After adding missing translations and re-running, stage completes."""
+        work_dir = _setup_work_dir(tmp_path)
+        ensure_dirs(work_dir)
+
+        item1 = ManifestItem(
+            spine_index=1,
+            original_href="text/001.xhtml",
+            raw_path="raw/001.xhtml",
+            clean_path="clean/001.md",
+            classification="chapter",
+            chunk_count=1,
+        )
+        item2 = ManifestItem(
+            spine_index=2,
+            original_href="text/002.xhtml",
+            raw_path="raw/002.xhtml",
+            clean_path="clean/002.md",
+            classification="chapter",
+            chunk_count=1,
+        )
+        manifest = Manifest(
+            source_epub_path="dummy.epub",
+            book_id="test",
+            spine=[item1, item2],
+        )
+
+        _write_chunk(work_dir, 1, 1, "Source one")
+        _write_chunk(work_dir, 2, 1, "Source two")
+
+        # First run: only item 1 has a translation.
+        _write_translation(work_dir, 1, 1, "Trans one.")
+
+        config = _make_config(work_dir)
+        state = load_state(work_dir)
+        assemble_all(config, manifest, state, force=False)
+
+        assert not is_stage_completed(load_state(work_dir), "assemble")
+
+        # Now add the missing translation and re-run.
+        _write_translation(work_dir, 2, 1, "Trans two.")
+
+        state2 = load_state(work_dir)
+        assemble_all(config, manifest, state2, force=False)
+
+        reloaded = load_state(work_dir)
+        assert is_stage_completed(reloaded, "assemble")
+
+        # Both assembled files should exist.
+        from dao_bridge.workdir import assembled_path
+
+        assert assembled_path(work_dir, 1).exists()
+        assert assembled_path(work_dir, 2).exists()

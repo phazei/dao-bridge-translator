@@ -19,6 +19,7 @@ import json
 import logging
 import re
 import shutil
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
@@ -535,6 +536,7 @@ def chunk_all(
     *,
     force: bool = False,
     spine_filter: int | None = None,
+    on_progress: Callable[[str], None] | None = None,
 ) -> Manifest:
     """Chunk all eligible spine items.
 
@@ -550,6 +552,9 @@ def chunk_all(
         If *True*, rechunk even if already completed.
     spine_filter:
         If set, only chunk this spine index.
+    on_progress:
+        Optional callback invoked with the padded spine ID after each
+        item is processed (chunked, skipped, or already-completed).
 
     Returns
     -------
@@ -605,6 +610,8 @@ def chunk_all(
 
         # Skip if already completed (unless force).
         if not force and padded not in pending:
+            if on_progress:
+                on_progress(padded)
             continue
 
         # Classification filtering.
@@ -625,6 +632,8 @@ def chunk_all(
                 padded,
                 classification,
             )
+            if on_progress:
+                on_progress(padded)
             continue
 
         mark_item_started(work_dir, state, "chunk", padded)
@@ -649,6 +658,9 @@ def chunk_all(
         except Exception as exc:
             mark_item_failed(work_dir, state, "chunk", padded, str(exc))
             raise
+
+        if on_progress:
+            on_progress(padded)
 
     # Persist updated manifest.
     mp = manifest_path(work_dir)

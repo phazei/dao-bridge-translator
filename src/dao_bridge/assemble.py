@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import logging
+from collections.abc import Callable
 from pathlib import Path
 
 from dao_bridge.chunk import count_tokens
@@ -186,6 +187,7 @@ def assemble_all(
     *,
     force: bool = False,
     spine_filter: int | None = None,
+    on_progress: Callable[[str], None] | None = None,
 ) -> Manifest:
     """Assemble all eligible spine items.
 
@@ -201,6 +203,9 @@ def assemble_all(
         If *True*, reassemble even if already completed.
     spine_filter:
         If set, only assemble this spine index.
+    on_progress:
+        Optional callback invoked with the padded spine ID after each
+        item is processed (assembled, skipped, or deferred).
 
     Returns
     -------
@@ -232,12 +237,15 @@ def assemble_all(
 
     assembled_count = 0
     skipped_count = 0
+    deferred_count = 0
 
     for item in items:
         padded = pad_spine(item.spine_index)
 
         # Skip if already completed (unless force).
         if not force and padded not in pending:
+            if on_progress:
+                on_progress(padded)
             continue
 
         # Skip items with no chunks (illustrations, auto-toc, etc.).
@@ -250,16 +258,20 @@ def assemble_all(
                 "Spine %s: chunk_count=0, nothing to assemble",
                 padded,
             )
+            if on_progress:
+                on_progress(padded)
             continue
 
         # Check if translations are available.
         if not _has_all_translations(work_dir, item.spine_index, chunk_count):
             logger.warning(
-                "Spine %s: translations incomplete (%d chunks expected), skipping",
+                "Spine %s: translations incomplete (%d chunks expected), deferring",
                 padded,
                 chunk_count,
             )
-            skipped_count += 1
+            deferred_count += 1
+            if on_progress:
+                on_progress(padded)
             continue
 
         mark_item_started(work_dir, state, "assemble", padded)
@@ -284,14 +296,23 @@ def assemble_all(
             mark_item_failed(work_dir, state, "assemble", padded, str(exc))
             raise
 
-    # Mark stage complete only if processing all items (not a single --spine).
-    if spine_filter is None:
+        if on_progress:
+            on_progress(padded)
+
+    # Mark stage complete only if processing all items and none were deferred.
+    if spine_filter is None and deferred_count == 0:
         mark_stage_completed(work_dir, state, "assemble")
+    elif spine_filter is None and deferred_count > 0:
+        logger.info(
+            "Assemble stage not marked complete: %d item(s) deferred (translations incomplete)",
+            deferred_count,
+        )
 
     logger.info(
-        "Assembly complete: %d items assembled, %d items skipped",
+        "Assembly complete: %d items assembled, %d items skipped, %d items deferred",
         assembled_count,
         skipped_count,
+        deferred_count,
     )
 
     return manifest

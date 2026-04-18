@@ -320,20 +320,19 @@ def chunk(ctx: click.Context, work_dir: str, spine_index: int | None, force: boo
 
     from dao_bridge.chunk import chunk_all
 
+    n_items = 1 if spine_index is not None else len(manifest.spine)
+
     with Progress(transient=True) as progress:
-        n_items = len(manifest.spine)
         task = progress.add_task("Chunking...", total=n_items)
 
-        # We call chunk_all which handles per-item iteration internally.
-        # Advance progress after completion.
         manifest = chunk_all(
             config,
             manifest,
             state,
             force=force,
             spine_filter=spine_index,
+            on_progress=lambda _: progress.advance(task),
         )
-        progress.update(task, completed=n_items)
 
     total_chunks = sum(i.chunk_count or 0 for i in manifest.spine)
     click.echo(f"Chunked {len(manifest.spine)} items ({total_chunks} total chunks)")
@@ -373,8 +372,9 @@ def assemble(ctx: click.Context, work_dir: str, spine_index: int | None, force: 
 
     from dao_bridge.assemble import assemble_all
 
+    n_items = 1 if spine_index is not None else len(manifest.spine)
+
     with Progress(transient=True) as progress:
-        n_items = len(manifest.spine)
         task = progress.add_task("Assembling...", total=n_items)
 
         manifest = assemble_all(
@@ -383,8 +383,8 @@ def assemble(ctx: click.Context, work_dir: str, spine_index: int | None, force: 
             state,
             force=force,
             spine_filter=spine_index,
+            on_progress=lambda _: progress.advance(task),
         )
-        progress.update(task, completed=n_items)
 
     click.echo("Assembly complete.")
 

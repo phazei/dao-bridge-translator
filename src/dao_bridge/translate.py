@@ -19,9 +19,11 @@ conversation to benefit from prefix caching on servers that support it
 
 from __future__ import annotations
 
+import functools
 import json
 import logging
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
@@ -110,8 +112,11 @@ class TranslationProgress:
 # ---------------------------------------------------------------------------
 
 
+@functools.lru_cache(maxsize=None)
 def _load_prompt_template(name: str) -> str:
     """Load a prompt template from the ``prompts/`` directory.
+
+    Cached — template files are read once per process.
 
     Parameters
     ----------
@@ -163,9 +168,7 @@ def render_glossary(glossary: Glossary, chunk_text: str, mode: str) -> str:
 
     for category, group_entries in groups.items():
         lines.append("")
-        # Pluralise the category header.
-        header = category + "s" if not category.endswith("s") else category
-        lines.append(f"{header}:")
+        lines.append(f"{category}:")
         for e in group_entries:
             # Main line: source_term [english] — notes
             parts = []
@@ -451,15 +454,15 @@ def build_pass1_messages(
     # Overlap context.
     if overlap is not None:
         overlap_content = (
-            "Here is the preceding section and its English translation, "
+            f"Here is the preceding section and its {target_lang} translation, "
             "for style and voice continuity. Do not retranslate this.\n\n"
-            f"JAPANESE:\n{overlap.source_text}\n\n"
-            f"ENGLISH:\n{overlap.translated_text}"
+            f"{source_lang.upper()}:\n{overlap.source_text}\n\n"
+            f"{target_lang.upper()}:\n{overlap.translated_text}"
         )
         messages.append({"role": "user", "content": overlap_content})
 
     # Source text to translate.
-    source_content = f"Translate the following text to English:\n\n{chunk.text}"
+    source_content = f"Translate the following {source_lang} text to {target_lang}:\n\n{chunk.text}"
     messages.append({"role": "user", "content": source_content})
 
     return messages
@@ -670,14 +673,18 @@ def translate_chunk(
     """
     tp = config.translation_phase
     start_time = time.monotonic()
-    token_usage: dict = {}
     model_used = ""
+
+    # Reset cumulative counters so we capture exactly this chunk's usage.
+    llm_client.reset_token_usage()
+    s_client = summary_client or llm_client
+    if s_client is not llm_client:
+        s_client.reset_token_usage()
 
     # --- Pass 1 ---
     messages = build_pass1_messages(chunk, glossary, overlap, rolling_summaries, config)
     result1 = llm_client.complete(messages)
     pass1_text = result1.text.strip()
-    token_usage = _merge_token_usage(token_usage, result1.token_usage)
     model_used = result1.model or llm_client.config.model
 
     # --- Pass 2 (revision) ---
@@ -688,7 +695,6 @@ def translate_chunk(
         messages = extend_pass2_messages(messages, pass1_text, config)
         result2 = llm_client.complete(messages)
         final_text = result2.text.strip()
-        token_usage = _merge_token_usage(token_usage, result2.token_usage)
         pass_count = 2
 
     # --- QA assessment ---
@@ -703,13 +709,12 @@ def translate_chunk(
             qa_issues = prog_result.issues
         else:
             # LLM judge — extend the same message list for prefix caching.
+            # Token usage is tracked automatically by the client.
             messages = extend_qa_messages(messages, final_text, config)
             try:
                 qa_resp: QAResponse = llm_client.complete_json(  # type: ignore[assignment]
                     messages, QAResponse, max_retries=3
                 )
-                # complete_json doesn't surface token usage directly;
-                # it's aggregated inside the client's internal complete() calls.
                 qa_result_val = qa_resp.result
                 qa_issues = qa_resp.issues
             except LLMStructuredOutputError:
@@ -719,10 +724,14 @@ def translate_chunk(
     # --- Rolling summary ---
     summary_text: str | None = None
     if tp.rolling_summary and qa_result_val != "fail":
-        s_client = summary_client or llm_client
         summary_text = generate_summary(
             final_text, chunk.chunk_id, rolling_summaries, s_client, config
         )
+
+    # Collect token usage from all clients used for this chunk.
+    token_usage = llm_client.total_token_usage
+    if s_client is not llm_client:
+        token_usage = _merge_token_usage(token_usage, s_client.total_token_usage)
 
     duration = time.monotonic() - start_time
 
@@ -825,7 +834,7 @@ def run_translate_stage(
     force: bool = False,
     from_chunk: str | None = None,
     to_chunk: str | None = None,
-    on_progress: None | object = None,
+    on_progress: Callable[[TranslationProgress], None] | None = None,
 ) -> dict:
     """Run the translate stage across all eligible chunks.
 
@@ -867,8 +876,6 @@ def run_translate_stage(
     glossary = Glossary(**json.loads(gp.read_text(encoding="utf-8")))
 
     # Create LLM clients.
-    from dao_bridge.config import LLMConfig
-
     llm_config = config.llm
     translate_client = LLMClient(config.models.translate, llm_config)
     summarize_cfg = config.summarize_model()
@@ -953,7 +960,7 @@ def run_translate_stage(
 
         for attempt in range(1, max_attempts + 1):
             if progress_cb is not None:
-                progress_cb(  # type: ignore[operator]
+                progress_cb(
                     TranslationProgress(
                         chunk_id=chunk_id,
                         pass_name=f"Pass 1 (attempt {attempt})" if attempt > 1 else "Pass 1",
@@ -1052,7 +1059,7 @@ def run_translate_stage(
         total_duration += final_tc.duration_seconds
 
         if progress_cb is not None:
-            progress_cb(  # type: ignore[operator]
+            progress_cb(
                 TranslationProgress(
                     chunk_id=chunk_id,
                     pass_name="Done",

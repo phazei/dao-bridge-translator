@@ -80,6 +80,28 @@ class LLMClient:
             api_key=config.api_key,
             timeout=self.llm_config.request_timeout_seconds,
         )
+        self._total_token_usage: dict[str, int] = {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+        }
+
+    # ------------------------------------------------------------------
+    # Cumulative token usage
+    # ------------------------------------------------------------------
+
+    @property
+    def total_token_usage(self) -> dict[str, int]:
+        """Return a copy of the cumulative token usage across all calls."""
+        return dict(self._total_token_usage)
+
+    def reset_token_usage(self) -> None:
+        """Zero the cumulative token usage counter."""
+        self._total_token_usage = {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+        }
 
     # ------------------------------------------------------------------
     # complete
@@ -124,6 +146,8 @@ class LLMClient:
                         "completion_tokens": response.usage.completion_tokens,
                         "total_tokens": response.usage.total_tokens,
                     }
+                    for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
+                        self._total_token_usage[key] += usage.get(key, 0)
                 return CompletionResult(
                     text=choice.message.content or "",
                     token_usage=usage,

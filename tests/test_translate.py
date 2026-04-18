@@ -226,6 +226,57 @@ def _mock_completion(text: str = "Translated text.", **kwargs) -> CompletionResu
     )
 
 
+def _make_mock_client(
+    completions: list[CompletionResult] | CompletionResult | None = None,
+) -> MagicMock:
+    """Create a MagicMock LLM client with working token-usage tracking.
+
+    The mock accumulates token usage from each ``complete()`` call's return
+    value, mirroring the real :class:`LLMClient` behaviour.
+    """
+    mock = MagicMock()
+    mock.config = MagicMock(model="test-model")
+
+    # Internal accumulator.
+    _usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+
+    def _reset() -> None:
+        _usage["prompt_tokens"] = 0
+        _usage["completion_tokens"] = 0
+        _usage["total_tokens"] = 0
+
+    mock.reset_token_usage = _reset
+
+    # Property-like accessor (MagicMock can't do @property, so use a function
+    # assigned to the attribute name via PropertyMock or a plain attribute).
+    # We need it to return a fresh copy each time it's accessed.
+    type(mock).total_token_usage = property(lambda self: dict(_usage))
+
+    # Wrap complete() to auto-accumulate token usage.
+    if completions is not None:
+        if isinstance(completions, list):
+            raw_side_effects = list(completions)
+        else:
+            raw_side_effects = None
+            raw_return = completions
+
+        call_index = [0]
+
+        def _complete_side_effect(*args, **kwargs):
+            if raw_side_effects is not None:
+                result = raw_side_effects[call_index[0]]
+                call_index[0] += 1
+            else:
+                result = raw_return
+            for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
+                _usage[key] += result.token_usage.get(key, 0)
+            return result
+
+        mock.complete.side_effect = _complete_side_effect
+
+    return mock
+
+
 # =========================================================================
 # Glossary rendering
 # =========================================================================
@@ -294,8 +345,8 @@ class TestRenderGlossary:
         glossary = _make_glossary()
         result = render_glossary(glossary, "ナツキ・スバル グァラル", "relevant")
 
-        assert "Characters:" in result
-        assert "Places:" in result
+        assert "Character:" in result
+        assert "Place:" in result
 
     def test_entry_without_source_term_excluded_from_relevant(self):
         """Entries with source_term=None are excluded in relevant mode."""
@@ -673,9 +724,7 @@ class TestTranslateChunk:
         config.translation_phase.qa_check = False
         config.translation_phase.rolling_summary = False
 
-        mock_client = MagicMock()
-        mock_client.complete.return_value = _mock_completion("Pass 1 result.")
-        mock_client.config = MagicMock(model="test-model")
+        mock_client = _make_mock_client(_mock_completion("Pass 1 result."))
 
         chunk = _make_chunk()
         glossary = _make_glossary()
@@ -696,12 +745,12 @@ class TestTranslateChunk:
         config.translation_phase.qa_check = False
         config.translation_phase.rolling_summary = False
 
-        mock_client = MagicMock()
-        mock_client.complete.side_effect = [
-            _mock_completion("Pass 1 draft."),
-            _mock_completion("Pass 2 revised."),
-        ]
-        mock_client.config = MagicMock(model="test-model")
+        mock_client = _make_mock_client(
+            [
+                _mock_completion("Pass 1 draft."),
+                _mock_completion("Pass 2 revised."),
+            ]
+        )
 
         chunk = _make_chunk()
         glossary = _make_glossary()
@@ -721,12 +770,10 @@ class TestTranslateChunk:
         config.translation_phase.qa_check = True
         config.translation_phase.rolling_summary = False
 
-        mock_client = MagicMock()
         # Pass 1 translation — needs enough text to pass programmatic check.
         translation = "This is a reasonable length translation for the test."
-        mock_client.complete.return_value = _mock_completion(translation)
+        mock_client = _make_mock_client(_mock_completion(translation))
         mock_client.complete_json.return_value = QAResponse(result="pass", issues=[])
-        mock_client.config = MagicMock(model="test-model")
 
         # Source text should have similar token count to avoid programmatic fail.
         chunk = _make_chunk(text="これは合理的な長さのテスト翻訳です。テストのための文章。")
@@ -746,9 +793,7 @@ class TestTranslateChunk:
         config.translation_phase.qa_check = False
         config.translation_phase.rolling_summary = False
 
-        mock_client = MagicMock()
-        mock_client.complete.return_value = _mock_completion("Translated.")
-        mock_client.config = MagicMock(model="test-model")
+        mock_client = _make_mock_client(_mock_completion("Translated."))
 
         chunk = _make_chunk()
         glossary = _make_glossary()
@@ -759,35 +804,35 @@ class TestTranslateChunk:
         mock_client.complete_json.assert_not_called()
 
     def test_token_usage_accumulated(self, tmp_path: Path):
-        """Token usage is accumulated across passes."""
+        """Token usage is accumulated across passes via client-level tracking."""
         work_dir = _setup_work_dir(tmp_path)
         config = _make_config(work_dir)
         config.translation_phase.double_pass = True
         config.translation_phase.qa_check = False
         config.translation_phase.rolling_summary = False
 
-        mock_client = MagicMock()
-        mock_client.complete.side_effect = [
-            CompletionResult(
-                text="Pass 1.",
-                token_usage={
-                    "prompt_tokens": 100,
-                    "completion_tokens": 50,
-                    "total_tokens": 150,
-                },
-                model="test-model",
-            ),
-            CompletionResult(
-                text="Pass 2.",
-                token_usage={
-                    "prompt_tokens": 200,
-                    "completion_tokens": 60,
-                    "total_tokens": 260,
-                },
-                model="test-model",
-            ),
-        ]
-        mock_client.config = MagicMock(model="test-model")
+        mock_client = _make_mock_client(
+            [
+                CompletionResult(
+                    text="Pass 1.",
+                    token_usage={
+                        "prompt_tokens": 100,
+                        "completion_tokens": 50,
+                        "total_tokens": 150,
+                    },
+                    model="test-model",
+                ),
+                CompletionResult(
+                    text="Pass 2.",
+                    token_usage={
+                        "prompt_tokens": 200,
+                        "completion_tokens": 60,
+                        "total_tokens": 260,
+                    },
+                    model="test-model",
+                ),
+            ]
+        )
 
         chunk = _make_chunk()
         glossary = _make_glossary()
@@ -815,13 +860,11 @@ class TestQAFlow:
         config.translation_phase.qa_check = True
         config.translation_phase.rolling_summary = False
 
-        mock_client = MagicMock()
         translation = "This is a reasonable length translation for the test."
-        mock_client.complete.return_value = _mock_completion(translation)
+        mock_client = _make_mock_client(_mock_completion(translation))
         mock_client.complete_json.return_value = QAResponse(
             result="fail", issues=["Missing paragraphs"]
         )
-        mock_client.config = MagicMock(model="test-model")
 
         chunk = _make_chunk(text="これは合理的な長さのテスト翻訳です。テストのための文章。")
         glossary = _make_glossary()
@@ -839,10 +882,8 @@ class TestQAFlow:
         config.translation_phase.qa_check = True
         config.translation_phase.rolling_summary = False
 
-        mock_client = MagicMock()
         # Return very short translation for a long source.
-        mock_client.complete.return_value = _mock_completion("No.")
-        mock_client.config = MagicMock(model="test-model")
+        mock_client = _make_mock_client(_mock_completion("No."))
 
         chunk = _make_chunk(text="これは長い文章です。" * 30)
         glossary = _make_glossary()
@@ -862,11 +903,9 @@ class TestQAFlow:
         config.translation_phase.qa_check = True
         config.translation_phase.rolling_summary = False
 
-        mock_client = MagicMock()
         translation = "This is a reasonable length translation for the test."
-        mock_client.complete.return_value = _mock_completion(translation)
+        mock_client = _make_mock_client(_mock_completion(translation))
         mock_client.complete_json.side_effect = LLMStructuredOutputError("Failed after retries")
-        mock_client.config = MagicMock(model="test-model")
 
         chunk = _make_chunk(text="これは合理的な長さのテスト翻訳です。テストのための文章。")
         glossary = _make_glossary()
@@ -893,12 +932,8 @@ class TestRollingSummary:
         config.translation_phase.qa_check = False
         config.translation_phase.rolling_summary = True
 
-        mock_translate = MagicMock()
-        mock_translate.complete.return_value = _mock_completion("Translated text here.")
-        mock_translate.config = MagicMock(model="test-model")
-
-        mock_summary = MagicMock()
-        mock_summary.complete.return_value = _mock_completion("Summary of events.")
+        mock_translate = _make_mock_client(_mock_completion("Translated text here."))
+        mock_summary = _make_mock_client(_mock_completion("Summary of events."))
 
         chunk = _make_chunk()
         glossary = _make_glossary()
@@ -916,9 +951,7 @@ class TestRollingSummary:
         config.translation_phase.qa_check = False
         config.translation_phase.rolling_summary = False
 
-        mock_client = MagicMock()
-        mock_client.complete.return_value = _mock_completion("Translated.")
-        mock_client.config = MagicMock(model="test-model")
+        mock_client = _make_mock_client(_mock_completion("Translated."))
 
         chunk = _make_chunk()
         glossary = _make_glossary()
@@ -935,10 +968,8 @@ class TestRollingSummary:
         config.translation_phase.qa_check = True
         config.translation_phase.rolling_summary = True
 
-        mock_client = MagicMock()
         # Return short translation to trigger programmatic QA fail.
-        mock_client.complete.return_value = _mock_completion("No.")
-        mock_client.config = MagicMock(model="test-model")
+        mock_client = _make_mock_client(_mock_completion("No."))
 
         chunk = _make_chunk(text="これは長い文章です。" * 30)
         glossary = _make_glossary()
@@ -1039,9 +1070,7 @@ class TestRunTranslateStage:
         """All chunks are translated and marked completed."""
         work_dir, config, state, manifest = _setup_stage_test(tmp_path, spines=[(1, 2)])
 
-        mock_client = MagicMock()
-        mock_client.complete.return_value = _mock_completion("Translated.")
-        mock_client.config = MagicMock(model="test-model")
+        mock_client = _make_mock_client(_mock_completion("Translated."))
         mock_llm_cls.return_value = mock_client
 
         result = run_translate_stage(work_dir, config, state, manifest)
@@ -1065,9 +1094,7 @@ class TestRunTranslateStage:
         tc = _make_translated_chunk("0001.001")
         _write_translation_file(work_dir, tc)
 
-        mock_client = MagicMock()
-        mock_client.complete.return_value = _mock_completion("Translated.")
-        mock_client.config = MagicMock(model="test-model")
+        mock_client = _make_mock_client(_mock_completion("Translated."))
         mock_llm_cls.return_value = mock_client
 
         result = run_translate_stage(work_dir, config, state, manifest)
@@ -1083,9 +1110,7 @@ class TestRunTranslateStage:
         # Pre-mark as failed.
         mark_item_failed(work_dir, state, "translate", "0001.001", "connection error")
 
-        mock_client = MagicMock()
-        mock_client.complete.return_value = _mock_completion("Translated.")
-        mock_client.config = MagicMock(model="test-model")
+        mock_client = _make_mock_client(_mock_completion("Translated."))
         mock_llm_cls.return_value = mock_client
 
         result = run_translate_stage(work_dir, config, state, manifest)
@@ -1101,9 +1126,7 @@ class TestRunTranslateStage:
         # Pre-mark as failed_qa.
         mark_item_failed(work_dir, state, "translate", "0001.001", "QA failed", status="failed_qa")
 
-        mock_client = MagicMock()
-        mock_client.complete.return_value = _mock_completion("Translated.")
-        mock_client.config = MagicMock(model="test-model")
+        mock_client = _make_mock_client(_mock_completion("Translated."))
         mock_llm_cls.return_value = mock_client
 
         result = run_translate_stage(work_dir, config, state, manifest)
@@ -1118,10 +1141,8 @@ class TestRunTranslateStage:
         config.translation_phase.qa_check = True
         config.translation_phase.qa_max_retries = 1
 
-        mock_client = MagicMock()
         # Return short translation to trigger programmatic QA fail.
-        mock_client.complete.return_value = _mock_completion("No.")
-        mock_client.config = MagicMock(model="test-model")
+        mock_client = _make_mock_client(_mock_completion("No."))
         mock_llm_cls.return_value = mock_client
 
         # Write chunks with long text so programmatic QA fails.
@@ -1150,9 +1171,7 @@ class TestRunTranslateStage:
         """--from/--to restricts which chunks are translated."""
         work_dir, config, state, manifest = _setup_stage_test(tmp_path, spines=[(1, 5)])
 
-        mock_client = MagicMock()
-        mock_client.complete.return_value = _mock_completion("Translated.")
-        mock_client.config = MagicMock(model="test-model")
+        mock_client = _make_mock_client(_mock_completion("Translated."))
         mock_llm_cls.return_value = mock_client
 
         result = run_translate_stage(
@@ -1185,9 +1204,7 @@ class TestRunTranslateStage:
         tc = _make_translated_chunk("0001.001")
         _write_translation_file(work_dir, tc)
 
-        mock_client = MagicMock()
-        mock_client.complete.return_value = _mock_completion("Translated.")
-        mock_client.config = MagicMock(model="test-model")
+        mock_client = _make_mock_client(_mock_completion("Translated."))
         mock_llm_cls.return_value = mock_client
 
         # Translate only chunk 3, which depends on chunk 2.
@@ -1208,9 +1225,8 @@ class TestRunTranslateStage:
         """Infrastructure errors (LLM connection) halt the pipeline."""
         work_dir, config, state, manifest = _setup_stage_test(tmp_path, spines=[(1, 1)])
 
-        mock_client = MagicMock()
+        mock_client = _make_mock_client()
         mock_client.complete.side_effect = ConnectionError("server down")
-        mock_client.config = MagicMock(model="test-model")
         mock_llm_cls.return_value = mock_client
 
         result = run_translate_stage(work_dir, config, state, manifest)
@@ -1229,9 +1245,7 @@ class TestRunTranslateStage:
         tc = _make_translated_chunk("0001.001")
         _write_translation_file(work_dir, tc)
 
-        mock_client = MagicMock()
-        mock_client.complete.return_value = _mock_completion("Re-translated.")
-        mock_client.config = MagicMock(model="test-model")
+        mock_client = _make_mock_client(_mock_completion("Re-translated."))
         mock_llm_cls.return_value = mock_client
 
         result = run_translate_stage(work_dir, config, state, manifest, force=True)
@@ -1248,9 +1262,7 @@ class TestRunTranslateStage:
         """The on_progress callback is invoked during translation."""
         work_dir, config, state, manifest = _setup_stage_test(tmp_path, spines=[(1, 1)])
 
-        mock_client = MagicMock()
-        mock_client.complete.return_value = _mock_completion("Translated.")
-        mock_client.config = MagicMock(model="test-model")
+        mock_client = _make_mock_client(_mock_completion("Translated."))
         mock_llm_cls.return_value = mock_client
 
         progress_calls: list[TranslationProgress] = []
@@ -1270,18 +1282,18 @@ class TestRunTranslateStage:
         work_dir, config, state, manifest = _setup_stage_test(tmp_path, spines=[(1, 2)])
         config.translation_phase.rolling_summary = True
 
-        mock_client = MagicMock()
-        mock_client.complete.side_effect = [
-            # Chunk 1 translation.
-            _mock_completion("Translated chunk 1."),
-            # Chunk 1 summary.
-            _mock_completion("Summary of chunk 1."),
-            # Chunk 2 translation.
-            _mock_completion("Translated chunk 2."),
-            # Chunk 2 summary.
-            _mock_completion("Summary of chunk 2."),
-        ]
-        mock_client.config = MagicMock(model="test-model")
+        mock_client = _make_mock_client(
+            [
+                # Chunk 1 translation.
+                _mock_completion("Translated chunk 1."),
+                # Chunk 1 summary.
+                _mock_completion("Summary of chunk 1."),
+                # Chunk 2 translation.
+                _mock_completion("Translated chunk 2."),
+                # Chunk 2 summary.
+                _mock_completion("Summary of chunk 2."),
+            ]
+        )
         mock_llm_cls.return_value = mock_client
 
         result = run_translate_stage(work_dir, config, state, manifest)
@@ -1308,9 +1320,7 @@ class TestEndOfRunSummary:
         """Successful run returns correct counts."""
         work_dir, config, state, manifest = _setup_stage_test(tmp_path, spines=[(1, 2)])
 
-        mock_client = MagicMock()
-        mock_client.complete.return_value = _mock_completion("Translated.")
-        mock_client.config = MagicMock(model="test-model")
+        mock_client = _make_mock_client(_mock_completion("Translated."))
         mock_llm_cls.return_value = mock_client
 
         result = run_translate_stage(work_dir, config, state, manifest)
@@ -1326,9 +1336,7 @@ class TestEndOfRunSummary:
         config.translation_phase.qa_check = True
         config.translation_phase.qa_max_retries = 0
 
-        mock_client = MagicMock()
-        mock_client.complete.return_value = _mock_completion("No.")
-        mock_client.config = MagicMock(model="test-model")
+        mock_client = _make_mock_client(_mock_completion("No."))
         mock_llm_cls.return_value = mock_client
 
         # Long source text to trigger programmatic QA fail.

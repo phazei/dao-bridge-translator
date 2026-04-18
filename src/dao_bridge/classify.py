@@ -15,6 +15,7 @@ Classification values (from :data:`~dao_bridge.schemas.Classification`):
 
 from __future__ import annotations
 
+import functools
 import json
 import logging
 import re
@@ -224,8 +225,12 @@ def apply_structural_hints(
 # ---------------------------------------------------------------------------
 
 
+@functools.lru_cache(maxsize=None)
 def _load_prompt_template() -> str:
-    """Load the classify prompt template from disk."""
+    """Load the classify prompt template from disk.
+
+    Cached — the template file is read once per process.
+    """
     return _PROMPT_TEMPLATE_PATH.read_text(encoding="utf-8")
 
 

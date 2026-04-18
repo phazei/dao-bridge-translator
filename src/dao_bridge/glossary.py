@@ -20,6 +20,7 @@ distinguishes provenance:
 
 from __future__ import annotations
 
+import functools
 import json
 import logging
 from collections import defaultdict
@@ -104,8 +105,11 @@ class _BuildMeta(BaseModel):
 # ---------------------------------------------------------------------------
 
 
+@functools.lru_cache(maxsize=None)
 def _load_prompt_template(name: str) -> str:
     """Load a prompt template from the ``prompts/`` directory.
+
+    Cached — template files are read once per process.
 
     Parameters
     ----------

@@ -353,3 +353,122 @@ class TestRetryCounterReset:
         assert result.value == 42
         # Exactly 5 API calls were made.
         assert mock_client.chat.completions.create.call_count == 5
+
+
+# ---------------------------------------------------------------------------
+# Cumulative token usage tracking
+# ---------------------------------------------------------------------------
+
+
+class TestTokenUsageTracking:
+    @patch("dao_bridge.llm_client.openai.OpenAI")
+    def test_accumulates_across_complete_calls(self, mock_openai_cls):
+        """total_token_usage accumulates across multiple complete() calls."""
+        mock_client = MagicMock()
+        mock_openai_cls.return_value = mock_client
+        mock_client.chat.completions.create.side_effect = [
+            _mock_response("first", prompt_tokens=100, completion_tokens=50),
+            _mock_response("second", prompt_tokens=200, completion_tokens=60),
+        ]
+
+        config = ModelConfig(model="test-model")
+        client = LLMClient(config)
+
+        client.complete([{"role": "user", "content": "a"}])
+        client.complete([{"role": "user", "content": "b"}])
+
+        usage = client.total_token_usage
+        assert usage["prompt_tokens"] == 300
+        assert usage["completion_tokens"] == 110
+        assert usage["total_tokens"] == 410
+
+    @patch("dao_bridge.llm_client.openai.OpenAI")
+    def test_accumulates_through_complete_json(self, mock_openai_cls):
+        """complete_json calls complete() internally — tokens are tracked."""
+        mock_client = MagicMock()
+        mock_openai_cls.return_value = mock_client
+        mock_client.chat.completions.create.return_value = _mock_response(
+            '{"name": "test", "value": 42}',
+            prompt_tokens=80,
+            completion_tokens=20,
+        )
+
+        config = ModelConfig(model="test-model")
+        client = LLMClient(config)
+
+        client.complete_json(
+            [{"role": "user", "content": "give me data"}],
+            response_model=SimpleResponse,
+        )
+
+        usage = client.total_token_usage
+        assert usage["prompt_tokens"] == 80
+        assert usage["completion_tokens"] == 20
+        assert usage["total_tokens"] == 100
+
+    @patch("dao_bridge.llm_client.openai.OpenAI")
+    def test_complete_json_retries_accumulate(self, mock_openai_cls):
+        """complete_json retries also accumulate token usage."""
+        mock_client = MagicMock()
+        mock_openai_cls.return_value = mock_client
+        mock_client.chat.completions.create.side_effect = [
+            # First attempt: bad JSON.
+            _mock_response("not json", prompt_tokens=50, completion_tokens=10),
+            # Second attempt: valid.
+            _mock_response('{"name": "ok", "value": 1}', prompt_tokens=60, completion_tokens=15),
+        ]
+
+        config = ModelConfig(model="test-model")
+        client = LLMClient(config)
+
+        client.complete_json(
+            [{"role": "user", "content": "data"}],
+            response_model=SimpleResponse,
+            max_retries=3,
+        )
+
+        usage = client.total_token_usage
+        # Both calls accumulated.
+        assert usage["prompt_tokens"] == 110
+        assert usage["completion_tokens"] == 25
+        assert usage["total_tokens"] == 135
+
+    @patch("dao_bridge.llm_client.openai.OpenAI")
+    def test_reset_zeroes_accumulator(self, mock_openai_cls):
+        """reset_token_usage() clears the cumulative counters."""
+        mock_client = MagicMock()
+        mock_openai_cls.return_value = mock_client
+        mock_client.chat.completions.create.return_value = _mock_response(
+            "hello", prompt_tokens=100, completion_tokens=50
+        )
+
+        config = ModelConfig(model="test-model")
+        client = LLMClient(config)
+
+        client.complete([{"role": "user", "content": "a"}])
+        assert client.total_token_usage["total_tokens"] == 150
+
+        client.reset_token_usage()
+        assert client.total_token_usage == {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+        }
+
+        # Accumulation restarts after reset.
+        client.complete([{"role": "user", "content": "b"}])
+        assert client.total_token_usage["total_tokens"] == 150
+
+    @patch("dao_bridge.llm_client.openai.OpenAI")
+    def test_total_token_usage_returns_copy(self, mock_openai_cls):
+        """total_token_usage returns a copy, not the internal dict."""
+        mock_client = MagicMock()
+        mock_openai_cls.return_value = mock_client
+
+        config = ModelConfig(model="test-model")
+        client = LLMClient(config)
+
+        usage1 = client.total_token_usage
+        usage1["prompt_tokens"] = 999
+        usage2 = client.total_token_usage
+        assert usage2["prompt_tokens"] == 0

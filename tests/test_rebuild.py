@@ -800,7 +800,7 @@ class TestRunRebuildStage:
         assert is_stage_completed(state, "rebuild")
 
         # Output EPUB should exist.
-        output_path = (work.parent / config.output.epub_path).resolve()
+        output_path = (work / config.output.epub_path).resolve()
         assert output_path.exists()
 
     @patch("dao_bridge.rebuild.translate_toc", return_value={})

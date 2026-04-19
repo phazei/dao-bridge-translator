@@ -516,7 +516,7 @@ class TestFullPipelineWithRebuild:
             run_rebuild_stage(work_dir, config, force=False)
 
         # --- Verify output ---
-        output_path = (work_dir.parent / config.output.epub_path).resolve()
+        output_path = (work_dir / config.output.epub_path).resolve()
         assert output_path.exists(), f"Output EPUB not written: {output_path}"
 
         # Verify it's a valid ZIP.
@@ -730,10 +730,7 @@ class TestRunCommand:
             assert ap.exists(), f"Assembled file missing for spine {item.spine_index}"
 
         # Output EPUB should exist.
-        output_epub = (work_dir.parent / "book.en.epub").resolve()
-        if not output_epub.exists():
-            # Config default is relative to work_dir parent; check work_dir too.
-            output_epub = work_dir / "book.en.epub"
+        output_epub = (work_dir / "book.en.epub").resolve()
         # The exact output path depends on config resolution, but at minimum
         # the rebuild stage should have completed.
         final_state = load_state(work_dir)

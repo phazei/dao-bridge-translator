@@ -750,13 +750,12 @@ def _resolve_output_path(work_dir: Path, config: AppConfig) -> Path:
     """Resolve the output EPUB path.
 
     If ``config.output.epub_path`` is relative, resolve it relative to
-    the work directory's parent (so ``./book.en.epub`` produces the
-    output alongside the work directory, not inside it).
+    the work directory itself so all output stays self-contained.
     """
     p = Path(config.output.epub_path)
     if p.is_absolute():
         return p
-    return (work_dir.parent / p).resolve()
+    return (work_dir / p).resolve()
 
 
 def _add_css_to_opf(opf_content: str, opf_dir: str, css_zip_path: str) -> str:

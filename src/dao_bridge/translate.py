@@ -55,8 +55,10 @@ from dao_bridge.state import (
 from dao_bridge.workdir import (
     atomic_write,
     chunk_path,
+    failed_translation_path,
     format_chunk_id,
     glossary_path,
+    next_failed_attempt,
     parse_chunk_id,
     summary_path,
     translation_dir,
@@ -713,7 +715,10 @@ def translate_chunk(
             messages = extend_qa_messages(messages, final_text, config)
             try:
                 qa_resp: QAResponse = llm_client.complete_json(  # type: ignore[assignment]
-                    messages, QAResponse, max_retries=3
+                    messages,
+                    QAResponse,
+                    max_retries=3,
+                    context_label=f"{chunk.chunk_id}:qa",
                 )
                 qa_result_val = qa_resp.result
                 qa_issues = qa_resp.issues
@@ -1001,7 +1006,16 @@ def run_translate_stage(
                 # Passed (or QA disabled).
                 break
 
-            # QA failed — log and retry.
+            # QA failed — save failed artifact and log.
+            fail_num = next_failed_attempt(work_dir, chunk_id, sw)
+            fail_path = failed_translation_path(work_dir, chunk_id, fail_num, sw)
+            fail_path.parent.mkdir(parents=True, exist_ok=True)
+            atomic_write(fail_path, tc_with_attempts.model_dump_json(indent=2))
+            logger.info(
+                "Saved failed translation attempt to %s",
+                fail_path.name,
+            )
+
             logger.warning(
                 "Chunk %s QA failed (attempt %d/%d): %s",
                 chunk_id,

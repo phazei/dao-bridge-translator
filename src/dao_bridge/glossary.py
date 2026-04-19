@@ -716,7 +716,11 @@ def glossary_build(
             # Call LLM.
             messages = [{"role": "user", "content": prompt}]
             client = _get_llm_client()
-            response = client.complete_json(messages, response_model=GlossaryExtractionResponse)
+            response = client.complete_json(
+                messages,
+                response_model=GlossaryExtractionResponse,
+                context_label=batch_id,
+            )
 
             # Merge results.
             first_chunk_id = batch[0].chunk_id
@@ -908,7 +912,11 @@ def glossary_reconcile(
 
                 messages = [{"role": "user", "content": prompt}]
                 client = _get_llm_client()
-                result = client.complete_json(messages, response_model=GlossaryReconcileResponse)
+                result = client.complete_json(
+                    messages,
+                    response_model=GlossaryReconcileResponse,
+                    context_label=item_id,
+                )
 
                 # Apply the winner.
                 entry = _find_entry_by_source_term(glossary, conflict.source_term)
@@ -992,7 +1000,11 @@ def glossary_reconcile(
 
             messages = [{"role": "user", "content": prompt}]
             client = _get_llm_client()
-            result = client.complete_json(messages, response_model=GlossarySpeechMergeResponse)
+            result = client.complete_json(
+                messages,
+                response_model=GlossarySpeechMergeResponse,
+                context_label=item_id,
+            )
 
             entry.speech_style = result.consolidated_speech_style
 

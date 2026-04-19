@@ -1159,7 +1159,7 @@ class TestLanguageAgnostic:
 
         captured_messages = []
 
-        def capture_complete_json(messages, response_model=None):
+        def capture_complete_json(messages, response_model=None, **kwargs):
             captured_messages.append(messages)
             return _mock_extraction_response(entries=[])
 

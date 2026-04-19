@@ -178,6 +178,7 @@ class LLMClient:
         response_model: type[BaseModel],
         max_retries: int = 3,
         max_tokens: int | None = None,
+        context_label: str | None = None,
     ) -> BaseModel:
         """Chat completion that returns a validated Pydantic model.
 
@@ -200,12 +201,16 @@ class LLMClient:
             Maximum *consecutive* parse/validation failures before raising.
         max_tokens:
             Optional maximum completion tokens.
+        context_label:
+            Optional caller-provided label (e.g. chunk ID, batch ID)
+            included in log messages for easier debugging.
 
         Raises
         ------
         LLMStructuredOutputError
             After *max_retries* consecutive failures.
         """
+        ctx = f"[{context_label}] " if context_label else ""
         schema_json = json.dumps(response_model.model_json_schema(), indent=2)
         schema_instruction = (
             "\n\nRespond with JSON matching this schema:\n"
@@ -248,10 +253,16 @@ class LLMClient:
                 consecutive_failures += 1
                 error_msg = f"JSON parse error: {exc}"
                 logger.warning(
-                    "complete_json parse failure (%d/%d): %s",
+                    "%scomplete_json parse failure (%d/%d): %s",
+                    ctx,
                     consecutive_failures,
                     max_retries,
                     error_msg,
+                )
+                logger.debug(
+                    "%sRaw LLM response:\n%s",
+                    ctx,
+                    result.text,
                 )
                 conversation.append({"role": "assistant", "content": result.text})
                 conversation.append(
@@ -269,10 +280,16 @@ class LLMClient:
                 consecutive_failures += 1
                 error_msg = f"Validation error: {exc}"
                 logger.warning(
-                    "complete_json validation failure (%d/%d): %s",
+                    "%scomplete_json validation failure (%d/%d): %s",
+                    ctx,
                     consecutive_failures,
                     max_retries,
                     error_msg,
+                )
+                logger.debug(
+                    "%sRaw LLM response (valid JSON, failed validation):\n%s",
+                    ctx,
+                    raw_text,
                 )
                 conversation.append({"role": "assistant", "content": result.text})
                 conversation.append(
@@ -288,7 +305,7 @@ class LLMClient:
                 continue
 
         raise LLMStructuredOutputError(
-            f"Failed to get valid structured output after {total_attempts} attempts "
+            f"{ctx}Failed to get valid structured output after {total_attempts} attempts "
             f"({consecutive_failures} consecutive failures, limit {max_retries}). "
             f"Model: {self.config.model}"
         )

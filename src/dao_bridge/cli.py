@@ -257,8 +257,13 @@ def clean(ctx: click.Context, work_dir: str, force: bool) -> None:
 @click.option(
     "--work-dir", type=click.Path(exists=True), default="./work", help="Work directory path."
 )
+@click.option(
+    "--detail",
+    is_flag=True,
+    help="Show full error messages for failed items (untruncated).",
+)
 @click.pass_context
-def status(ctx: click.Context, work_dir: str) -> None:
+def status(ctx: click.Context, work_dir: str, detail: bool) -> None:
     """Show pipeline status for a work directory."""
     work = Path(work_dir).resolve()
     state = load_state(work)
@@ -268,7 +273,20 @@ def status(ctx: click.Context, work_dir: str) -> None:
     click.echo(f"Run status: {state.run.status}")
     click.echo()
 
+    from collections import Counter, defaultdict
+
     from dao_bridge.state import STAGE_NAMES
+
+    # Group items by stage prefix.
+    stage_items: dict[str, list[tuple[str, object]]] = defaultdict(list)
+    for key, item in state.items.items():
+        if ":" in key:
+            stage_prefix, item_id = key.split(":", 1)
+        else:
+            stage_prefix, item_id = "unknown", key
+        stage_items[stage_prefix].append((item_id, item))
+
+    _ERROR_TRUNCATE = 100
 
     click.echo("Stages:")
     for stage_name in STAGE_NAMES:
@@ -281,13 +299,36 @@ def status(ctx: click.Context, work_dir: str) -> None:
             status_str = "not started"
         click.echo(f"  {stage_name:.<25s} {status_str}")
 
-    # Count item statuses.
-    if state.items:
-        click.echo()
-        from collections import Counter
+        # Show per-stage item breakdown if items exist for this stage.
+        items = stage_items.get(stage_name, [])
+        if not items:
+            continue
 
-        counts = Counter(item.status for item in state.items.values())
-        click.echo("Items: " + ", ".join(f"{s}={c}" for s, c in sorted(counts.items())))
+        counts = Counter(item.status for _, item in items)
+        # Show counts on one line, indented under the stage.
+        parts = []
+        for s in ("completed", "started", "failed", "failed_qa", "pending"):
+            c = counts.get(s, 0)
+            if c > 0:
+                parts.append(f"{s}={c}")
+        if parts:
+            click.echo(f"    {', '.join(parts)}")
+
+        # List non-completed items with details.
+        problem_items = [
+            (item_id, item)
+            for item_id, item in items
+            if item.status in ("failed", "failed_qa", "started")
+        ]
+        for item_id, item in problem_items:
+            err = item.error_message or ""
+            if err and not detail:
+                err = (err[:_ERROR_TRUNCATE] + "...") if len(err) > _ERROR_TRUNCATE else err
+            label = f"[{item.status}] {item_id}"
+            if err:
+                click.echo(f"      {label}: {err}")
+            else:
+                click.echo(f"      {label}")
 
 
 # ---------------------------------------------------------------------------

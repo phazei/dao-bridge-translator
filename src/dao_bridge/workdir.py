@@ -148,6 +148,50 @@ def translation_path(work_dir: Path, chunk_id: str, spine_width: int = 4) -> Pat
     return work_dir / "translations" / pad_spine(spine_index, spine_width) / f"{chunk_id}.json"
 
 
+def failed_translation_path(
+    work_dir: Path, chunk_id: str, attempt: int, spine_width: int = 4
+) -> Path:
+    """``translations/NNNN/NNNN.MMM.failed.N.json``
+
+    Parameters
+    ----------
+    work_dir:
+        Work directory root.
+    chunk_id:
+        Chunk identifier (e.g. ``"0004.001"``).
+    attempt:
+        Failure attempt number (1-based).
+    spine_width:
+        Zero-padding width for the spine portion.
+    """
+    spine_index, _ = parse_chunk_id(chunk_id)
+    fname = f"{chunk_id}.failed.{attempt}.json"
+    return work_dir / "translations" / pad_spine(spine_index, spine_width) / fname
+
+
+def next_failed_attempt(work_dir: Path, chunk_id: str, spine_width: int = 4) -> int:
+    """Return the next available failure attempt number for a chunk.
+
+    Scans existing ``.failed.*.json`` files in the translation directory
+    and returns one past the highest found, or ``1`` if none exist.
+    """
+    spine_index, _ = parse_chunk_id(chunk_id)
+    t_dir = work_dir / "translations" / pad_spine(spine_index, spine_width)
+    if not t_dir.exists():
+        return 1
+    prefix = f"{chunk_id}.failed."
+    max_attempt = 0
+    for f in t_dir.iterdir():
+        if f.name.startswith(prefix) and f.name.endswith(".json"):
+            # Extract the number between "failed." and ".json"
+            num_str = f.name[len(prefix) : -len(".json")]
+            try:
+                max_attempt = max(max_attempt, int(num_str))
+            except ValueError:
+                continue
+    return max_attempt + 1
+
+
 def assembled_path(work_dir: Path, spine_index: int, spine_width: int = 4) -> Path:
     """``assembled/NNNN.md``"""
     return work_dir / "assembled" / f"{pad_spine(spine_index, spine_width)}.md"

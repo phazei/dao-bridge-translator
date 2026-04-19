@@ -11,10 +11,8 @@ from __future__ import annotations
 import functools
 import json
 import logging
-import posixpath
 import uuid
 import zipfile
-from copy import deepcopy
 from pathlib import Path
 
 from lxml import etree
@@ -22,6 +20,7 @@ from lxml import etree
 from dao_bridge.config import AppConfig
 from dao_bridge.llm_client import LLMClient
 from dao_bridge.schemas import Glossary, Manifest, TocTranslationResponse
+from dao_bridge.workdir import resolve_zip_path
 
 logger = logging.getLogger(__name__)
 
@@ -63,13 +62,6 @@ def _load_prompt_template(name: str) -> str:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-
-def _resolve_zip_path(opf_dir: str, href: str) -> str:
-    """Resolve an OPF-relative *href* to a ZIP-absolute path."""
-    if not opf_dir:
-        return posixpath.normpath(href)
-    return posixpath.normpath(posixpath.join(opf_dir, href))
 
 
 def _element_text(el: etree._Element) -> str:
@@ -130,7 +122,7 @@ def find_toc_files(source_epub_path: str, opf_dir: str) -> tuple[str | None, str
             for item in opf.iter(f"{{{_NS_OPF}}}item"):
                 if item.get("id") == ncx_id:
                     href = item.get("href", "")
-                    ncx_zip_path = _resolve_zip_path(opf_dir, href)
+                    ncx_zip_path = resolve_zip_path(opf_dir, href)
                     break
 
     # --- Nav: <item properties="nav" ...> ---
@@ -138,7 +130,7 @@ def find_toc_files(source_epub_path: str, opf_dir: str) -> tuple[str | None, str
         props = item.get("properties", "")
         if "nav" in props.split():
             href = item.get("href", "")
-            nav_zip_path = _resolve_zip_path(opf_dir, href)
+            nav_zip_path = resolve_zip_path(opf_dir, href)
             break
 
     return ncx_zip_path, nav_zip_path
@@ -220,22 +212,31 @@ def _extract_nav_titles(tree: etree._Element) -> list[str]:
 # ---------------------------------------------------------------------------
 
 
-def _render_glossary_for_toc(glossary: Glossary) -> str:
+def _render_glossary_for_toc(glossary: Glossary, categories: list[str] | None = None) -> str:
     """Render a compact glossary for ToC title translation.
 
-    Only includes names and places (most relevant for chapter titles).
+    Parameters
+    ----------
+    glossary:
+        Per-book glossary.
+    categories:
+        Category names to include.  If ``None`` or empty, includes all
+        entries (caller should resolve the fallback from config before
+        calling).
     """
     if not glossary.entries:
         return "(no glossary available)"
+    include = set(categories) if categories else None
     lines: list[str] = []
     for entry in glossary.entries:
-        if entry.category in ("character", "place", "organisation", "faction", "title"):
-            src = entry.source_term or ""
-            eng = entry.english
-            if src:
-                lines.append(f"  {src} -> {eng}")
-            else:
-                lines.append(f"  {eng}")
+        if include is not None and entry.category not in include:
+            continue
+        src = entry.source_term or ""
+        eng = entry.english
+        if src:
+            lines.append(f"  {src} -> {eng}")
+        else:
+            lines.append(f"  {eng}")
     return "\n".join(lines) if lines else "(no relevant glossary entries)"
 
 
@@ -277,13 +278,16 @@ def translate_titles(
     target_lang = resolve_language_name(config.languages.target)
 
     template = _load_prompt_template("translate_toc.txt")
-    glossary_text = _render_glossary_for_toc(glossary)
+
+    # Resolve ToC glossary categories: use toc_categories if set, else
+    # fall back to the full categories list from glossary config.
+    toc_cats = config.glossary.toc_categories or config.glossary.categories
+    glossary_text = _render_glossary_for_toc(glossary, categories=toc_cats)
 
     system_prompt = template.format(
         source_language=source_lang,
         target_language=target_lang,
         glossary=glossary_text,
-        titles_json=json.dumps(titles, ensure_ascii=False, indent=2),
     )
 
     messages = [

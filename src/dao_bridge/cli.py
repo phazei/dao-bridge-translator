@@ -79,6 +79,7 @@ def _default_config_yaml(epub_path: str, work_dir: str) -> str:
             "normalize_scene_breaks": "* * *",
         },
         "glossary": {
+            "toc_categories": [],
             "master_glossary_path": None,
             "promote_on_complete": False,
         },
@@ -897,7 +898,7 @@ def run(ctx: click.Context, work_dir: str, force: bool) -> None:
     _run_stage("glossary-reconcile", _glossary_reconcile)
 
     # --- Stage 6b: glossary-crosscheck (skip with warning if not implemented) ---
-    if config.glossary.crosscheck.enabled:
+    if config.glossary.master_glossary_path and config.glossary.crosscheck.enabled:
         click.echo("=== glossary-crosscheck ===")
         click.echo("  WARNING: glossary-crosscheck is not yet implemented, skipping.")
 

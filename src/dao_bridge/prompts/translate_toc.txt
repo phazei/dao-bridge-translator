@@ -1,4 +1,4 @@
-Translate these {source_language} chapter/section titles to {target_language}.
+Translate the {source_language} chapter/section titles provided by the user to {target_language}.
 
 Rules:
 - Use the glossary below for proper nouns and character names.
@@ -10,6 +10,3 @@ Rules:
 
 Glossary:
 {glossary}
-
-Titles to translate:
-{titles_json}

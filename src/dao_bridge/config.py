@@ -103,7 +103,7 @@ class ChunkingConfig(BaseModel):
 class GlossaryCrosscheckConfig(BaseModel):
     """Glossary crosscheck sub-config."""
 
-    enabled: bool = True
+    enabled: bool = False
     llm_assist: bool = False
     on_conflict: Literal["prefer_master", "prefer_book", "flag_only"] = "prefer_master"
 
@@ -134,6 +134,13 @@ class GlossaryConfig(BaseModel):
             ),
             "organization": "Formal groups, guilds, military units, institutions",
         }
+    )
+    toc_categories: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Glossary categories included in ToC title translation context. "
+            "Empty list (default) falls back to the main 'categories' list."
+        ),
     )
     master_glossary_path: str | None = None
     crosscheck: GlossaryCrosscheckConfig = Field(default_factory=GlossaryCrosscheckConfig)

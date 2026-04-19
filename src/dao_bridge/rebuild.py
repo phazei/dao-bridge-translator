@@ -13,6 +13,7 @@ namespaces, or unusual archive structure.
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import posixpath
@@ -24,6 +25,7 @@ from pathlib import Path
 
 import markdown
 from bs4 import BeautifulSoup
+from lxml import etree
 
 from dao_bridge.config import AppConfig
 from dao_bridge.schemas import Glossary, Manifest
@@ -46,6 +48,7 @@ from dao_bridge.workdir import (
     assembled_path,
     glossary_path,
     manifest_path,
+    resolve_zip_path,
 )
 
 logger = logging.getLogger(__name__)
@@ -55,39 +58,6 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 _TEMPLATES_DIR = Path(__file__).parent / "templates"
-
-# ---------------------------------------------------------------------------
-# Path helpers
-# ---------------------------------------------------------------------------
-
-
-def resolve_zip_path(opf_dir: str, href: str) -> str:
-    """Resolve an OPF-relative *href* to a ZIP-absolute path.
-
-    Parameters
-    ----------
-    opf_dir:
-        Directory of the OPF file within the ZIP (e.g. ``"OEBPS"``).
-        Empty string if OPF is at the ZIP root.
-    href:
-        The ``href`` attribute from the OPF manifest item.
-
-    Returns
-    -------
-    str
-        ZIP-absolute path (forward-slash separated, normalised).
-
-    Examples
-    --------
-    >>> resolve_zip_path("OEBPS", "Text/chapter1.xhtml")
-    'OEBPS/Text/chapter1.xhtml'
-    >>> resolve_zip_path("", "chapter1.xhtml")
-    'chapter1.xhtml'
-    """
-    if not opf_dir:
-        return posixpath.normpath(href)
-    return posixpath.normpath(posixpath.join(opf_dir, href))
-
 
 # ---------------------------------------------------------------------------
 # Ruby-safe markdown -> HTML conversion
@@ -405,20 +375,16 @@ def write_epub_modified_copy(
                 if item.filename == "mimetype":
                     continue  # Already written.
 
+                new_info = copy.copy(item)
+                new_info.header_offset = 0  # Reset; written by ZipFile.
+
                 if item.filename in modified_files:
-                    # Preserve original ZipInfo metadata.
-                    new_info = zipfile.ZipInfo(item.filename)
-                    new_info.compress_type = item.compress_type
-                    new_info.date_time = item.date_time
-                    new_info.external_attr = item.external_attr
+                    # Content changed -- wipe extra in case any fields
+                    # reference the old payload (e.g. compressed size hints).
+                    new_info.extra = b""
                     dst.writestr(new_info, modified_files[item.filename])
                 else:
                     # Byte-identical copy.
-                    new_info = zipfile.ZipInfo(item.filename)
-                    new_info.compress_type = item.compress_type
-                    new_info.date_time = item.date_time
-                    new_info.external_attr = item.external_attr
-                    new_info.extra = item.extra
                     dst.writestr(new_info, src.read(item.filename))
 
             # Phase 3: Add new files not in source (e.g., default.css).
@@ -563,7 +529,7 @@ def _do_rebuild(work_dir: Path, config: AppConfig, state: PipelineState) -> None
     # --- Translate ToC ---
     from dao_bridge.llm_client import LLMClient
 
-    llm_client = LLMClient(config.models.glossary, config.llm)
+    llm_client = LLMClient(config.models.translate, config.llm)
     gp = glossary_path(work_dir)
     glossary = Glossary(
         created_at="2000-01-01T00:00:00Z",
@@ -621,8 +587,6 @@ def _resolve_output_path(work_dir: Path, config: AppConfig) -> Path:
 
 def _add_css_to_opf(opf_content: str, opf_dir: str, css_zip_path: str) -> str:
     """Add a ``<item>`` entry for the default CSS to the OPF manifest."""
-    from lxml import etree
-
     tree = etree.fromstring(
         opf_content.encode("utf-8") if isinstance(opf_content, str) else opf_content
     )

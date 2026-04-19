@@ -7,6 +7,7 @@ All JSON writes go through ``atomic_write`` to prevent corruption on crash.
 from __future__ import annotations
 
 import os
+import posixpath
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
@@ -47,7 +48,40 @@ def parse_chunk_id(chunk_id: str) -> tuple[int, int]:
 
 
 # ---------------------------------------------------------------------------
-# Path helpers
+# ZIP / OPF path helpers
+# ---------------------------------------------------------------------------
+
+
+def resolve_zip_path(opf_dir: str, href: str) -> str:
+    """Resolve an OPF-relative *href* to a ZIP-absolute path.
+
+    Parameters
+    ----------
+    opf_dir:
+        Directory of the OPF file within the ZIP (e.g. ``"OEBPS"``).
+        Empty string if OPF is at the ZIP root.
+    href:
+        The ``href`` attribute from the OPF manifest item.
+
+    Returns
+    -------
+    str
+        ZIP-absolute path (forward-slash separated, normalised).
+
+    Examples
+    --------
+    >>> resolve_zip_path("OEBPS", "Text/chapter1.xhtml")
+    'OEBPS/Text/chapter1.xhtml'
+    >>> resolve_zip_path("", "chapter1.xhtml")
+    'chapter1.xhtml'
+    """
+    if not opf_dir:
+        return posixpath.normpath(href)
+    return posixpath.normpath(posixpath.join(opf_dir, href))
+
+
+# ---------------------------------------------------------------------------
+# Work directory path helpers
 # ---------------------------------------------------------------------------
 
 

@@ -817,7 +817,8 @@ class TestRenderGlossaryForToc:
                 ),
             ]
         )
-        result = _render_glossary_for_toc(glossary)
+        cats = ["character", "place", "clan", "title"]
+        result = _render_glossary_for_toc(glossary, categories=cats)
         assert "スバル" in result
         assert "Subaru" in result
         assert "ルグニカ" in result
@@ -829,3 +830,39 @@ class TestRenderGlossaryForToc:
         glossary = _make_glossary()
         result = _render_glossary_for_toc(glossary)
         assert "no glossary" in result.lower()
+
+    def test_no_categories_includes_all(self):
+        """When categories is None or empty, all entries are included."""
+        glossary = _make_glossary(
+            entries=[
+                GlossaryEntry(
+                    source_term="スバル", english="Subaru", category="character", source="extracted"
+                ),
+                GlossaryEntry(
+                    source_term="マナ", english="mana", category="concept", source="extracted"
+                ),
+            ]
+        )
+        result = _render_glossary_for_toc(glossary, categories=None)
+        assert "スバル" in result
+        assert "マナ" in result
+
+        result2 = _render_glossary_for_toc(glossary, categories=[])
+        assert "スバル" in result2
+        assert "マナ" in result2
+
+    def test_custom_categories(self):
+        """Custom categories list controls which entries appear."""
+        glossary = _make_glossary(
+            entries=[
+                GlossaryEntry(
+                    source_term="スバル", english="Subaru", category="character", source="extracted"
+                ),
+                GlossaryEntry(
+                    source_term="マナ", english="mana", category="concept", source="extracted"
+                ),
+            ]
+        )
+        result = _render_glossary_for_toc(glossary, categories=["concept"])
+        assert "マナ" in result
+        assert "スバル" not in result

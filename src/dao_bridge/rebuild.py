@@ -61,6 +61,77 @@ logger = logging.getLogger(__name__)
 _NS_OPF = "http://www.idpf.org/2007/opf"
 _TEMPLATES_DIR = Path(__file__).parent / "templates"
 
+# CSS properties that enforce vertical text layout in Japanese EPUBs.
+# These are stripped unconditionally during rebuild so the translated
+# (horizontal-language) text renders left-to-right, top-to-bottom.
+_VERTICAL_CSS_PROPERTIES: frozenset[str] = frozenset(
+    {
+        "writing-mode",
+        "-webkit-writing-mode",
+        "-epub-writing-mode",
+    }
+)
+
+# Regex for strip_css_properties(): matches a single CSS declaration
+# whose property name is in a caller-supplied set.  Captures:
+#   - optional leading whitespace (including newlines)
+#   - the property name
+#   - colon, value, and terminating semicolon
+# The pattern is compiled once per call via _build_strip_re().
+#
+# We intentionally do NOT try to handle values that contain semicolons
+# inside strings/url() — those are astronomically rare in the properties
+# we target (writing-mode never has such values).
+
+
+def _build_strip_re(properties: frozenset[str]) -> re.Pattern[str]:
+    """Build a compiled regex that matches declarations for *properties*.
+
+    The generated pattern matches lines like::
+
+        -webkit-writing-mode: vertical-rl;
+          -epub-writing-mode:   vertical-rl  ;
+
+    It handles optional whitespace around the colon and before the
+    semicolon, and consumes leading whitespace so the resulting CSS
+    has no stray blank lines.
+    """
+    # Escape property names for regex safety (hyphens are literal in
+    # character classes but we use re.escape to be safe with any future
+    # property names).
+    escaped = "|".join(re.escape(p) for p in sorted(properties))
+    # Match: optional leading whitespace, property, colon, value, semicolon.
+    # The value is everything up to the next semicolon (non-greedy).
+    return re.compile(
+        rf"[ \t]*(?:{escaped})\s*:[^;]*;\s*?\n?",
+        re.IGNORECASE,
+    )
+
+
+def strip_css_properties(css: str, properties: frozenset[str]) -> str:
+    """Remove all declarations for the given CSS *properties* from *css*.
+
+    Parameters
+    ----------
+    css:
+        CSS source text.
+    properties:
+        Set of CSS property names (case-insensitive matching) to remove.
+        Vendor-prefixed variants should be listed explicitly (e.g.
+        ``{"-webkit-writing-mode", "-epub-writing-mode", "writing-mode"}``).
+
+    Returns
+    -------
+    str
+        CSS text with the matching declarations removed.  Empty rule
+        blocks (e.g. ``.vrtl { }``) are left intact — they are harmless.
+    """
+    if not properties:
+        return css
+    pattern = _build_strip_re(properties)
+    return pattern.sub("", css)
+
+
 # ---------------------------------------------------------------------------
 # Ruby-safe markdown -> HTML conversion
 # ---------------------------------------------------------------------------
@@ -400,6 +471,96 @@ def write_epub_modified_copy(
 
 
 # ---------------------------------------------------------------------------
+# Vertical writing-mode / page-progression fixes
+# ---------------------------------------------------------------------------
+
+
+def _strip_vertical_css_from_epub(
+    source_epub: str,
+    modified_files: dict[str, bytes],
+) -> int:
+    """Find all CSS files in *source_epub* and strip vertical writing-mode.
+
+    Modified CSS content is added to *modified_files* in-place so it
+    gets written to the output EPUB by :func:`write_epub_modified_copy`.
+    CSS files that are already in *modified_files* (e.g. the injected
+    default CSS) are processed as well in case they somehow contain
+    vertical declarations.
+
+    Parameters
+    ----------
+    source_epub:
+        Path to the source EPUB file.
+    modified_files:
+        Mutable mapping of ZIP-internal paths to replacement bytes.
+        CSS files with changes are added/updated here.
+
+    Returns
+    -------
+    int
+        Number of CSS files that were actually modified.
+    """
+    count = 0
+
+    with zipfile.ZipFile(source_epub, "r") as zf:
+        css_paths = [n for n in zf.namelist() if n.lower().endswith(".css")]
+        for css_path in css_paths:
+            # Use the already-modified content if present, otherwise read
+            # from the source EPUB.
+            if css_path in modified_files:
+                original = modified_files[css_path].decode("utf-8")
+            else:
+                original = zf.read(css_path).decode("utf-8")
+
+            stripped = strip_css_properties(original, _VERTICAL_CSS_PROPERTIES)
+            if stripped != original:
+                modified_files[css_path] = stripped.encode("utf-8")
+                count += 1
+                logger.debug("Stripped vertical writing-mode from %s", css_path)
+
+    return count
+
+
+def fix_page_progression_direction(opf_content: str) -> str:
+    """Change ``page-progression-direction="rtl"`` to ``"ltr"`` in the OPF.
+
+    Japanese vertical EPUBs use ``rtl`` page progression (right-to-left
+    page turning).  After translation to a horizontal language this
+    should be ``ltr`` so pages flow naturally for left-to-right readers.
+
+    If the attribute is not present or already ``ltr``, the content is
+    returned unchanged.
+
+    Parameters
+    ----------
+    opf_content:
+        OPF file content as a string.
+
+    Returns
+    -------
+    str
+        OPF content with the attribute corrected.
+    """
+    tree = etree.fromstring(
+        opf_content.encode("utf-8") if isinstance(opf_content, str) else opf_content
+    )
+
+    spine_el = tree.find(f"{{{_NS_OPF}}}spine")
+    if spine_el is not None:
+        ppd = spine_el.get("page-progression-direction")
+        if ppd and ppd.lower() == "rtl":
+            spine_el.set("page-progression-direction", "ltr")
+            logger.info("Changed page-progression-direction from '%s' to 'ltr'", ppd)
+
+    return etree.tostring(
+        tree,
+        xml_declaration=True,
+        encoding="UTF-8",
+        pretty_print=True,
+    ).decode("utf-8")
+
+
+# ---------------------------------------------------------------------------
 # Epubcheck validation
 # ---------------------------------------------------------------------------
 
@@ -532,6 +693,11 @@ def _do_rebuild(work_dir: Path, config: AppConfig, state: PipelineState) -> None
     modified = build_modified_files(manifest, work_dir, source_epub, config)
     logger.info("Body replacement complete: %d files modified", len(modified))
 
+    # --- Strip vertical writing-mode from CSS files ---
+    css_count = _strip_vertical_css_from_epub(source_epub, modified)
+    if css_count:
+        logger.info("Stripped vertical writing-mode from %d CSS file(s)", css_count)
+
     # --- Translate ToC ---
     from dao_bridge.llm_client import LLMClient
 
@@ -553,6 +719,7 @@ def _do_rebuild(work_dir: Path, config: AppConfig, state: PipelineState) -> None
     opf_zip_path = find_opf_zip_path(source_epub)
     opf_content = read_zip_entry(source_epub, opf_zip_path).decode("utf-8")
     new_opf = update_opf_metadata(opf_content, config)
+    new_opf = fix_page_progression_direction(new_opf)
 
     # If default CSS, add it to the OPF manifest and the modified files.
     if config.output.css == "default":

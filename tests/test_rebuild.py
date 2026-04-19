@@ -11,12 +11,15 @@ import pytest
 
 from dao_bridge.config import AppConfig
 from dao_bridge.rebuild import (
+    _VERTICAL_CSS_PROPERTIES,
     build_modified_files,
+    fix_page_progression_direction,
     inject_default_css_link,
     markdown_to_html,
     replace_xhtml_body,
     resolve_zip_path,
     restore_ruby_tags,
+    strip_css_properties,
     validate_with_epubcheck,
     write_epub_modified_copy,
 )
@@ -900,3 +903,303 @@ class TestZipIntegrity:
 
         with zipfile.ZipFile(output, "r") as zf:
             assert "OEBPS/content.opf" in zf.namelist()
+
+
+# ---------------------------------------------------------------------------
+# Tests: strip_css_properties
+# ---------------------------------------------------------------------------
+
+
+class TestStripCssProperties:
+    """Unit tests for the generic strip_css_properties() function."""
+
+    def test_strips_writing_mode_vertical_rl(self):
+        css = """\
+.vrtl {
+  -webkit-writing-mode: vertical-rl;
+  -epub-writing-mode:   vertical-rl;
+}
+"""
+        result = strip_css_properties(css, _VERTICAL_CSS_PROPERTIES)
+        assert "writing-mode" not in result
+        assert ".vrtl {" in result  # rule block preserved (empty)
+
+    def test_strips_webkit_and_epub_prefixes(self):
+        css = "html { -webkit-writing-mode: horizontal-tb; -epub-writing-mode: horizontal-tb; }"
+        result = strip_css_properties(css, _VERTICAL_CSS_PROPERTIES)
+        assert "-webkit-writing-mode" not in result
+        assert "-epub-writing-mode" not in result
+
+    def test_strips_standard_writing_mode(self):
+        css = "body { writing-mode: vertical-rl; color: red; }"
+        result = strip_css_properties(css, _VERTICAL_CSS_PROPERTIES)
+        assert "writing-mode" not in result
+        assert "color: red;" in result
+
+    def test_preserves_unrelated_properties(self):
+        css = """\
+.vrtl h1 {
+  font-family: serif-ja-v, serif-ja, serif;
+  -webkit-writing-mode: vertical-rl;
+  -epub-writing-mode: vertical-rl;
+  margin: 0;
+}
+"""
+        result = strip_css_properties(css, _VERTICAL_CSS_PROPERTIES)
+        assert "font-family: serif-ja-v" in result
+        assert "margin: 0;" in result
+        assert "writing-mode" not in result
+
+    def test_case_insensitive(self):
+        css = "body { Writing-Mode: vertical-rl; WRITING-MODE: tb-rl; }"
+        result = strip_css_properties(css, _VERTICAL_CSS_PROPERTIES)
+        assert "writing-mode" not in result.lower()
+
+    def test_tb_rl_value(self):
+        css = "html { writing-mode: tb-rl; }"
+        result = strip_css_properties(css, _VERTICAL_CSS_PROPERTIES)
+        assert "writing-mode" not in result
+
+    def test_vertical_lr_value(self):
+        css = ".vltr { -webkit-writing-mode: vertical-lr; -epub-writing-mode: vertical-lr; }"
+        result = strip_css_properties(css, _VERTICAL_CSS_PROPERTIES)
+        assert "writing-mode" not in result
+
+    def test_no_change_when_no_matching_properties(self):
+        css = "body { color: red; font-size: 16px; }"
+        result = strip_css_properties(css, _VERTICAL_CSS_PROPERTIES)
+        assert result == css
+
+    def test_empty_css(self):
+        assert strip_css_properties("", _VERTICAL_CSS_PROPERTIES) == ""
+
+    def test_empty_properties_set(self):
+        css = "body { writing-mode: vertical-rl; }"
+        result = strip_css_properties(css, frozenset())
+        assert result == css
+
+    def test_custom_property_set(self):
+        """Verify the function works with arbitrary property names."""
+        css = "body { color: red; font-size: 16px; margin: 0; }"
+        result = strip_css_properties(css, frozenset({"color", "margin"}))
+        assert "color" not in result
+        assert "margin" not in result
+        assert "font-size: 16px;" in result
+
+    def test_whitespace_variations(self):
+        """Extra spaces around colon and before semicolon."""
+        css = "body {\n  writing-mode  :  vertical-rl  ;\n  color: red;\n}"
+        result = strip_css_properties(css, _VERTICAL_CSS_PROPERTIES)
+        assert "writing-mode" not in result
+        assert "color: red;" in result
+
+    def test_multiline_realistic_css(self):
+        """Realistic EBPAJ stylesheet excerpt."""
+        css = """\
+@charset "UTF-8";
+
+/* horizontal */
+html,
+.hltr {
+  -webkit-writing-mode: horizontal-tb;
+  -epub-writing-mode:   horizontal-tb;
+}
+/* vertical */
+.vrtl {
+  -webkit-writing-mode: vertical-rl;
+  -epub-writing-mode:   vertical-rl;
+}
+
+html {
+  font-family: serif-ja, serif;
+}
+"""
+        result = strip_css_properties(css, _VERTICAL_CSS_PROPERTIES)
+        assert "vertical-rl" not in result
+        assert "horizontal-tb" not in result  # also stripped (same property name)
+        assert "font-family: serif-ja, serif;" in result
+        assert '@charset "UTF-8";' in result
+
+    def test_commented_out_code_not_stripped(self):
+        """Properties inside CSS comments should ideally survive, but since
+        we use a simple regex (not a CSS parser), commented-out declarations
+        may be stripped.  This test documents the current behaviour."""
+        css = """\
+/* .vrtl { writing-mode: vertical-rl; } */
+body { color: red; }
+"""
+        result = strip_css_properties(css, _VERTICAL_CSS_PROPERTIES)
+        # The regex will strip even inside comments — this is acceptable
+        # because removing a commented-out declaration has no effect.
+        assert "color: red;" in result
+
+
+# ---------------------------------------------------------------------------
+# Tests: fix_page_progression_direction
+# ---------------------------------------------------------------------------
+
+
+class TestFixPageProgressionDirection:
+    """Unit tests for fix_page_progression_direction()."""
+
+    def test_rtl_changed_to_ltr(self):
+        opf = """\
+<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="uid">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+    <dc:title>Test</dc:title>
+    <dc:language>ja</dc:language>
+  </metadata>
+  <manifest/>
+  <spine page-progression-direction="rtl"/>
+</package>
+"""
+        result = fix_page_progression_direction(opf)
+        assert 'page-progression-direction="ltr"' in result
+        assert 'page-progression-direction="rtl"' not in result
+
+    def test_already_ltr_unchanged(self):
+        opf = """\
+<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="uid">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+    <dc:title>Test</dc:title>
+  </metadata>
+  <manifest/>
+  <spine page-progression-direction="ltr"/>
+</package>
+"""
+        result = fix_page_progression_direction(opf)
+        assert 'page-progression-direction="ltr"' in result
+
+    def test_no_ppd_attribute(self):
+        opf = """\
+<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="uid">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+    <dc:title>Test</dc:title>
+  </metadata>
+  <manifest/>
+  <spine/>
+</package>
+"""
+        result = fix_page_progression_direction(opf)
+        # Should not add the attribute if it wasn't there.
+        assert "page-progression-direction" not in result
+
+    def test_no_spine_element(self):
+        """Unusual OPF with no <spine> — should not crash."""
+        opf = """\
+<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="uid">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+    <dc:title>Test</dc:title>
+  </metadata>
+  <manifest/>
+</package>
+"""
+        result = fix_page_progression_direction(opf)
+        assert "page-progression-direction" not in result
+
+
+# ---------------------------------------------------------------------------
+# Tests: _strip_vertical_css_from_epub (integration)
+# ---------------------------------------------------------------------------
+
+
+class TestStripVerticalCssFromEpub:
+    """Integration tests for CSS stripping during EPUB rebuild."""
+
+    def test_css_files_stripped_in_output_epub(self, tmp_path: Path):
+        """CSS files in the source EPUB should have vertical writing-mode removed."""
+        vertical_css = """\
+.vrtl {
+  -webkit-writing-mode: vertical-rl;
+  -epub-writing-mode:   vertical-rl;
+}
+.hltr {
+  -webkit-writing-mode: horizontal-tb;
+  -epub-writing-mode:   horizontal-tb;
+}
+body { color: black; }
+"""
+        epub = _make_mini_epub(
+            tmp_path,
+            extra_files={
+                "OEBPS/style/main.css": vertical_css.encode("utf-8"),
+            },
+        )
+        output = tmp_path / "output.epub"
+
+        # Build modified_files and strip CSS, then write.
+        from dao_bridge.rebuild import _strip_vertical_css_from_epub
+
+        modified: dict[str, bytes] = {}
+        count = _strip_vertical_css_from_epub(str(epub), modified)
+
+        assert count == 1
+        assert "OEBPS/style/main.css" in modified
+
+        css_result = modified["OEBPS/style/main.css"].decode("utf-8")
+        assert "writing-mode" not in css_result
+        assert "color: black;" in css_result
+
+    def test_multiple_css_files(self, tmp_path: Path):
+        """All CSS files in the EPUB should be processed."""
+        css_a = "body { writing-mode: vertical-rl; font-size: 16px; }"
+        css_b = "html { -epub-writing-mode: vertical-rl; }"
+        css_c = "p { color: red; }"  # no vertical — should not appear in modified
+
+        epub = _make_mini_epub(
+            tmp_path,
+            extra_files={
+                "OEBPS/style/a.css": css_a.encode("utf-8"),
+                "OEBPS/style/b.css": css_b.encode("utf-8"),
+                "OEBPS/style/c.css": css_c.encode("utf-8"),
+            },
+        )
+
+        from dao_bridge.rebuild import _strip_vertical_css_from_epub
+
+        modified: dict[str, bytes] = {}
+        count = _strip_vertical_css_from_epub(str(epub), modified)
+
+        assert count == 2  # a.css and b.css changed; c.css unchanged
+        assert "OEBPS/style/a.css" in modified
+        assert "OEBPS/style/b.css" in modified
+        assert "OEBPS/style/c.css" not in modified
+
+    def test_no_css_files(self, tmp_path: Path):
+        """EPUB with no CSS files — should be a no-op."""
+        epub = _make_mini_epub(tmp_path)
+
+        from dao_bridge.rebuild import _strip_vertical_css_from_epub
+
+        modified: dict[str, bytes] = {}
+        count = _strip_vertical_css_from_epub(str(epub), modified)
+
+        assert count == 0
+        assert len(modified) == 0
+
+    def test_already_modified_css_is_processed(self, tmp_path: Path):
+        """If a CSS file is already in modified_files, it should still be processed."""
+        epub = _make_mini_epub(
+            tmp_path,
+            extra_files={
+                "OEBPS/style/main.css": b"body { color: red; }",
+            },
+        )
+
+        from dao_bridge.rebuild import _strip_vertical_css_from_epub
+
+        # Pre-populate modified_files with a different version of the CSS
+        # that has vertical writing-mode.
+        modified: dict[str, bytes] = {
+            "OEBPS/style/main.css": b"body { writing-mode: vertical-rl; color: blue; }",
+        }
+        count = _strip_vertical_css_from_epub(str(epub), modified)
+
+        assert count == 1
+        css_result = modified["OEBPS/style/main.css"].decode("utf-8")
+        assert "writing-mode" not in css_result
+        assert "color: blue;" in css_result  # Uses the modified version, not source

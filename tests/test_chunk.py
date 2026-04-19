@@ -470,10 +470,10 @@ class TestClassificationFiltering:
         item = self._make_item("illustration")
         assert item.classification not in config.chunkable_classifications
 
-    def test_toc_auto_not_chunkable(self):
+    def test_toc_auto_is_chunkable(self):
         config = _default_config()
         item = self._make_item("toc_auto")
-        assert item.classification not in config.chunkable_classifications
+        assert item.classification in config.chunkable_classifications
 
     def test_chapter_is_chunkable(self):
         config = _default_config()

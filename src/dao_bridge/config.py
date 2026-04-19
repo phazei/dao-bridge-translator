@@ -91,6 +91,7 @@ class ChunkingConfig(BaseModel):
             "frontmatter",
             "backmatter",
             "toc_authored",
+            "toc_auto",
         ]
     )
 

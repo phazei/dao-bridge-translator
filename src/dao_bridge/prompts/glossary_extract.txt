@@ -8,7 +8,7 @@ Extract all proper nouns and notable terms from the text below. For each entry p
 - category: one of the categories listed below
 - aliases: alternate forms, abbreviations, or partial names for the same entity
 - nicknames: for characters, a mapping of {{speaker_name: nickname_used_by_that_speaker}}
-- speech_style: for characters only, describe how they speak (register, verbal tics, dialect, speech patterns). Null for non-characters.
+- speech_style: for characters only, a single plain-text sentence describing how they speak (e.g. register, verbal tics, dialect, self-reference, etc.). Must be a string, not an object. Null for non-characters.
 - notes: brief context (role, significance). Null if obvious.
 
 Categories:

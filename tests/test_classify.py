@@ -523,8 +523,8 @@ class TestConfidence:
 
 
 class TestErrorHandling:
-    def test_llm_failure_marks_unknown(self, tmp_path):
-        """LLM failure should mark item as 'unknown', not crash the stage."""
+    def test_llm_failure_leaves_classification_none(self, tmp_path):
+        """LLM failure should leave classification as None for retry, not crash the stage."""
         work_dir = tmp_path / "work"
         ensure_dirs(work_dir)
         config = _make_config(work_dir)
@@ -545,13 +545,13 @@ class TestErrorHandling:
 
             result = run_classify_stage(work_dir, config, state, force=False)
 
-        # Item 0 should be "unknown" (LLM failed).
-        assert result.spine[0].classification == "unknown"
+        # Item 0 should be None (LLM failed, retryable on re-run).
+        assert result.spine[0].classification is None
         # Item 1 should be "chapter" (LLM succeeded).
         assert result.spine[1].classification == "chapter"
 
-    def test_unexpected_error_marks_unknown(self, tmp_path):
-        """Unexpected exceptions also mark item as 'unknown'."""
+    def test_unexpected_error_leaves_classification_none(self, tmp_path):
+        """Unexpected exceptions leave classification as None for retry."""
         work_dir = tmp_path / "work"
         ensure_dirs(work_dir)
         config = _make_config(work_dir)
@@ -567,10 +567,10 @@ class TestErrorHandling:
 
             result = run_classify_stage(work_dir, config, state, force=False)
 
-        assert result.spine[0].classification == "unknown"
+        assert result.spine[0].classification is None
 
-    def test_missing_raw_file_marks_unknown(self, tmp_path):
-        """Missing raw file should mark item as 'unknown' without crashing."""
+    def test_missing_raw_file_leaves_classification_none(self, tmp_path):
+        """Missing raw file should leave classification as None without crashing."""
         work_dir = tmp_path / "work"
         ensure_dirs(work_dir)
         config = _make_config(work_dir)
@@ -581,7 +581,7 @@ class TestErrorHandling:
 
         result = run_classify_stage(work_dir, config, state, force=False)
 
-        assert result.spine[0].classification == "unknown"
+        assert result.spine[0].classification is None
 
 
 # ---------------------------------------------------------------------------

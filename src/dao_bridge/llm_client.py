@@ -52,6 +52,7 @@ _TRANSIENT_EXCEPTIONS = (
     openai.APITimeoutError,
     openai.RateLimitError,
     openai.InternalServerError,
+    openai.BadRequestError,
 )
 
 

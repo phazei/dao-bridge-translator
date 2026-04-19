@@ -462,7 +462,6 @@ def run_classify_stage(
         if not raw_file.exists():
             logger.error("Spine %s: raw file missing at %s", padded, raw_file)
             mark_item_failed(work_dir, state, "classify", padded, "raw file missing")
-            item.classification = "unknown"
             if on_progress:
                 on_progress(padded)
             continue
@@ -505,24 +504,20 @@ def run_classify_stage(
 
         except LLMStructuredOutputError as exc:
             logger.warning(
-                "Spine %s: LLM classification failed after retries — marking as 'unknown'. "
-                "Error: %s",
+                "Spine %s: LLM classification failed after retries. Error: %s",
                 padded,
                 exc,
             )
-            item.classification = "unknown"
-            item.title = None
+            # Leave classification as None so re-runs will retry this item.
             mark_item_failed(work_dir, state, "classify", padded, str(exc))
 
         except Exception as exc:
             logger.warning(
-                "Spine %s: unexpected error during classification — marking as 'unknown'. "
-                "Error: %s",
+                "Spine %s: unexpected error during classification. Error: %s",
                 padded,
                 exc,
             )
-            item.classification = "unknown"
-            item.title = None
+            # Leave classification as None so re-runs will retry this item.
             mark_item_failed(work_dir, state, "classify", padded, str(exc))
 
         if on_progress:

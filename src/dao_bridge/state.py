@@ -243,3 +243,34 @@ def iter_pending_items(state: PipelineState, stage: StageName, item_ids: list[st
             continue
         result.append(item_id)
     return result
+
+
+def has_failed_items(state: PipelineState, stage: StageName) -> bool:
+    """Return *True* if *stage* has any items with ``failed`` or ``failed_qa`` status.
+
+    Useful for ``--retry-failed`` to check whether there is work to do
+    before re-entering a completed stage.
+    """
+    prefix = f"{stage}:"
+    for key, item in state.items.items():
+        if key.startswith(prefix) and item.status in ("failed", "failed_qa"):
+            return True
+    return False
+
+
+def reopen_stage(work_dir: Path, state: PipelineState, stage: StageName) -> None:
+    """Re-open a completed stage so failed items can be retried.
+
+    Unlike :func:`reset_stage` (used by ``--force``), this preserves all
+    existing item state — completed items stay completed.  Only the stage-
+    level status is set back to ``"running"`` so that ``iter_pending_items``
+    based processing can resume for non-completed items.
+
+    If the stage is already ``"running"`` or ``"pending"``, this is a no-op.
+    """
+    info = state.stages.get(stage)
+    if info and info.status in ("running", "pending"):
+        return
+    state.stages[stage] = StageState(status="running", started_at=_now())
+    save_state(work_dir, state)
+    logger.info("Stage [bold]%s[/bold] reopened for retry-failed", stage)

@@ -27,6 +27,7 @@ from dao_bridge.state import (
     mark_item_started,
     mark_stage_completed,
     mark_stage_started,
+    reopen_stage,
     reset_stage,
 )
 from dao_bridge.workdir import (
@@ -190,6 +191,7 @@ def assemble_all(
     state: PipelineState,
     *,
     force: bool = False,
+    retry_failed: bool = False,
     spine_filter: int | None = None,
     on_progress: Callable[[str], None] | None = None,
 ) -> Manifest:
@@ -205,6 +207,9 @@ def assemble_all(
         Pipeline state (mutated in place).
     force:
         If *True*, reassemble even if already completed.
+    retry_failed:
+        If *True*, re-enter a completed stage to retry only failed items.
+        Preserves completed item state (unlike ``force``).
     spine_filter:
         If set, only assemble this spine index.
     on_progress:
@@ -230,7 +235,16 @@ def assemble_all(
     if force:
         reset_stage(work_dir, state, "assemble")
 
-    if not force and is_stage_completed(state, "assemble") and spine_filter is None:
+    # Handle --retry-failed: re-open a completed stage without wiping items.
+    if retry_failed and not force:
+        reopen_stage(work_dir, state, "assemble")
+
+    if (
+        not force
+        and not retry_failed
+        and is_stage_completed(state, "assemble")
+        and spine_filter is None
+    ):
         logger.info("Assemble stage already completed — skipping (use --force to re-run)")
         return manifest
 

@@ -8,6 +8,7 @@ import pytest
 from dao_bridge.state import (
     PipelineState,
     StageState,
+    has_failed_items,
     is_stage_completed,
     iter_pending_items,
     load_state,
@@ -17,6 +18,7 @@ from dao_bridge.state import (
     mark_stage_completed,
     mark_stage_failed,
     mark_stage_started,
+    reopen_stage,
     reset_stage,
     save_state,
 )
@@ -277,3 +279,140 @@ class TestResetStage:
 
         assert state.stages["extract"].status == "running"
         assert state.stages["extract"].started_at is not None
+
+
+# ---------------------------------------------------------------------------
+# has_failed_items
+# ---------------------------------------------------------------------------
+
+
+class TestHasFailedItems:
+    def test_no_items(self, work_dir: Path):
+        """No items at all returns False."""
+        state = load_state(work_dir)
+        assert not has_failed_items(state, "classify")
+
+    def test_all_completed(self, work_dir: Path):
+        """All completed items returns False."""
+        state = load_state(work_dir)
+        mark_item_completed(work_dir, state, "classify", "001")
+        mark_item_completed(work_dir, state, "classify", "002")
+        assert not has_failed_items(state, "classify")
+
+    def test_has_failed(self, work_dir: Path):
+        """A failed item returns True."""
+        state = load_state(work_dir)
+        mark_item_completed(work_dir, state, "classify", "001")
+        mark_item_failed(work_dir, state, "classify", "002", "LLM error")
+        assert has_failed_items(state, "classify")
+
+    def test_has_failed_qa(self, work_dir: Path):
+        """A failed_qa item returns True."""
+        state = load_state(work_dir)
+        mark_item_failed(work_dir, state, "translate", "001.002", "QA fail", status="failed_qa")
+        assert has_failed_items(state, "translate")
+
+    def test_other_stage_not_affected(self, work_dir: Path):
+        """Failed items in one stage don't affect another."""
+        state = load_state(work_dir)
+        mark_item_failed(work_dir, state, "classify", "001", "error")
+        assert not has_failed_items(state, "chunk")
+
+
+# ---------------------------------------------------------------------------
+# reopen_stage (for --retry-failed)
+# ---------------------------------------------------------------------------
+
+
+class TestReopenStage:
+    def test_reopen_completed_stage(self, work_dir: Path):
+        """reopen_stage sets a completed stage back to running."""
+        state = load_state(work_dir)
+        mark_stage_started(work_dir, state, "classify")
+        mark_item_completed(work_dir, state, "classify", "001")
+        mark_item_failed(work_dir, state, "classify", "002", "error")
+        mark_stage_completed(work_dir, state, "classify")
+
+        reopen_stage(work_dir, state, "classify")
+
+        assert state.stages["classify"].status == "running"
+        # Items are preserved.
+        assert state.items["classify:001"].status == "completed"
+        assert state.items["classify:002"].status == "failed"
+
+    def test_reopen_preserves_completed_items(self, work_dir: Path):
+        """reopen_stage does NOT remove any item entries."""
+        state = load_state(work_dir)
+        mark_stage_started(work_dir, state, "chunk")
+        mark_item_completed(work_dir, state, "chunk", "001")
+        mark_item_completed(work_dir, state, "chunk", "002")
+        mark_item_failed(work_dir, state, "chunk", "003", "error")
+        mark_stage_completed(work_dir, state, "chunk")
+
+        reopen_stage(work_dir, state, "chunk")
+
+        # All items still present.
+        assert state.items["chunk:001"].status == "completed"
+        assert state.items["chunk:002"].status == "completed"
+        assert state.items["chunk:003"].status == "failed"
+
+    def test_reopen_running_is_noop(self, work_dir: Path):
+        """reopen_stage on an already running stage is a no-op."""
+        state = load_state(work_dir)
+        mark_stage_started(work_dir, state, "classify")
+        ts = state.stages["classify"].started_at
+
+        reopen_stage(work_dir, state, "classify")
+
+        assert state.stages["classify"].status == "running"
+        assert state.stages["classify"].started_at == ts  # unchanged
+
+    def test_reopen_pending_is_noop(self, work_dir: Path):
+        """reopen_stage on a pending (never started) stage is a no-op."""
+        state = load_state(work_dir)
+        state.stages["classify"] = StageState(status="pending")
+        save_state(work_dir, state)
+
+        reopen_stage(work_dir, state, "classify")
+
+        assert state.stages["classify"].status == "pending"
+
+    def test_reopen_failed_stage(self, work_dir: Path):
+        """reopen_stage on a failed stage sets it to running."""
+        state = load_state(work_dir)
+        mark_stage_started(work_dir, state, "classify")
+        mark_stage_failed(work_dir, state, "classify", "something broke")
+
+        reopen_stage(work_dir, state, "classify")
+
+        assert state.stages["classify"].status == "running"
+
+    def test_reopen_persists_to_disk(self, work_dir: Path):
+        """reopen_stage changes are persisted to disk."""
+        state = load_state(work_dir)
+        mark_stage_started(work_dir, state, "classify")
+        mark_item_completed(work_dir, state, "classify", "001")
+        mark_item_failed(work_dir, state, "classify", "002", "error")
+        mark_stage_completed(work_dir, state, "classify")
+
+        reopen_stage(work_dir, state, "classify")
+
+        reloaded = load_state(work_dir)
+        assert reloaded.stages["classify"].status == "running"
+        assert reloaded.items["classify:001"].status == "completed"
+        assert reloaded.items["classify:002"].status == "failed"
+
+    def test_reopen_then_iter_pending_returns_only_failed(self, work_dir: Path):
+        """After reopen, iter_pending_items returns failed items but not completed."""
+        state = load_state(work_dir)
+        mark_stage_started(work_dir, state, "classify")
+        mark_item_completed(work_dir, state, "classify", "001")
+        mark_item_completed(work_dir, state, "classify", "002")
+        mark_item_failed(work_dir, state, "classify", "003", "error")
+        mark_stage_completed(work_dir, state, "classify")
+
+        reopen_stage(work_dir, state, "classify")
+
+        pending = iter_pending_items(state, "classify", ["001", "002", "003", "004"])
+        # 001, 002 = completed (skipped); 003 = failed (included); 004 = not present (included)
+        assert pending == ["003", "004"]

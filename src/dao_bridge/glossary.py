@@ -50,6 +50,7 @@ from dao_bridge.state import (
     mark_item_started,
     mark_stage_completed,
     mark_stage_started,
+    reopen_stage,
     reset_stage,
 )
 from dao_bridge.workdir import (
@@ -568,6 +569,7 @@ def glossary_build(
     state: PipelineState,
     *,
     force: bool = False,
+    retry_failed: bool = False,
     on_progress: Callable[[str], None] | None = None,
 ) -> Glossary:
     """Extract the per-book glossary from chunked source text.
@@ -587,6 +589,9 @@ def glossary_build(
         Pipeline state (mutated in place).
     force:
         If *True*, reset and rebuild from scratch.
+    retry_failed:
+        If *True*, re-enter a completed stage to retry only failed batches.
+        Preserves completed batch state (unlike ``force``).
     on_progress:
         Optional callback invoked with the batch ID after each batch
         is processed.
@@ -621,7 +626,11 @@ def glossary_build(
         if bmp.exists():
             bmp.unlink()
 
-    if not force and is_stage_completed(state, stage):
+    # Handle --retry-failed: re-open a completed stage without wiping items.
+    if retry_failed and not force:
+        reopen_stage(work_dir, state, stage)
+
+    if not force and not retry_failed and is_stage_completed(state, stage):
         logger.info("Glossary build already completed — skipping (use --force to re-run)")
         return _load_glossary(work_dir)
 
@@ -780,6 +789,7 @@ def glossary_reconcile(
     state: PipelineState,
     *,
     force: bool = False,
+    retry_failed: bool = False,
     on_progress: Callable[[str], None] | None = None,
 ) -> Glossary:
     """Resolve within-book glossary conflicts from the build stage.
@@ -801,6 +811,9 @@ def glossary_reconcile(
         Pipeline state (mutated in place).
     force:
         If *True*, reset and reconcile from scratch.
+    retry_failed:
+        If *True*, re-enter a completed stage to retry only failed items.
+        Preserves completed item state (unlike ``force``).
     on_progress:
         Optional callback invoked with the item ID after each item
         is processed.
@@ -822,7 +835,11 @@ def glossary_reconcile(
     if force:
         reset_stage(work_dir, state, stage)
 
-    if not force and is_stage_completed(state, stage):
+    # Handle --retry-failed: re-open a completed stage without wiping items.
+    if retry_failed and not force:
+        reopen_stage(work_dir, state, stage)
+
+    if not force and not retry_failed and is_stage_completed(state, stage):
         logger.info("Glossary reconcile already completed — skipping (use --force to re-run)")
         return _load_glossary(work_dir)
 

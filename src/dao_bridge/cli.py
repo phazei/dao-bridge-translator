@@ -348,8 +348,15 @@ def status(ctx: click.Context, work_dir: str, detail: bool) -> None:
     is_flag=True,
     help="Reclassify all items, overriding existing classifications.",
 )
+@click.option(
+    "--retry-failed",
+    is_flag=True,
+    help="Re-enter a completed stage to retry only failed items.",
+)
 @click.pass_context
-def classify(ctx: click.Context, work_dir: str, spine_index: int | None, force: bool) -> None:
+def classify(
+    ctx: click.Context, work_dir: str, spine_index: int | None, force: bool, retry_failed: bool
+) -> None:
     """Classify spine items by content type.
 
     Determines whether each spine item is a chapter, frontmatter,
@@ -360,6 +367,9 @@ def classify(ctx: click.Context, work_dir: str, spine_index: int | None, force: 
     unless --force is passed.  To manually override a classification,
     edit manifest.json directly and re-run subsequent pipeline stages.
     """
+    if force and retry_failed:
+        raise click.ClickException("--force and --retry-failed are mutually exclusive.")
+
     work = Path(work_dir).resolve()
     setup_logging(work, ctx.obj["verbose"])
     config = _resolve_config(work)
@@ -387,6 +397,7 @@ def classify(ctx: click.Context, work_dir: str, spine_index: int | None, force: 
             config,
             state,
             force=force,
+            retry_failed=retry_failed,
             spine_filter=spine_index,
             on_progress=lambda _: progress.advance(task),
         )
@@ -423,9 +434,19 @@ def classify(ctx: click.Context, work_dir: str, spine_index: int | None, force: 
 )
 @click.option("--spine", "spine_index", type=int, default=None, help="Chunk only this spine index.")
 @click.option("--force", is_flag=True, help="Rechunk even if already completed.")
+@click.option(
+    "--retry-failed",
+    is_flag=True,
+    help="Re-enter a completed stage to retry only failed items.",
+)
 @click.pass_context
-def chunk(ctx: click.Context, work_dir: str, spine_index: int | None, force: bool) -> None:
+def chunk(
+    ctx: click.Context, work_dir: str, spine_index: int | None, force: bool, retry_failed: bool
+) -> None:
     """Chunk cleaned markdown into translation-ready segments."""
+    if force and retry_failed:
+        raise click.ClickException("--force and --retry-failed are mutually exclusive.")
+
     work = Path(work_dir).resolve()
     setup_logging(work, ctx.obj["verbose"])
     config = _resolve_config(work)
@@ -454,6 +475,7 @@ def chunk(ctx: click.Context, work_dir: str, spine_index: int | None, force: boo
             manifest,
             state,
             force=force,
+            retry_failed=retry_failed,
             spine_filter=spine_index,
             on_progress=lambda _: progress.advance(task),
         )
@@ -475,9 +497,19 @@ def chunk(ctx: click.Context, work_dir: str, spine_index: int | None, force: boo
     "--spine", "spine_index", type=int, default=None, help="Assemble only this spine index."
 )
 @click.option("--force", is_flag=True, help="Reassemble even if already completed.")
+@click.option(
+    "--retry-failed",
+    is_flag=True,
+    help="Re-enter a completed stage to retry only failed items.",
+)
 @click.pass_context
-def assemble(ctx: click.Context, work_dir: str, spine_index: int | None, force: bool) -> None:
+def assemble(
+    ctx: click.Context, work_dir: str, spine_index: int | None, force: bool, retry_failed: bool
+) -> None:
     """Assemble translated chunks into per-spine markdown files."""
+    if force and retry_failed:
+        raise click.ClickException("--force and --retry-failed are mutually exclusive.")
+
     work = Path(work_dir).resolve()
     setup_logging(work, ctx.obj["verbose"])
     config = _resolve_config(work)
@@ -506,6 +538,7 @@ def assemble(ctx: click.Context, work_dir: str, spine_index: int | None, force: 
             manifest,
             state,
             force=force,
+            retry_failed=retry_failed,
             spine_filter=spine_index,
             on_progress=lambda _: progress.advance(task),
         )
@@ -523,8 +556,13 @@ def assemble(ctx: click.Context, work_dir: str, spine_index: int | None, force: 
     "--work-dir", type=click.Path(exists=True), default="./work", help="Work directory path."
 )
 @click.option("--force", is_flag=True, help="Rebuild glossary from scratch.")
+@click.option(
+    "--retry-failed",
+    is_flag=True,
+    help="Re-enter a completed stage to retry only failed batches.",
+)
 @click.pass_context
-def glossary_build_cmd(ctx: click.Context, work_dir: str, force: bool) -> None:
+def glossary_build_cmd(ctx: click.Context, work_dir: str, force: bool, retry_failed: bool) -> None:
     """Extract a per-book glossary from chunked source text.
 
     Greedy-packs chunks into batches and sends each batch to the LLM for
@@ -533,6 +571,9 @@ def glossary_build_cmd(ctx: click.Context, work_dir: str, force: bool) -> None:
 
     Requires: extract, clean, classify, chunk stages completed.
     """
+    if force and retry_failed:
+        raise click.ClickException("--force and --retry-failed are mutually exclusive.")
+
     work = Path(work_dir).resolve()
     setup_logging(work, ctx.obj["verbose"])
     config = _resolve_config(work)
@@ -550,6 +591,7 @@ def glossary_build_cmd(ctx: click.Context, work_dir: str, force: bool) -> None:
             config,
             state,
             force=force,
+            retry_failed=retry_failed,
             on_progress=lambda _: progress.advance(task),
         )
 
@@ -566,8 +608,15 @@ def glossary_build_cmd(ctx: click.Context, work_dir: str, force: bool) -> None:
     "--work-dir", type=click.Path(exists=True), default="./work", help="Work directory path."
 )
 @click.option("--force", is_flag=True, help="Re-reconcile from scratch.")
+@click.option(
+    "--retry-failed",
+    is_flag=True,
+    help="Re-enter a completed stage to retry only failed items.",
+)
 @click.pass_context
-def glossary_reconcile_cmd(ctx: click.Context, work_dir: str, force: bool) -> None:
+def glossary_reconcile_cmd(
+    ctx: click.Context, work_dir: str, force: bool, retry_failed: bool
+) -> None:
     """Resolve within-book glossary conflicts from the build stage.
 
     Resolves differing English proposals and corrections via LLM calls,
@@ -576,6 +625,9 @@ def glossary_reconcile_cmd(ctx: click.Context, work_dir: str, force: bool) -> No
 
     Requires: glossary-build stage completed.
     """
+    if force and retry_failed:
+        raise click.ClickException("--force and --retry-failed are mutually exclusive.")
+
     work = Path(work_dir).resolve()
     setup_logging(work, ctx.obj["verbose"])
     config = _resolve_config(work)
@@ -593,6 +645,7 @@ def glossary_reconcile_cmd(ctx: click.Context, work_dir: str, force: bool) -> No
             config,
             state,
             force=force,
+            retry_failed=retry_failed,
             on_progress=lambda _: progress.advance(task),
         )
 
@@ -671,6 +724,11 @@ def glossary_export_cmd(
     help="Stop translating after this chunk ID (inclusive).",
 )
 @click.option("--force", is_flag=True, help="Retranslate even if already completed.")
+@click.option(
+    "--retry-failed",
+    is_flag=True,
+    help="Re-enter a completed stage to retry only failed/failed_qa chunks.",
+)
 @click.pass_context
 def translate(
     ctx: click.Context,
@@ -680,6 +738,7 @@ def translate(
     from_chunk: str | None,
     to_chunk: str | None,
     force: bool,
+    retry_failed: bool,
 ) -> None:
     """Translate chunked source text to English using LLM.
 
@@ -690,6 +749,8 @@ def translate(
     (swap model, edit glossary, adjust config) and re-run to continue.
     Failed and failed_qa chunks are retried automatically on re-run.
     """
+    if force and retry_failed:
+        raise click.ClickException("--force and --retry-failed are mutually exclusive.")
     work = Path(work_dir).resolve()
     setup_logging(work, ctx.obj["verbose"])
     config = _resolve_config(work)
@@ -771,6 +832,7 @@ def translate(
                 state=state,
                 manifest=manifest,
                 force=force,
+                retry_failed=retry_failed,
                 from_chunk=from_chunk,
                 to_chunk=to_chunk,
                 on_progress=_on_progress_live,
@@ -842,16 +904,25 @@ def rebuild(ctx: click.Context, work_dir: str, force: bool) -> None:
     "--work-dir", type=click.Path(exists=True), default="./work", help="Work directory path."
 )
 @click.option("--force", is_flag=True, help="Force re-run of all stages.")
+@click.option(
+    "--retry-failed",
+    is_flag=True,
+    help="Re-enter completed stages to retry only failed items.",
+)
 @click.pass_context
-def run(ctx: click.Context, work_dir: str, force: bool) -> None:
+def run(ctx: click.Context, work_dir: str, force: bool, retry_failed: bool) -> None:
     """Run the full translation pipeline.
 
     Chains: extract -> clean -> classify -> chunk -> glossary-build ->
     glossary-reconcile -> translate -> assemble -> rebuild.
 
     Each stage skips completed work unless --force is passed.
+    Use --retry-failed to re-enter completed stages and retry only
+    failed items without reprocessing everything.
     Stops immediately on first stage failure.
     """
+    if force and retry_failed:
+        raise click.ClickException("--force and --retry-failed are mutually exclusive.")
     work = Path(work_dir).resolve()
     setup_logging(work, ctx.obj["verbose"])
     config = _resolve_config(work)
@@ -906,7 +977,7 @@ def run(ctx: click.Context, work_dir: str, force: bool) -> None:
         nonlocal manifest
         from dao_bridge.classify import run_classify_stage
 
-        manifest = run_classify_stage(work, config, state, force=force)
+        manifest = run_classify_stage(work, config, state, force=force, retry_failed=retry_failed)
         from collections import Counter
 
         counts = Counter(item.classification for item in manifest.spine)
@@ -919,7 +990,7 @@ def run(ctx: click.Context, work_dir: str, force: bool) -> None:
         nonlocal manifest
         from dao_bridge.chunk import chunk_all
 
-        manifest = chunk_all(config, manifest, state, force=force)
+        manifest = chunk_all(config, manifest, state, force=force, retry_failed=retry_failed)
         total_chunks = sum(i.chunk_count or 0 for i in manifest.spine)
         click.echo(f"  {total_chunks} total chunks")
 
@@ -929,7 +1000,7 @@ def run(ctx: click.Context, work_dir: str, force: bool) -> None:
     def _glossary_build():
         from dao_bridge.glossary import glossary_build
 
-        glossary = glossary_build(work, config, state, force=force)
+        glossary = glossary_build(work, config, state, force=force, retry_failed=retry_failed)
         click.echo(f"  {len(glossary.entries)} entries extracted")
 
     _run_stage("glossary-build", _glossary_build)
@@ -938,7 +1009,7 @@ def run(ctx: click.Context, work_dir: str, force: bool) -> None:
     def _glossary_reconcile():
         from dao_bridge.glossary import glossary_reconcile
 
-        glossary = glossary_reconcile(work, config, state, force=force)
+        glossary = glossary_reconcile(work, config, state, force=force, retry_failed=retry_failed)
         click.echo(f"  {len(glossary.entries)} entries (reconciled)")
 
     _run_stage("glossary-reconcile", _glossary_reconcile)
@@ -962,6 +1033,7 @@ def run(ctx: click.Context, work_dir: str, force: bool) -> None:
             state=state,
             manifest=manifest,
             force=force,
+            retry_failed=retry_failed,
         )
         if result["error"] is not None:
             raise RuntimeError(
@@ -980,7 +1052,7 @@ def run(ctx: click.Context, work_dir: str, force: bool) -> None:
 
         from dao_bridge.assemble import assemble_all
 
-        manifest = assemble_all(config, manifest, state, force=force)
+        manifest = assemble_all(config, manifest, state, force=force, retry_failed=retry_failed)
         assembled_count = sum(
             1 for item in manifest.spine if item.chunk_count and item.chunk_count > 0
         )

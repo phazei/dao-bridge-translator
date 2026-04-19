@@ -50,6 +50,7 @@ from dao_bridge.state import (
     mark_item_started,
     mark_stage_completed,
     mark_stage_started,
+    reopen_stage,
     reset_stage,
 )
 from dao_bridge.workdir import (
@@ -837,6 +838,7 @@ def run_translate_stage(
     state: PipelineState,
     manifest: Manifest,
     force: bool = False,
+    retry_failed: bool = False,
     from_chunk: str | None = None,
     to_chunk: str | None = None,
     on_progress: Callable[[TranslationProgress], None] | None = None,
@@ -855,6 +857,9 @@ def run_translate_stage(
         Book manifest.
     force:
         If ``True``, retranslate even completed chunks.
+    retry_failed:
+        If ``True``, re-enter a completed stage to retry only failed
+        chunks.  Preserves completed chunk state (unlike ``force``).
     from_chunk:
         Start translating from this chunk ID (inclusive).
     to_chunk:
@@ -894,6 +899,10 @@ def run_translate_stage(
 
     if force:
         reset_stage(work_dir, state, _STAGE)
+
+    # Handle --retry-failed: re-open a completed stage without wiping items.
+    if retry_failed and not force:
+        reopen_stage(work_dir, state, _STAGE)
 
     # Determine which chunks need work.
     pending_ids = iter_pending_items(state, _STAGE, target_ids)

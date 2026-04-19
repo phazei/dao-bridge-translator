@@ -99,6 +99,31 @@ a single spine item, and `--force` to reprocess even if already complete.
 The `translate` command supports `--spine N`, `--chunk ID`, `--from/--to` for
 range-based translation, and `--force` to retranslate completed chunks.
 
+### Retrying Failed Items
+
+If some items fail during a stage (e.g., LLM errors during classification or
+translation), a plain re-run will automatically retry them -- as long as the
+stage has not been marked `completed`.
+
+If the stage *did* complete with some items failed, use `--retry-failed` to
+re-enter the stage and retry only the failed items without reprocessing
+everything:
+
+```bash
+# Retry only failed items in a completed classify stage
+dao-bridge classify --work-dir ./work --retry-failed
+
+# Retry only failed chunks in translate
+dao-bridge translate --work-dir ./work --retry-failed
+
+# Retry failed items across all stages
+dao-bridge run --work-dir ./work --retry-failed
+```
+
+`--retry-failed` is mutually exclusive with `--force`. It is supported on
+`classify`, `chunk`, `glossary-build`, `glossary-reconcile`, `translate`,
+`assemble`, and `run`.
+
 ### Glossary Flow
 
 The glossary stages extract and refine a per-book glossary of proper nouns,

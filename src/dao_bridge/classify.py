@@ -37,6 +37,7 @@ from dao_bridge.state import (
     mark_item_started,
     mark_stage_completed,
     mark_stage_started,
+    reopen_stage,
     reset_stage,
 )
 from dao_bridge.workdir import atomic_write, manifest_path, pad_spine
@@ -355,6 +356,7 @@ def run_classify_stage(
     state: PipelineState,
     *,
     force: bool = False,
+    retry_failed: bool = False,
     spine_filter: int | None = None,
     on_progress: Callable[[str], None] | None = None,
 ) -> Manifest:
@@ -374,6 +376,9 @@ def run_classify_stage(
     force:
         If *True*, reclassify all targeted items regardless of existing
         classification or state.
+    retry_failed:
+        If *True*, re-enter a completed stage to retry only failed items.
+        Preserves completed item state (unlike ``force``).
     spine_filter:
         If set, classify only this spine index.
     on_progress:
@@ -405,8 +410,17 @@ def run_classify_stage(
             item.classification = None
             item.title = None
 
+    # Handle --retry-failed: re-open a completed stage without wiping items.
+    if retry_failed and not force:
+        reopen_stage(work_dir, state, "classify")
+
     # Skip if already completed.
-    if not force and is_stage_completed(state, "classify") and spine_filter is None:
+    if (
+        not force
+        and not retry_failed
+        and is_stage_completed(state, "classify")
+        and spine_filter is None
+    ):
         logger.info("Classify stage already completed — skipping (use --force to re-run)")
         return manifest
 

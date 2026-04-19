@@ -816,13 +816,10 @@ def run(ctx: click.Context, work_dir: str, force: bool) -> None:
     config = _resolve_config(work)
     state = load_state(work)
 
-    mp = manifest_path(work)
-    if not mp.exists():
-        raise click.ClickException("Manifest not found. Run 'dao-bridge init <epub>' first.")
-
     from dao_bridge.schemas import Manifest
 
-    manifest = Manifest(**json.loads(mp.read_text(encoding="utf-8")))
+    manifest: Manifest | None = None
+    mp = manifest_path(work)
 
     def _run_stage(name: str, fn):
         """Execute a stage, halting the pipeline on failure."""
@@ -843,6 +840,14 @@ def run(ctx: click.Context, work_dir: str, force: bool) -> None:
         click.echo(f"  {len(manifest.spine)} spine items, {len(manifest.images)} images")
 
     _run_stage("extract", _extract)
+
+    # Manifest must exist after extract.
+    if manifest is None:
+        if not mp.exists():
+            raise click.ClickException(
+                "Manifest not found after extract. Run 'dao-bridge init <epub>' first."
+            )
+        manifest = Manifest(**json.loads(mp.read_text(encoding="utf-8")))
 
     # --- Stage 2: clean ---
     def _clean():

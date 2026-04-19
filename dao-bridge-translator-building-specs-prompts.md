@@ -168,7 +168,7 @@
 >   new_identifier: false          # true to generate new UUID for output EPUB
 >   css: "original"                # "original" (keep source CSS) or "default" (add minimal CSS)
 >   add_translation_note: true     # add machine translation note to metadata description
->   validate: false                # run epubcheck on output if available on PATH
+>   run_epubcheck: false            # run epubcheck on output if available on PATH
 > 
 > languages:
 >   source: "ja"
@@ -185,7 +185,7 @@
 > These are the complete schemas for the entire pipeline. Later prompts will use them as-is. Fields not populated by early stages are nullable and default to None.
 > 
 > - `ManifestItem`: `spine_index` (int), `original_href` (str), `raw_path` (str), `clean_path` (str | None), `classification` (literal: `"chapter" | "frontmatter" | "backmatter" | "toc_auto" | "toc_authored" | "illustration" | "unknown"` | None, default None), `title` (str | None), `token_count` (int | None), `paragraph_count` (int | None), `chunk_count` (int | None — set by chunker later).
-> - `Manifest`: `source_epub_path` (str), `book_id` (str — derived from EPUB metadata at init: prefer ISBN, fall back to normalized title+volume, fall back to filename stem), `spine_padding_width` (int, default 4 — computed at extract time as `max(4, len(str(spine_count)))`; all spine-related path helpers and ID formatters consult this width), `spine` (list[ManifestItem]), `images` (list[str] — image item paths), `metadata` (dict — original EPUB metadata: title, author, language, identifier, etc.).
+> - `Manifest`: `source_epub_path` (str), `book_id` (str — derived from EPUB metadata at init: prefer ISBN, fall back to normalized title+volume, fall back to filename stem), `spine_padding_width` (int, default 4 — computed at extract time as `max(4, len(str(spine_count)))`; all spine-related path helpers and ID formatters consult this width), `opf_dir` (str, default "" — directory path of the OPF file within the ZIP, used to resolve OPF-relative hrefs to ZIP-absolute paths for rebuild), `spine` (list[ManifestItem]), `images` (list[str] — image item paths), `metadata` (dict — original EPUB metadata: title, author, language, identifier, etc.).
 > - `Chunk`: `chunk_id` (str, format "NNNN.MMM" — spine portion uses dynamic padding width, chunk portion always 3 digits), `spine_index` (int), `chunk_index` (int — per-spine, starting at 1), `source_file` (str — path to clean markdown file), `block_range` (tuple[int, int] — inclusive start, inclusive end of block indices in source file), `token_count` (int), `extended_for_remainder` (bool), `text` (str), `ends_at_scene_break` (bool).
 >   - Note: no `mode` field, no `overlap_range`, no `new_text_starts_at_block`. Chunks are phase-agnostic. Each phase assembles calls from them.
 > - `GlossaryEntry`: `source_term` (str | None — the term in the source language; None for target-language-reference-only entries from import-reference), `reading` (str | None — from furigana), `english` (str), `category` (str — validated against `config.glossary.categories` at load time), `first_seen_chunk` (str | None), `aliases` (list[str] = []), `nicknames` (dict[str, str] = {} — `{speaker_english_name: nickname_english}`, only used by specific speakers), `speech_style` (str | None = None — prose description, characters only), `notes` (str | None = None), `source` (literal: `"seed" | "extracted" | "user" | "master"`), `source_books` (list[str] = [] — populated for master-glossary entries).
@@ -280,6 +280,31 @@
 > All commands accept `--verbose` to enable DEBUG-level console logging.
 > 
 > Every command checks state before starting and skips completed work unless `--force`. `run` (placeholder for now) will eventually chain all stages.
+> 
+> **`init` command:**
+> 
+> `dao-bridge init <epub> [--config config.yaml] [--work-dir ./work]`
+> 
+> Sets up a work directory for a new book. Must be run before any other command.
+> 
+> 1. Create the work directory and all subdirectories via `ensure_dirs()`.
+> 2. If `--config` is provided, copy the user-supplied config file to `{work_dir}/config.yaml`. Otherwise, generate a default `config.yaml` with `source_epub` and `work_dir` populated from the command arguments and all other fields at defaults.
+> 3. Validate the config is loadable (catches YAML syntax errors or invalid values early).
+> 4. Initialize `state.json` with `run.source_epub` set to the absolute EPUB path, `run.status` set to `"initialised"`, and empty `stages`/`items`.
+> 5. Does NOT create a manifest — that happens during the `extract` stage.
+> 
+> Idempotent: re-running `init` on an existing work directory preserves the existing config (unless `--config` provides a new one) and does not reset state.
+> 
+> **`status` command:**
+> 
+> `dao-bridge status [--work-dir ./work]`
+> 
+> Reads `state.json` and prints a summary of pipeline progress:
+> 1. Work directory path, source EPUB path, and run status.
+> 2. Each stage name with its current status (`not started`, `running`, `completed`, `failed`, with error message if applicable).
+> 3. Aggregate item status counts (e.g., `completed=15, failed=1`) if any items have been tracked.
+> 
+> Read-only — does not modify state or any files.
 > 
 > **`extract.py`:**
 > 1. Open EPUB with ebooklib.
@@ -1307,7 +1332,7 @@
 > 1. Read the original XHTML from the source EPUB ZIP (using the resolved ZIP path from `original_href`).
 > 2. Read the translated markdown from `assembled/NNNN.md`.
 > 3. Convert the markdown to HTML using a ruby-safe pipeline:
->    a. **Before markdown conversion:** Replace all `{kanji|reading}` notation with unique placeholders (e.g., `RUBY_0001`, `RUBY_0002`). This prevents the `markdown` library's `attr_list` extension (included in `extra`) from mangling the `{...}` syntax.
+>    a. **Before markdown conversion:** Replace all `{kanji|reading}` notation with unique placeholders (e.g., `RUBYDBT0001`, `RUBYDBT0002`). This prevents the `markdown` library's `attr_list` extension (included in `extra`) from mangling the `{...}` syntax.
 >    b. **Markdown conversion:** Use the `markdown` library with the `extra` extension.
 >    c. **Post-process scene breaks:** Convert normalized scene break markers to `<hr/>` tags.
 >    d. **Post-process line breaks:** Ensure `<br>` tags are self-closing (`<br/>`).
@@ -1403,7 +1428,7 @@
 > 
 > ## Optional epubcheck validation
 > 
-> If `config.output.validate` is true: after writing the output EPUB, check if `epubcheck` is available on PATH. If found, run it via subprocess on the output file. Log the result (pass/fail and any warnings). If not found, log a warning ("epubcheck not found on PATH, skipping validation") and continue. This is a non-blocking safety net — validation failure does not prevent the EPUB from being written.
+> If `config.output.run_epubcheck` is true: after writing the output EPUB, check if `epubcheck` is available on PATH. If found, run it via subprocess on the output file. Log the result (pass/fail and any warnings). If not found, log a warning ("epubcheck not found on PATH, skipping validation") and continue. This is a non-blocking safety net — validation failure does not prevent the EPUB from being written.
 > 
 > ---
 > 
@@ -1424,7 +1449,7 @@
 >   - Converts markdown to HTML with the ruby-safe pipeline (placeholder → convert → restore).
 > 
 > - `restore_ruby_tags(html: str, placeholder_map: dict) -> str`
->   - Replaces `RUBY_NNNN` placeholders with `<ruby>` tags.
+>   - Replaces `RUBYDBT` placeholders with `<ruby>` tags.
 > 
 > - `write_epub_modified_copy(source_epub: str, output_epub: str, modified_files: dict[str, bytes]) -> None`
 >   - ZIP-level copy with file replacement. Preserves mimetype as first entry, uncompressed. Preserves per-entry ZipInfo.
@@ -1474,12 +1499,12 @@
 > The `run` command should now chain all implemented stages:
 > 
 > ```
-> dao-bridge run <epub> [--config config.yaml] [--work-dir ./work] [--verbose]
+> dao-bridge run [--work-dir ./work] [--force] [--verbose]
 > ```
 > 
-> Equivalent to executing in order:
+> Requires `dao-bridge init <epub>` to have been run first. Equivalent to executing in order:
 > ```
-> init → extract → clean → classify → chunk → glossary-build → 
+> extract → clean → classify → chunk → glossary-build → 
 > glossary-reconcile → glossary-crosscheck (if master configured) → 
 > translate → assemble → rebuild
 > ```
@@ -1547,9 +1572,9 @@
 > - `css: "default"`: `default.css` added to EPUB, `<link>` added to each modified XHTML `<head>`.
 > 
 > **Validation:**
-> - `validate: true` with epubcheck available: runs and logs result.
-> - `validate: true` without epubcheck on PATH: logs warning, continues.
-> - `validate: false`: no validation attempted.
+> - `run_epubcheck: true` with epubcheck available: runs and logs result.
+> - `run_epubcheck: true` without epubcheck on PATH: logs warning, continues.
+> - `run_epubcheck: false`: no validation attempted.
 > 
 > **Integration:**
 > - Full pipeline with mini EPUB fixture and mocked LLM: init through rebuild produces a valid output EPUB.

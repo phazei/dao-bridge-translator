@@ -46,9 +46,9 @@ logger = logging.getLogger("dao_bridge")
 # ---------------------------------------------------------------------------
 
 
-def _load_translation(work_dir: Path, chunk_id: str) -> TranslatedChunk:
+def _load_translation(work_dir: Path, chunk_id: str, spine_width: int = 4) -> TranslatedChunk:
     """Load a translated chunk from disk."""
-    tp = translation_path(work_dir, chunk_id)
+    tp = translation_path(work_dir, chunk_id, spine_width)
     if not tp.exists():
         raise FileNotFoundError(f"Translation file missing: {tp}")
     raw = json.loads(tp.read_text(encoding="utf-8"))
@@ -135,7 +135,7 @@ def assemble_spine_item(
     # Load translations in chunk order.
     translations: list[TranslatedChunk] = []
     for c in chunks:
-        tc = _load_translation(work_dir, c.chunk_id)
+        tc = _load_translation(work_dir, c.chunk_id, spine_width)
         translations.append(tc)
 
     # Concatenate translated text.

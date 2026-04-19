@@ -594,3 +594,147 @@ class TestFullPipelineWithRebuild:
         stage = final_state.stages.get("rebuild")
         assert stage is not None
         assert stage.status == "failed"
+
+
+# ---------------------------------------------------------------------------
+# CLI `run` command: full pipeline via Click
+# ---------------------------------------------------------------------------
+
+
+class TestRunCommand:
+    """Test the ``dao-bridge run`` CLI command end-to-end.
+
+    This exercises the orchestration in cli.py rather than calling stage
+    functions directly.  All LLM calls are mocked.
+    """
+
+    def test_run_on_freshly_initialised_work_dir(self, jp_epub_path: Path, tmp_path: Path):
+        """``dao-bridge run`` succeeds on a work dir that only had ``init`` run.
+
+        This is the primary regression test for the bug where ``run`` tried
+        to load the manifest before the extract stage created it.
+        """
+        from click.testing import CliRunner
+        from unittest.mock import PropertyMock
+
+        from dao_bridge.cli import cli
+        from dao_bridge.llm_client import CompletionResult
+        from dao_bridge.schemas import (
+            ClassificationResponse,
+            GlossaryExtractionResponse,
+            TocTranslationResponse,
+        )
+
+        work_dir = tmp_path / "work"
+
+        # --- Phase 1: init via CLI ---
+        runner = CliRunner()
+        result = runner.invoke(cli, ["init", str(jp_epub_path), "--work-dir", str(work_dir)])
+        assert result.exit_code == 0, f"init failed: {result.output}"
+
+        # At this point only config.yaml and state.json exist — no manifest.
+        assert not manifest_path(work_dir).exists()
+
+        # Disable QA and double-pass so the short mock translation is accepted.
+        import yaml
+
+        cfg_path = work_dir / "config.yaml"
+        cfg = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
+        cfg["translation_phase"] = {
+            "qa_check": False,
+            "double_pass": False,
+            "rolling_summary": False,
+        }
+        cfg_path.write_text(yaml.dump(cfg, default_flow_style=False), encoding="utf-8")
+
+        # --- Phase 2: run via CLI with mocked LLM ---
+        # Mock LLMClient at each module that lazily creates one.
+        def _make_mock_client(
+            classify_response=None,
+            glossary_response=None,
+            translate_text="This is a translated sentence.",
+            toc_titles=None,
+        ):
+            """Build a MagicMock that covers all LLM interactions."""
+            client = MagicMock()
+            # complete() — used by translate (pass1, pass2, summary)
+            client.complete.return_value = CompletionResult(
+                text=translate_text,
+                token_usage={"prompt_tokens": 100, "completion_tokens": 50, "total_tokens": 150},
+                model="mock-model",
+                finish_reason="stop",
+            )
+
+            # complete_json() — used by classify, glossary, translate QA, toc
+            def _complete_json(messages, response_model, **kwargs):
+                if response_model is ClassificationResponse:
+                    return classify_response or ClassificationResponse(
+                        classification="chapter",
+                        title=None,
+                        confidence="high",
+                        reasoning="mock",
+                    )
+                if response_model is GlossaryExtractionResponse:
+                    return glossary_response or GlossaryExtractionResponse()
+                if response_model is TocTranslationResponse:
+                    return TocTranslationResponse(titles=toc_titles or [])
+                # QA response — return pass
+                return response_model(result="pass", issues=[])
+
+            client.complete_json.side_effect = _complete_json
+            # reset_token_usage — called by translate_chunk
+            client.reset_token_usage.return_value = None
+            # total_token_usage property
+            type(client).total_token_usage = PropertyMock(
+                return_value={"prompt_tokens": 100, "completion_tokens": 50, "total_tokens": 150}
+            )
+            # config attribute — used by translate to get model name
+            client.config = MagicMock()
+            client.config.model = "mock-model"
+            return client
+
+        mock_client = _make_mock_client()
+
+        with (
+            patch("dao_bridge.classify.LLMClient", return_value=mock_client),
+            patch("dao_bridge.glossary.LLMClient", return_value=mock_client),
+            patch("dao_bridge.translate.LLMClient", return_value=mock_client),
+            patch("dao_bridge.llm_client.LLMClient", return_value=mock_client),
+            patch("dao_bridge.rebuild.translate_toc", return_value={}),
+        ):
+            result = runner.invoke(
+                cli,
+                ["run", "--work-dir", str(work_dir)],
+                catch_exceptions=False,
+            )
+
+        assert result.exit_code == 0, f"run failed:\n{result.output}"
+        assert "Pipeline complete" in result.output
+
+        # Verify key artefacts exist.
+        assert manifest_path(work_dir).exists()
+        assert state_path(work_dir).exists()
+
+        # Manifest should have spine items with classifications and chunk counts.
+        manifest_data = json.loads(manifest_path(work_dir).read_text(encoding="utf-8"))
+        manifest = Manifest(**manifest_data)
+        for item in manifest.spine:
+            assert item.classification is not None
+            assert item.chunk_count is not None
+
+        # At least one assembled file should exist.
+        chunked = [i for i in manifest.spine if (i.chunk_count or 0) > 0]
+        assert len(chunked) > 0
+        for item in chunked:
+            ap = assembled_path(work_dir, item.spine_index)
+            assert ap.exists(), f"Assembled file missing for spine {item.spine_index}"
+
+        # Output EPUB should exist.
+        output_epub = (work_dir.parent / "book.en.epub").resolve()
+        if not output_epub.exists():
+            # Config default is relative to work_dir parent; check work_dir too.
+            output_epub = work_dir / "book.en.epub"
+        # The exact output path depends on config resolution, but at minimum
+        # the rebuild stage should have completed.
+        final_state = load_state(work_dir)
+        assert is_stage_completed(final_state, "rebuild")

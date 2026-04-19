@@ -1,7 +1,7 @@
 """Logging setup with Rich console handler and file handler.
 
 Call :func:`setup_logging` once at CLI entry to configure the ``"dao_bridge"``
-logger with a Rich console handler and a rotating file handler.
+logger with a Rich console handler and a file handler.
 """
 
 from __future__ import annotations

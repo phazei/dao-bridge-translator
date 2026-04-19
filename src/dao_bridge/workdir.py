@@ -8,7 +8,10 @@ from __future__ import annotations
 
 import os
 import posixpath
+import zipfile
 from pathlib import Path
+
+from lxml import etree
 
 # ---------------------------------------------------------------------------
 # Padding / formatting helpers
@@ -50,6 +53,34 @@ def parse_chunk_id(chunk_id: str) -> tuple[int, int]:
 # ---------------------------------------------------------------------------
 # ZIP / OPF path helpers
 # ---------------------------------------------------------------------------
+
+
+def read_zip_entry(epub_path: str, zip_path: str) -> bytes:
+    """Read a single entry from an EPUB ZIP.
+
+    Parameters
+    ----------
+    epub_path:
+        Filesystem path to the ``.epub`` file.
+    zip_path:
+        ZIP-internal path of the entry to read.
+    """
+    with zipfile.ZipFile(epub_path, "r") as zf:
+        return zf.read(zip_path)
+
+
+def find_opf_zip_path(epub_path: str) -> str:
+    """Return the ZIP-internal path of the OPF file.
+
+    Parses ``META-INF/container.xml`` to locate the rootfile.
+    """
+    container_xml = read_zip_entry(epub_path, "META-INF/container.xml")
+    tree = etree.fromstring(container_xml)
+    ns = "urn:oasis:names:tc:opendocument:xmlns:container"
+    rootfile = tree.find(f".//{{{ns}}}rootfile[@media-type='application/oebps-package+xml']")
+    if rootfile is None:
+        raise RuntimeError("Could not find rootfile in container.xml")
+    return rootfile.get("full-path", "content.opf")
 
 
 def resolve_zip_path(opf_dir: str, href: str) -> str:

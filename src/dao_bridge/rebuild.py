@@ -28,6 +28,7 @@ from bs4 import BeautifulSoup
 from lxml import etree
 
 from dao_bridge.config import AppConfig
+from dao_bridge.glossary import load_glossary
 from dao_bridge.schemas import Glossary, Manifest
 from dao_bridge.state import (
     PipelineState,
@@ -39,24 +40,25 @@ from dao_bridge.state import (
     reset_stage,
 )
 from dao_bridge.toc import (
-    _find_opf_zip_path,
-    _read_zip_entry,
     translate_toc,
     update_opf_metadata,
 )
 from dao_bridge.workdir import (
     assembled_path,
+    find_opf_zip_path,
     glossary_path,
     manifest_path,
+    read_zip_entry,
     resolve_zip_path,
 )
 
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Templates directory
+# Constants
 # ---------------------------------------------------------------------------
 
+_NS_OPF = "http://www.idpf.org/2007/opf"
 _TEMPLATES_DIR = Path(__file__).parent / "templates"
 
 # ---------------------------------------------------------------------------
@@ -460,6 +462,7 @@ def run_rebuild_stage(
     work_dir: Path,
     config: AppConfig,
     force: bool = False,
+    state: PipelineState | None = None,
 ) -> None:
     """Run the rebuild stage: produce the output EPUB.
 
@@ -475,8 +478,11 @@ def run_rebuild_stage(
         Application config.
     force:
         If ``True``, re-run even if the stage was already completed.
+    state:
+        Pipeline state.  Loaded from disk if ``None``.
     """
-    state = load_state(work_dir)
+    if state is None:
+        state = load_state(work_dir)
 
     if is_stage_completed(state, "rebuild") and not force:
         logger.info("Rebuild stage already completed, skipping (use --force to re-run)")
@@ -531,20 +537,21 @@ def _do_rebuild(work_dir: Path, config: AppConfig, state: PipelineState) -> None
 
     llm_client = LLMClient(config.models.translate, config.llm)
     gp = glossary_path(work_dir)
-    glossary = Glossary(
-        created_at="2000-01-01T00:00:00Z",
-        updated_at="2000-01-01T00:00:00Z",
-    )
     if gp.exists():
-        glossary = Glossary(**json.loads(gp.read_text(encoding="utf-8")))
+        glossary = load_glossary(work_dir, config)
+    else:
+        glossary = Glossary(
+            created_at="2000-01-01T00:00:00Z",
+            updated_at="2000-01-01T00:00:00Z",
+        )
 
     toc_modified = translate_toc(source_epub, manifest, glossary, llm_client, config)
     modified.update(toc_modified)
     logger.info("ToC translation: %d files modified", len(toc_modified))
 
     # --- Update OPF metadata ---
-    opf_zip_path = _find_opf_zip_path(source_epub)
-    opf_content = _read_zip_entry(source_epub, opf_zip_path).decode("utf-8")
+    opf_zip_path = find_opf_zip_path(source_epub)
+    opf_content = read_zip_entry(source_epub, opf_zip_path).decode("utf-8")
     new_opf = update_opf_metadata(opf_content, config)
 
     # If default CSS, add it to the OPF manifest and the modified files.
@@ -566,7 +573,7 @@ def _do_rebuild(work_dir: Path, config: AppConfig, state: PipelineState) -> None
     logger.info("Output EPUB written: %s", output_path)
 
     # --- Optional validation ---
-    if config.output.validate_epub:
+    if config.output.run_epubcheck:
         passed = validate_with_epubcheck(str(output_path))
         if not passed:
             logger.warning("EPUB validation failed (output still written)")
@@ -613,7 +620,3 @@ def _add_css_to_opf(opf_content: str, opf_dir: str, css_zip_path: str) -> str:
         encoding="UTF-8",
         pretty_print=True,
     ).decode("utf-8")
-
-
-# Re-use namespace constant from toc module.
-_NS_OPF = "http://www.idpf.org/2007/opf"

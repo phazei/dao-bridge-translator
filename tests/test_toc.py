@@ -260,7 +260,7 @@ def _make_config(**overrides):
             "new_identifier": False,
             "css": "original",
             "add_translation_note": True,
-            "validate": False,
+            "run_epubcheck": False,
         },
     }
     defaults.update(overrides)

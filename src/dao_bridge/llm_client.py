@@ -185,9 +185,10 @@ class LLMClient:
         JSON response, and validates it.  On parse / validation failure the
         error is appended to the conversation and the call is retried.
 
-        The retry counter resets on any successful JSON parse (even if
-        validation later fails in the same attempt — what matters is that
-        consecutive *parse* failures are bounded).
+        Both parse failures and validation failures increment the
+        consecutive failure counter.  A hard ceiling on total attempts
+        (``max_retries * 2``) prevents infinite loops when the model
+        consistently returns parseable-but-invalid JSON.
 
         Parameters
         ----------
@@ -223,8 +224,11 @@ class LLMClient:
                 break
 
         consecutive_failures = 0
+        total_attempts = 0
+        max_total_attempts = max_retries * 2
 
-        while consecutive_failures < max_retries:
+        while consecutive_failures < max_retries and total_attempts < max_total_attempts:
+            total_attempts += 1
             result = self.complete(conversation, max_tokens=max_tokens)
             raw_text = result.text.strip()
 
@@ -259,9 +263,6 @@ class LLMClient:
                 )
                 continue
 
-            # JSON parsed — reset consecutive failure counter.
-            consecutive_failures = 0
-
             try:
                 return response_model(**parsed)
             except (ValidationError, TypeError) as exc:
@@ -287,6 +288,7 @@ class LLMClient:
                 continue
 
         raise LLMStructuredOutputError(
-            f"Failed to get valid structured output after {max_retries} consecutive failures. "
+            f"Failed to get valid structured output after {total_attempts} attempts "
+            f"({consecutive_failures} consecutive failures, limit {max_retries}). "
             f"Model: {self.config.model}"
         )

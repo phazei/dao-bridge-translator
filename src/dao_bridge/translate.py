@@ -32,6 +32,7 @@ from pydantic import BaseModel
 
 from dao_bridge.chunk import count_tokens
 from dao_bridge.config import AppConfig, resolve_language_name
+from dao_bridge.glossary import load_glossary
 from dao_bridge.llm_client import CompletionResult, LLMClient, LLMStructuredOutputError
 from dao_bridge.schemas import (
     Chunk,
@@ -866,14 +867,14 @@ def run_translate_stage(
     tp = config.translation_phase
     sw = manifest.spine_padding_width
 
-    # Load glossary.
+    # Load glossary (validates categories against config).
     gp = glossary_path(work_dir)
     if not gp.exists():
         raise RuntimeError(
             f"Glossary not found at {gp}. "
             "Run 'dao-bridge glossary-build' and 'glossary-reconcile' first."
         )
-    glossary = Glossary(**json.loads(gp.read_text(encoding="utf-8")))
+    glossary = load_glossary(work_dir, config)
 
     # Create LLM clients.
     llm_config = config.llm

@@ -106,7 +106,7 @@ def _default_config_yaml(epub_path: str, work_dir: str) -> str:
             "new_identifier": False,
             "css": "original",
             "add_translation_note": True,
-            "validate": False,
+            "run_epubcheck": False,
         },
         "languages": {"source": "ja", "target": "en"},
         "llm": {
@@ -946,7 +946,7 @@ def run(ctx: click.Context, work_dir: str, force: bool) -> None:
     def _rebuild():
         from dao_bridge.rebuild import run_rebuild_stage
 
-        run_rebuild_stage(work, config, force=force)
+        run_rebuild_stage(work, config, force=force, state=state)
         click.echo(f"  Output EPUB: {config.output.epub_path}")
 
     _run_stage("rebuild", _rebuild)

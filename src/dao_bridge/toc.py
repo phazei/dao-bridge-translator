@@ -12,7 +12,6 @@ import functools
 import json
 import logging
 import uuid
-import zipfile
 from pathlib import Path
 
 from lxml import etree
@@ -20,7 +19,7 @@ from lxml import etree
 from dao_bridge.config import AppConfig
 from dao_bridge.llm_client import LLMClient
 from dao_bridge.schemas import Glossary, Manifest, TocTranslationResponse
-from dao_bridge.workdir import resolve_zip_path
+from dao_bridge.workdir import find_opf_zip_path, read_zip_entry, resolve_zip_path
 
 logger = logging.getLogger(__name__)
 
@@ -69,23 +68,6 @@ def _element_text(el: etree._Element) -> str:
     return "".join(el.itertext()).strip()
 
 
-def _read_zip_entry(epub_path: str, zip_path: str) -> bytes:
-    """Read a single entry from an EPUB ZIP."""
-    with zipfile.ZipFile(epub_path, "r") as zf:
-        return zf.read(zip_path)
-
-
-def _find_opf_zip_path(epub_path: str) -> str:
-    """Return the ZIP-internal path of the OPF file."""
-    container_xml = _read_zip_entry(epub_path, "META-INF/container.xml")
-    tree = etree.fromstring(container_xml)
-    ns = "urn:oasis:names:tc:opendocument:xmlns:container"
-    rootfile = tree.find(f".//{{{ns}}}rootfile[@media-type='application/oebps-package+xml']")
-    if rootfile is None:
-        raise RuntimeError("Could not find rootfile in container.xml")
-    return rootfile.get("full-path", "content.opf")
-
-
 # ---------------------------------------------------------------------------
 # Find ToC files
 # ---------------------------------------------------------------------------
@@ -106,8 +88,8 @@ def find_toc_files(source_epub_path: str, opf_dir: str) -> tuple[str | None, str
     tuple[str | None, str | None]
         ``(ncx_zip_path, nav_zip_path)`` -- either may be ``None``.
     """
-    opf_zip_path = _find_opf_zip_path(source_epub_path)
-    opf_bytes = _read_zip_entry(source_epub_path, opf_zip_path)
+    opf_zip_path = find_opf_zip_path(source_epub_path)
+    opf_bytes = read_zip_entry(source_epub_path, opf_zip_path)
     opf = etree.fromstring(opf_bytes)
 
     ncx_zip_path: str | None = None
@@ -453,13 +435,13 @@ def translate_toc(
     nav_titles: list[str] = []
 
     if ncx_path:
-        ncx_bytes = _read_zip_entry(source_epub_path, ncx_path)
+        ncx_bytes = read_zip_entry(source_epub_path, ncx_path)
         ncx_content = ncx_bytes.decode("utf-8")
         ncx_titles = extract_toc_titles(ncx_content, "ncx")
         logger.info("NCX: extracted %d titles from %s", len(ncx_titles), ncx_path)
 
     if nav_path:
-        nav_bytes = _read_zip_entry(source_epub_path, nav_path)
+        nav_bytes = read_zip_entry(source_epub_path, nav_path)
         nav_content = nav_bytes.decode("utf-8")
         nav_titles = extract_toc_titles(nav_content, "nav")
         logger.info("Nav: extracted %d titles from %s", len(nav_titles), nav_path)

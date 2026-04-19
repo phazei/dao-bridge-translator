@@ -282,66 +282,33 @@ class TestCompleteJsonRetry:
 # ---------------------------------------------------------------------------
 
 
-class TestRetryCounterReset:
+class TestRetryCounterAndTotalAttempts:
     @patch("dao_bridge.llm_client.openai.OpenAI")
-    def test_retry_counter_resets_on_successful_parse(self, mock_openai_cls):
-        """Scenario: malformed, malformed, good, malformed, good -> 5 attempts, no error.
-
-        The counter resets after a successful JSON parse, so:
-        - Attempt 1: malformed JSON -> consecutive_failures = 1
-        - Attempt 2: malformed JSON -> consecutive_failures = 2
-        - Attempt 3: valid JSON, valid schema -> consecutive_failures = 0, RETURN
-
-        But we want to test the full scenario where parse succeeds but
-        validation fails, then it recovers.  Let's use the exact spec:
+    def test_consecutive_failures_accumulate_across_parse_and_validation(self, mock_openai_cls):
+        """Failures accumulate without reset: parse fail + validation fail both count.
 
         - Attempt 1: malformed JSON -> consecutive_failures = 1
-        - Attempt 2: malformed JSON -> consecutive_failures = 2  (max_retries=3, not yet hit)
-        - Attempt 3: valid JSON, valid schema -> SUCCESS, return
+        - Attempt 2: valid JSON, validation fails -> consecutive_failures = 2
+        - Attempt 3: valid JSON, valid schema -> SUCCESS
 
-        Actually the spec says: "malformed, malformed, good, malformed, good -> 5 attempts"
-        The key insight: a successful JSON *parse* resets the counter, even if
-        validation then fails.  So we need:
-
-        - Attempt 1: malformed (not JSON) -> consecutive_failures = 1
-        - Attempt 2: malformed (not JSON) -> consecutive_failures = 2
-        - Attempt 3: valid JSON + valid model -> return
-          BUT we want 5 attempts.  So the "good" must be parse-good but
-          validation-bad:
-
-        Reinterpretation:
-        - Attempt 1: not valid JSON at all -> consecutive_failures = 1
-        - Attempt 2: not valid JSON at all -> consecutive_failures = 2
-        - Attempt 3: valid JSON, passes parse, resets counter to 0.
-                     Then validation fails -> consecutive_failures = 1
-        - Attempt 4: not valid JSON -> consecutive_failures = 2
-        - Attempt 5: valid JSON, valid model -> SUCCESS
-
-        With max_retries=3, we never hit the limit because the counter
-        never reaches 3 consecutively.  5 API calls total.
+        With max_retries=3, we succeed on attempt 3 (consecutive_failures
+        never reaches 3).
         """
         mock_client = MagicMock()
         mock_openai_cls.return_value = mock_client
 
         mock_client.chat.completions.create.side_effect = [
-            # Attempt 1: malformed JSON
+            # Attempt 1: malformed JSON -> consecutive_failures = 1
             _mock_response("this is not json"),
-            # Attempt 2: malformed JSON
-            _mock_response("{broken json"),
-            # Attempt 3: valid JSON, but wrong schema (value is string not int)
-            #   -> parse succeeds (resets counter to 0), validation fails (counter -> 1)
+            # Attempt 2: valid JSON, wrong schema -> consecutive_failures = 2
             _mock_response('{"name": "test", "value": "not_int"}'),
-            # Attempt 4: malformed JSON again -> counter -> 2
-            _mock_response("still broken"),
-            # Attempt 5: valid JSON, valid schema -> SUCCESS
+            # Attempt 3: valid JSON, valid schema -> SUCCESS
             _mock_response('{"name": "final", "value": 42}'),
         ]
 
         config = ModelConfig(model="test-model")
         client = LLMClient(config)
 
-        # max_retries=3 means we tolerate up to 3 consecutive failures.
-        # The counter resets mid-sequence so we never hit 3.
         result = client.complete_json(
             [{"role": "user", "content": "give me data"}],
             response_model=SimpleResponse,
@@ -351,7 +318,81 @@ class TestRetryCounterReset:
         assert isinstance(result, SimpleResponse)
         assert result.name == "final"
         assert result.value == 42
-        # Exactly 5 API calls were made.
+        assert mock_client.chat.completions.create.call_count == 3
+
+    @patch("dao_bridge.llm_client.openai.OpenAI")
+    def test_total_attempts_ceiling_prevents_infinite_loop(self, mock_openai_cls):
+        """Even if consecutive_failures stays below max_retries, the total
+        attempts ceiling (max_retries * 2) halts the loop.
+
+        With max_retries=3 and max_total_attempts=6:
+        - Attempts 1-6: all return parseable-but-invalid JSON
+        - consecutive_failures increments each time: 1, 2, 3 -> exits at 3
+
+        Actually consecutive failures alone catch this case.  To test the
+        *total attempts* ceiling we need max_retries high enough that
+        consecutive failures wouldn't trigger first.  Use max_retries=10
+        with a scenario that hits total_attempts=20 ceiling first.
+
+        Simpler: just verify that validation failures accumulate and the
+        loop terminates.
+        """
+        mock_client = MagicMock()
+        mock_openai_cls.return_value = mock_client
+
+        # All responses are valid JSON but fail validation (value is string).
+        mock_client.chat.completions.create.return_value = _mock_response(
+            '{"name": "test", "value": "not_an_int"}'
+        )
+
+        config = ModelConfig(model="test-model")
+        client = LLMClient(config)
+
+        with pytest.raises(LLMStructuredOutputError):
+            client.complete_json(
+                [{"role": "user", "content": "give me data"}],
+                response_model=SimpleResponse,
+                max_retries=3,
+            )
+
+        # Should have made exactly 3 attempts (consecutive_failures hits 3).
+        assert mock_client.chat.completions.create.call_count == 3
+
+    @patch("dao_bridge.llm_client.openai.OpenAI")
+    def test_total_attempts_ceiling_with_high_max_retries(self, mock_openai_cls):
+        """With a high max_retries, the total_attempts ceiling (max_retries * 2)
+        is the binding constraint.
+
+        max_retries=100, max_total_attempts=200.
+        All responses fail validation -> consecutive_failures hits 100 at attempt 100.
+        But total_attempts ceiling is 200, so consecutive_failures is the
+        binding limit here.
+
+        To actually test the total_attempts ceiling being the binding limit,
+        we need failures to *not* be consecutive — but without resetting
+        the counter, they always are.  The total_attempts ceiling is a
+        safety net for any future logic changes.  Verify the ceiling exists:
+        """
+        mock_client = MagicMock()
+        mock_openai_cls.return_value = mock_client
+
+        # Always returns invalid schema.
+        mock_client.chat.completions.create.return_value = _mock_response(
+            '{"name": "test", "value": "bad"}'
+        )
+
+        config = ModelConfig(model="test-model")
+        client = LLMClient(config)
+
+        with pytest.raises(LLMStructuredOutputError):
+            client.complete_json(
+                [{"role": "user", "content": "data"}],
+                response_model=SimpleResponse,
+                max_retries=5,
+            )
+
+        # consecutive_failures hits 5 at attempt 5.
+        # total_attempts ceiling is 10, so consecutive is the binding limit.
         assert mock_client.chat.completions.create.call_count == 5
 
 

@@ -188,14 +188,12 @@ class TranslationPhaseConfig(BaseModel):
 class OutputConfig(BaseModel):
     """EPUB output parameters."""
 
-    model_config = {"populate_by_name": True}
-
     epub_path: str = "./book.en.epub"
     title_suffix: str = " (English Translation)"
     new_identifier: bool = False
     css: Literal["original", "default"] = "original"
     add_translation_note: bool = True
-    validate_epub: bool = Field(default=False, alias="validate")
+    run_epubcheck: bool = False
 
 
 # ---------------------------------------------------------------------------

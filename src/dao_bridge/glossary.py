@@ -336,6 +336,24 @@ def _load_glossary(work_dir: Path) -> Glossary:
     return Glossary()
 
 
+def load_glossary(work_dir: Path, config: AppConfig) -> Glossary:
+    """Load ``glossary.json`` and validate categories against *config*.
+
+    Public convenience wrapper used by consumer stages (translate, rebuild,
+    toc) so that category mismatches are caught at load time rather than
+    silently propagated into prompts.
+
+    Raises
+    ------
+    ValueError
+        If any glossary entry has a category not in ``config.glossary.categories``.
+    """
+    glossary = _load_glossary(work_dir)
+    if glossary.entries:
+        validate_glossary_categories(glossary, config.glossary.categories)
+    return glossary
+
+
 def _save_glossary(work_dir: Path, glossary: Glossary) -> None:
     """Atomically save ``glossary.json``."""
     glossary.updated_at = datetime.now(timezone.utc)
@@ -716,9 +734,16 @@ def glossary_build(
                 len(response.corrections),
             )
 
-        except (LLMStructuredOutputError, Exception) as exc:
+        except LLMStructuredOutputError as exc:
+            logger.error("Structured output failed for batch %s: %s", batch_id, exc)
             mark_item_failed(work_dir, state, stage, batch_id, str(exc))
             # Save progress so far even on failure.
+            _save_glossary(work_dir, glossary)
+            _save_build_meta(work_dir, meta)
+            raise
+        except Exception as exc:
+            logger.error("Unexpected error in batch %s: %s", batch_id, exc)
+            mark_item_failed(work_dir, state, stage, batch_id, str(exc))
             _save_glossary(work_dir, glossary)
             _save_build_meta(work_dir, meta)
             raise
@@ -932,7 +957,13 @@ def glossary_reconcile(
 
             mark_item_completed(work_dir, state, stage, item_id)
 
-        except (LLMStructuredOutputError, Exception) as exc:
+        except LLMStructuredOutputError as exc:
+            logger.error("Structured output failed for term %s: %s", item_id, exc)
+            mark_item_failed(work_dir, state, stage, item_id, str(exc))
+            _save_glossary(work_dir, glossary)
+            raise
+        except Exception as exc:
+            logger.error("Unexpected error reconciling term %s: %s", item_id, exc)
             mark_item_failed(work_dir, state, stage, item_id, str(exc))
             _save_glossary(work_dir, glossary)
             raise
@@ -976,7 +1007,13 @@ def glossary_reconcile(
             mark_item_completed(work_dir, state, stage, item_id)
             logger.debug("Consolidated speech style for %s", entry.english)
 
-        except (LLMStructuredOutputError, Exception) as exc:
+        except LLMStructuredOutputError as exc:
+            logger.error("Structured output failed for speech style %s: %s", item_id, exc)
+            mark_item_failed(work_dir, state, stage, item_id, str(exc))
+            _save_glossary(work_dir, glossary)
+            raise
+        except Exception as exc:
+            logger.error("Unexpected error consolidating speech style %s: %s", item_id, exc)
             mark_item_failed(work_dir, state, stage, item_id, str(exc))
             _save_glossary(work_dir, glossary)
             raise

@@ -16,7 +16,6 @@ from dao_bridge.chunk import (
     ChunkValidationError,
     chunk_blocks,
     chunk_spine_item,
-    count_tokens,
     find_last_break_point_in_range,
     parse_blocks,
     validate_chunks,

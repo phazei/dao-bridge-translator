@@ -33,7 +33,7 @@ from pydantic import BaseModel
 from dao_bridge.chunk import count_tokens
 from dao_bridge.config import AppConfig, resolve_language_name
 from dao_bridge.glossary import load_glossary
-from dao_bridge.llm_client import CompletionResult, LLMClient, LLMStructuredOutputError
+from dao_bridge.llm_client import LLMClient, LLMStructuredOutputError
 from dao_bridge.schemas import (
     Chunk,
     Glossary,
@@ -44,7 +44,6 @@ from dao_bridge.schemas import (
 )
 from dao_bridge.state import (
     PipelineState,
-    is_stage_completed,
     iter_pending_items,
     mark_item_completed,
     mark_item_failed,

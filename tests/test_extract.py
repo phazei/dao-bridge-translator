@@ -5,10 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from unittest.mock import MagicMock
 
-import pytest
-
 from dao_bridge.extract import _derive_book_id, _normalize_for_id
-
 
 # ---------------------------------------------------------------------------
 # Helpers

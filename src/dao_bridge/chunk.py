@@ -15,12 +15,11 @@ output, which is critical for resumability and debugging.
 
 from __future__ import annotations
 
-import json
 import logging
 import re
 import shutil
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 

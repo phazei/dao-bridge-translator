@@ -443,7 +443,7 @@ class TestFullPipelineWithRebuild:
         from dao_bridge.assemble import assemble_all
         from dao_bridge.chunk import chunk_all
         from dao_bridge.rebuild import run_rebuild_stage
-        from dao_bridge.schemas import Glossary, TocTranslationResponse
+        from dao_bridge.schemas import Glossary
 
         work_dir = tmp_path / "work"
         ensure_dirs(work_dir)

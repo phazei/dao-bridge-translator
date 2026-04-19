@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import zipfile
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 from lxml import etree
@@ -14,7 +14,6 @@ from dao_bridge.schemas import (
     Glossary,
     GlossaryEntry,
     Manifest,
-    ManifestItem,
     TocTranslationResponse,
 )
 from dao_bridge.toc import (
@@ -357,7 +356,8 @@ class TestExtractTocTitles:
         )
         titles = extract_toc_titles(ncx, "ncx")
         # NCX iterates <text> in document order: Part I children first, then Part I label, etc.
-        # Actually lxml.iter is document order which means Part I label, then children, then Part II label, then children.
+        # Actually lxml.iter is document order: Part I label, then children,
+        # then Part II label, then children.
         # Let's verify the actual count.
         assert len(titles) == 5
         # All titles should be present.

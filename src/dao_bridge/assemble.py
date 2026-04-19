@@ -17,7 +17,7 @@ from pathlib import Path
 
 from dao_bridge.chunk import count_tokens
 from dao_bridge.config import AppConfig
-from dao_bridge.schemas import Chunk, Manifest, ManifestItem, TranslatedChunk
+from dao_bridge.schemas import Chunk, Manifest, TranslatedChunk
 from dao_bridge.state import (
     PipelineState,
     is_stage_completed,
@@ -34,7 +34,6 @@ from dao_bridge.workdir import (
     atomic_write,
     chunk_dir,
     format_chunk_id,
-    manifest_path,
     pad_spine,
     translation_path,
 )

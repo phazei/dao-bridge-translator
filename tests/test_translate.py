@@ -9,7 +9,6 @@ stage runner.
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -31,11 +30,9 @@ from dao_bridge.state import (
     mark_item_completed,
     mark_item_failed,
     mark_stage_completed,
-    save_state,
 )
 from dao_bridge.translate import (
     QAResponse,
-    QAResult,
     TranslationProgress,
     _enumerate_chunk_ids,
     _filter_chunk_range,
@@ -45,7 +42,6 @@ from dao_bridge.translate import (
     build_pass1_messages,
     extend_pass2_messages,
     extend_qa_messages,
-    generate_summary,
     load_overlap,
     programmatic_qa_check,
     render_glossary,
@@ -57,13 +53,10 @@ from dao_bridge.workdir import (
     atomic_write,
     chunk_path,
     ensure_dirs,
-    format_chunk_id,
     glossary_path,
     manifest_path,
-    summary_path,
     translation_path,
 )
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -323,7 +316,7 @@ class TestRenderGlossary:
         assert "Guaral" in result
         # Speech and Nicknames should not appear for a place.
         lines = result.split("\n")
-        guaral_idx = next(i for i, l in enumerate(lines) if "Guaral" in l)
+        guaral_idx = next(i for i, line in enumerate(lines) if "Guaral" in line)
         # Next line should not be a Speech or Nicknames line.
         remaining = lines[guaral_idx + 1 :]
         for line in remaining:

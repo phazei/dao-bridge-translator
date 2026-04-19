@@ -6,7 +6,6 @@ to exercise assembly logic without requiring the full pipeline.
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
 import pytest
@@ -14,14 +13,11 @@ import pytest
 from dao_bridge.assemble import assemble_all, assemble_spine_item
 from dao_bridge.config import AppConfig
 from dao_bridge.schemas import Chunk, Manifest, ManifestItem, TranslatedChunk
-from dao_bridge.state import PipelineState, is_stage_completed, load_state, save_state
+from dao_bridge.state import is_stage_completed, load_state
 from dao_bridge.workdir import (
-    chunk_dir,
     chunk_path,
     ensure_dirs,
     format_chunk_id,
-    manifest_path,
-    translation_dir,
     translation_path,
 )
 

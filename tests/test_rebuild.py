@@ -24,7 +24,6 @@ from dao_bridge.schemas import (
     Glossary,
     Manifest,
     ManifestItem,
-    TocTranslationResponse,
 )
 
 # ---------------------------------------------------------------------------
@@ -759,7 +758,7 @@ class TestRunRebuildStage:
         (work / "manifest.json").write_text(manifest.model_dump_json(), encoding="utf-8")
 
         # State file.
-        from dao_bridge.state import PipelineState, save_state, RunState
+        from dao_bridge.state import PipelineState, RunState, save_state
 
         state = PipelineState(
             run=RunState(source_epub=str(epub_path), started_at="", status="initialised")
@@ -792,7 +791,7 @@ class TestRunRebuildStage:
         run_rebuild_stage(work, config, force=False)
 
         # Stage should be marked completed.
-        from dao_bridge.state import load_state, is_stage_completed
+        from dao_bridge.state import is_stage_completed, load_state
 
         state = load_state(work)
         assert is_stage_completed(state, "rebuild")

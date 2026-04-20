@@ -38,6 +38,7 @@ from dao_bridge.translate import (
     _filter_chunk_range,
     _load_rolling_summaries,
     _save_rolling_summaries,
+    _strip_analysis,
     _update_rolling_summary,
     build_pass1_messages,
     extend_pass2_messages,
@@ -418,6 +419,43 @@ class TestRenderRollingSummary:
 
 
 # =========================================================================
+# Analysis stripping
+# =========================================================================
+
+
+class TestStripAnalysis:
+    """Tests for _strip_analysis()."""
+
+    def test_strips_analysis_block(self):
+        """Analysis block is removed, leaving only the translation."""
+        text = "<analysis>\nSome notes here.\n</analysis>\nThe translation text."
+        assert _strip_analysis(text) == "The translation text."
+
+    def test_strips_analysis_with_whitespace(self):
+        """Leading/trailing whitespace around the result is cleaned up."""
+        text = "<analysis>notes</analysis>\n\n  The translation text.  \n"
+        assert _strip_analysis(text) == "The translation text."
+
+    def test_no_analysis_returns_text_unchanged(self):
+        """When no analysis block is present, text is returned as-is."""
+        text = "Just the translation."
+        assert _strip_analysis(text) == "Just the translation."
+
+    def test_multiline_analysis(self):
+        """Analysis blocks with multiple lines are fully removed."""
+        text = (
+            "<analysis>\nLine 1\nLine 2\n**Bold**: stuff\n</analysis>\n"
+            "Paragraph one.\n\nParagraph two."
+        )
+        assert _strip_analysis(text) == "Paragraph one.\n\nParagraph two."
+
+    def test_empty_analysis(self):
+        """An empty analysis block is removed cleanly."""
+        text = "<analysis></analysis>Translation."
+        assert _strip_analysis(text) == "Translation."
+
+
+# =========================================================================
 # Message construction
 # =========================================================================
 
@@ -437,7 +475,7 @@ class TestBuildPass1Messages:
         messages = build_pass1_messages(chunk, glossary, None, summaries, config)
 
         assert messages[0]["role"] == "system"
-        assert "Guidelines" in messages[0]["content"]
+        assert "Translation guidelines" in messages[0]["content"]
         assert "GLOSSARY" not in messages[0]["content"]
         assert "STORY SO FAR" not in messages[0]["content"]
 
@@ -599,8 +637,9 @@ class TestExtendPass2Messages:
         assert result[2]["role"] == "assistant"
         assert result[2]["content"] == "pass1 output"
         assert result[3]["role"] == "system"
-        assert "revis" in result[3]["content"].lower()
+        assert "polish" in result[3]["content"].lower()
         assert result[4]["role"] == "user"
+        assert "polish" in result[4]["content"].lower()
 
 
 class TestExtendQAMessages:

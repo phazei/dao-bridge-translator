@@ -22,6 +22,7 @@ from __future__ import annotations
 import functools
 import json
 import logging
+import re
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -129,6 +130,18 @@ def _load_prompt_template(name: str) -> str:
     """
     path = _PROMPT_DIR / name
     return path.read_text(encoding="utf-8")
+
+
+# ---------------------------------------------------------------------------
+# Analysis stripping
+# ---------------------------------------------------------------------------
+
+_ANALYSIS_RE = re.compile(r"<analysis>.*?</analysis>\s*", re.DOTALL)
+
+
+def _strip_analysis(text: str) -> str:
+    """Remove the ``<analysis>...</analysis>`` block from Pass 1 LLM output."""
+    return _ANALYSIS_RE.sub("", text).strip()
 
 
 # ---------------------------------------------------------------------------
@@ -486,30 +499,25 @@ def extend_pass2_messages(
     pass1_response: str,
     config: AppConfig,
 ) -> list[dict]:
-    """Append Pass 2 (revision) messages to the conversation.
+    """Append Pass 2 (polish) messages to the conversation.
 
     Mutates and returns *messages* for prefix-cache friendliness.
     """
     source_lang = resolve_language_name(config.languages.source)
     target_lang = resolve_language_name(config.languages.target)
-    template = _load_prompt_template("translate_pass2.txt")
-    system_content = template.format(
+    system_template = _load_prompt_template("translate_pass2.txt")
+    system_content = system_template.format(
         source_language=source_lang,
+        target_language=target_lang,
+    )
+    user_template = _load_prompt_template("translate_pass2_user.txt")
+    user_content = user_template.format(
         target_language=target_lang,
     )
 
     messages.append({"role": "assistant", "content": pass1_response})
     messages.append({"role": "system", "content": system_content})
-    messages.append(
-        {
-            "role": "user",
-            "content": (
-                "Please revise your translation above. Compare against the "
-                "original source for accuracy, naturalness, and glossary "
-                "consistency. Output only the revised translation."
-            ),
-        }
-    )
+    messages.append({"role": "user", "content": user_content})
     return messages
 
 
@@ -684,7 +692,7 @@ def translate_chunk(
     # --- Pass 1 ---
     messages = build_pass1_messages(chunk, glossary, overlap, rolling_summaries, config)
     result1 = llm_client.complete(messages)
-    pass1_text = result1.text.strip()
+    pass1_text = _strip_analysis(result1.text)
     model_used = result1.model or llm_client.config.model
 
     # --- Pass 2 (revision) ---

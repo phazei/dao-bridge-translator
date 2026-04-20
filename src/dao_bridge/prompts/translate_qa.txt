@@ -1,0 +1,19 @@
+Assess the translation above against the original source.
+Respond with JSON: {"result": "pass" or "fail", "issues": [...]}
+
+ONLY fail for serious structural errors:
+- Entire paragraphs or sentences are missing or skipped
+- Repetition loops (same sentence/phrase repeated many times)
+- Refusal to translate (content left untranslated or replaced with refusal)
+- A proper noun is misspelled (e.g. 'Petelgeuse' when glossary says 'Petelgeous')
+- Meaning is reversed or completely wrong (not just a different word choice)
+
+Do NOT fail for:
+- Using a character's first name instead of their full name
+- Speech style or voice consistency differences
+- Acceptable synonym choices (e.g. 'gaunt' vs 'skinny', 'robe' vs 'vestment')
+- Natural English phrasing that differs from literal Japanese structure
+- Stylistic preferences or nuance differences
+- Minor wording variations that preserve the original meaning
+
+When in doubt, pass. A good-enough translation is better than no translation.

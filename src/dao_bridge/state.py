@@ -172,6 +172,32 @@ def reset_stage(work_dir: Path, state: PipelineState, stage: StageName) -> None:
     logger.info("Stage [bold]%s[/bold] reset for re-run", stage)
 
 
+def reset_stage_items(
+    work_dir: Path,
+    state: PipelineState,
+    stage: StageName,
+    item_ids: list[str],
+) -> None:
+    """Reset specific items within a stage so they can be retranslated.
+
+    Unlike :func:`reset_stage`, this preserves the stage status and all
+    item entries *not* in *item_ids*.  The stage status is set to
+    ``"running"`` so processing can proceed.
+    """
+    for item_id in item_ids:
+        key = _item_key(stage, item_id)
+        state.items.pop(key, None)
+    # Ensure the stage is in a runnable state.
+    if stage not in state.stages or state.stages[stage].status in ("completed", "failed"):
+        state.stages[stage] = StageState(status="running", started_at=_now())
+    save_state(work_dir, state)
+    logger.info(
+        "Stage [bold]%s[/bold]: reset %d item(s) for re-run",
+        stage,
+        len(item_ids),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Item helpers
 # ---------------------------------------------------------------------------

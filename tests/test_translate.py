@@ -325,13 +325,13 @@ class TestRenderGlossary:
             assert not line.strip().startswith("Speech:")
             assert not line.strip().startswith("Nicknames:")
 
-    def test_no_matches_returns_placeholder(self):
-        """When no glossary entries match in relevant mode, show a
-        placeholder message."""
+    def test_no_matches_returns_empty_string(self):
+        """When no glossary entries match in relevant mode, return an
+        empty string so the caller can skip injection."""
         glossary = _make_glossary()
         result = render_glossary(glossary, "no matching terms here", "relevant")
 
-        assert "No matching glossary entries for this section" in result
+        assert result == ""
 
     def test_entries_grouped_by_category(self):
         """Entries are grouped under their category header."""
@@ -354,7 +354,7 @@ class TestRenderGlossary:
         glossary = _make_glossary(entries)
         result = render_glossary(glossary, "anything", "relevant")
 
-        assert "No matching glossary entries" in result
+        assert result == ""
 
     def test_notes_included_in_rendering(self):
         """Entry notes are shown after the dash."""
@@ -425,8 +425,24 @@ class TestRenderRollingSummary:
 class TestBuildPass1Messages:
     """Tests for build_pass1_messages()."""
 
-    def test_messages_include_system_and_source(self, tmp_path: Path):
-        """Pass 1 messages contain system prompt and source text."""
+    def test_system_message_contains_instructions_only(self, tmp_path: Path):
+        """System message contains translation instructions but not glossary
+        or rolling summary content."""
+        work_dir = _setup_work_dir(tmp_path)
+        config = _make_config(work_dir)
+        chunk = _make_chunk()
+        glossary = _make_glossary()
+        summaries = [{"chunk_id": "0001.001", "summary": "Something happened."}]
+
+        messages = build_pass1_messages(chunk, glossary, None, summaries, config)
+
+        assert messages[0]["role"] == "system"
+        assert "Guidelines" in messages[0]["content"]
+        assert "GLOSSARY" not in messages[0]["content"]
+        assert "STORY SO FAR" not in messages[0]["content"]
+
+    def test_last_message_is_source_text(self, tmp_path: Path):
+        """The last message is always the user source text to translate."""
         work_dir = _setup_work_dir(tmp_path)
         config = _make_config(work_dir)
         chunk = _make_chunk()
@@ -434,15 +450,42 @@ class TestBuildPass1Messages:
 
         messages = build_pass1_messages(chunk, glossary, None, [], config)
 
-        assert messages[0]["role"] == "system"
-        assert "GLOSSARY" in messages[0]["content"]
-        # Last message is the source text.
         assert messages[-1]["role"] == "user"
         assert chunk.text in messages[-1]["content"]
 
-    def test_overlap_adds_user_message(self, tmp_path: Path):
-        """When overlap is provided, a user message with the preceding
-        section is inserted before the source text."""
+    def test_glossary_injected_as_user_assistant_pair(self, tmp_path: Path):
+        """Matching glossary entries are injected as a user message
+        followed by an assistant 'Understood.' acknowledgment."""
+        work_dir = _setup_work_dir(tmp_path)
+        config = _make_config(work_dir)
+        # Use chunk text that contains a glossary source_term.
+        chunk = _make_chunk(text="ナツキ・スバルは言った。")
+        glossary = _make_glossary()
+
+        messages = build_pass1_messages(chunk, glossary, None, [], config)
+
+        assert messages[1]["role"] == "user"
+        assert "GLOSSARY" in messages[1]["content"]
+        assert "Natsuki Subaru" in messages[1]["content"]
+        assert messages[2]["role"] == "assistant"
+        assert messages[2]["content"] == "Understood."
+
+    def test_no_glossary_match_skips_glossary_messages(self, tmp_path: Path):
+        """When no glossary entries match the chunk text, glossary user and
+        assistant messages are omitted entirely."""
+        work_dir = _setup_work_dir(tmp_path)
+        config = _make_config(work_dir)
+        chunk = _make_chunk()  # default text has no matching glossary terms
+        glossary = _make_glossary()
+
+        messages = build_pass1_messages(chunk, glossary, None, [], config)
+
+        all_content = " ".join(m["content"] for m in messages)
+        assert "GLOSSARY" not in all_content
+
+    def test_overlap_adds_user_assistant_pair(self, tmp_path: Path):
+        """When overlap is provided, it is injected as a user message
+        followed by an assistant 'Understood.' before the source text."""
         work_dir = _setup_work_dir(tmp_path)
         config = _make_config(work_dir)
         chunk = _make_chunk()
@@ -453,13 +496,15 @@ class TestBuildPass1Messages:
 
         messages = build_pass1_messages(chunk, glossary, overlap, [], config)
 
-        # There should be 3 messages: system, overlap-user, source-user.
-        assert len(messages) == 3
+        # system, overlap-user, overlap-assistant, source-user
+        assert len(messages) == 4
         assert messages[1]["role"] == "user"
         assert "prev source" in messages[1]["content"]
         assert "prev translation" in messages[1]["content"]
+        assert messages[2]["role"] == "assistant"
+        assert messages[2]["content"] == "Understood."
 
-    def test_no_overlap_omits_overlap_message(self, tmp_path: Path):
+    def test_no_overlap_omits_overlap_messages(self, tmp_path: Path):
         """Without overlap, only system + source messages are present."""
         work_dir = _setup_work_dir(tmp_path)
         config = _make_config(work_dir)
@@ -472,8 +517,9 @@ class TestBuildPass1Messages:
         assert messages[0]["role"] == "system"
         assert messages[1]["role"] == "user"
 
-    def test_rolling_summary_in_system_message(self, tmp_path: Path):
-        """When rolling summaries exist, they appear in the system prompt."""
+    def test_rolling_summary_injected_as_user_assistant_pair(self, tmp_path: Path):
+        """Rolling summaries are injected as a user message followed by an
+        assistant 'Understood.' acknowledgment."""
         work_dir = _setup_work_dir(tmp_path)
         config = _make_config(work_dir)
         chunk = _make_chunk()
@@ -482,11 +528,16 @@ class TestBuildPass1Messages:
 
         messages = build_pass1_messages(chunk, glossary, None, summaries, config)
 
-        assert "STORY SO FAR" in messages[0]["content"]
-        assert "Something happened" in messages[0]["content"]
+        # system, summary-user, summary-assistant, source-user
+        assert len(messages) == 4
+        assert messages[1]["role"] == "user"
+        assert "STORY SO FAR" in messages[1]["content"]
+        assert "Something happened" in messages[1]["content"]
+        assert messages[2]["role"] == "assistant"
+        assert messages[2]["content"] == "Understood."
 
-    def test_empty_summary_not_in_system_message(self, tmp_path: Path):
-        """When there are no summaries, the STORY SO FAR block is absent."""
+    def test_empty_summary_omits_summary_messages(self, tmp_path: Path):
+        """When there are no summaries, summary messages are omitted entirely."""
         work_dir = _setup_work_dir(tmp_path)
         config = _make_config(work_dir)
         chunk = _make_chunk()
@@ -494,7 +545,39 @@ class TestBuildPass1Messages:
 
         messages = build_pass1_messages(chunk, glossary, None, [], config)
 
-        assert "STORY SO FAR" not in messages[0]["content"]
+        all_content = " ".join(m["content"] for m in messages)
+        assert "STORY SO FAR" not in all_content
+
+    def test_full_context_message_order(self, tmp_path: Path):
+        """With glossary, summary, and overlap all present, messages follow
+        the expected order: system, glossary, ack, summary, ack, overlap, ack, source."""
+        work_dir = _setup_work_dir(tmp_path)
+        config = _make_config(work_dir)
+        chunk = _make_chunk(text="ナツキ・スバルは言った。")
+        glossary = _make_glossary()
+        summaries = [{"chunk_id": "0001.001", "summary": "Something happened."}]
+        overlap = _make_translated_chunk(
+            source_text="prev source", translated_text="prev translation"
+        )
+
+        messages = build_pass1_messages(chunk, glossary, overlap, summaries, config)
+
+        assert len(messages) == 8
+        roles = [m["role"] for m in messages]
+        assert roles == [
+            "system",
+            "user",
+            "assistant",  # glossary
+            "user",
+            "assistant",  # summary
+            "user",
+            "assistant",  # overlap
+            "user",  # source text
+        ]
+        assert "GLOSSARY" in messages[1]["content"]
+        assert "STORY SO FAR" in messages[3]["content"]
+        assert "prev source" in messages[5]["content"]
+        assert chunk.text in messages[7]["content"]
 
 
 class TestExtendPass2Messages:
@@ -540,7 +623,7 @@ class TestExtendQAMessages:
         assert result[3]["role"] == "system"
         assert "JSON" in result[3]["content"]
         assert result[4]["role"] == "user"
-        assert "Glossary violations" in result[4]["content"]
+        assert "Assess the translation" in result[4]["content"]
 
 
 # =========================================================================

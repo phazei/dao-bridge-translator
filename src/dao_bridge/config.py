@@ -58,7 +58,7 @@ class ModelConfig(BaseModel):
     base_url: str = "http://localhost:8080/v1"
     api_key: str = "not-needed"
     model: str = "default"
-    temperature: float = 0.0
+    temperature: float | None = None
 
 
 # ---------------------------------------------------------------------------

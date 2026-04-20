@@ -252,26 +252,25 @@ def _default_config_yaml(epub_path: str, work_dir: str) -> str:
                 "base_url": "http://localhost:8080/v1",
                 "api_key": "not-needed",
                 "model": "qwen3-30b-a3b",
-                "temperature": 0.0,
+                "temperature": 0.6,
             },
             "glossary": {
                 "base_url": "http://localhost:8080/v1",
                 "api_key": "not-needed",
                 "model": "gemma-4-26b-a4b",
-                "temperature": 0.2,
+                "temperature": 0.7,
             },
             "translate": {
                 "base_url": "http://localhost:8080/v1",
                 "api_key": "not-needed",
                 "model": "gemma-4-26b-a4b",
-                "temperature": 0.3,
+                "temperature": 0.9,
             },
             # "summarize" falls back to "translate" if absent.
             # "summarize": {
             #     "base_url": "http://localhost:8080/v1",
             #     "api_key": "not-needed",
             #     "model": "qwen3-30b-a3b",
-            #     "temperature": 0.2,
             # },
         },
         "chunking": {

@@ -14,7 +14,7 @@ Classify it as exactly one of these types:
 
 Guidelines:
 - Prefer content over position. Spine position is a weak signal; classify based on what the content actually is.
-- Extract a title if one is discernible. For chapters use the heading text (e.g. "Chapter 3: The Storm"). For frontmatter use the section label (e.g. "Prologue", "Copyright"). For illustrations return null.
+- Extract a title if one is discernible. For chapters use the heading text (e.g. "Chapter 3: The Storm"). For frontmatter use the section label (e.g. "Prologue", "Copyright"). For illustrations return null. If the title is in {source_language}, translate it to {target_language}.
 - Reserve "low" confidence for genuinely ambiguous cases.
 
 === RAW XHTML (first 500 chars, preserves structural context) ===

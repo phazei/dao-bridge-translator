@@ -264,9 +264,11 @@ def llm_classify(
     """
     template = _load_prompt_template()
     source_lang = resolve_language_name(config.languages.source)
+    target_lang = resolve_language_name(config.languages.target)
 
     prompt = template.format(
         source_language=source_lang,
+        target_language=target_lang,
         raw_excerpt=raw_excerpt,
         clean_excerpt=clean_excerpt,
         spine_position=position[0],

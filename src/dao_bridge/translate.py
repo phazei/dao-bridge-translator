@@ -52,6 +52,7 @@ from dao_bridge.state import (
     mark_stage_started,
     reopen_stage,
     reset_stage,
+    reset_stage_items,
 )
 from dao_bridge.workdir import (
     atomic_write,
@@ -159,7 +160,7 @@ def render_glossary(glossary: Glossary, chunk_text: str, mode: str) -> str:
         entries = list(glossary.entries)
 
     if not entries:
-        return "GLOSSARY (terms in this section)\n\nNo matching glossary entries for this section."
+        return ""
 
     # Group by category.
     groups: dict[str, list[GlossaryEntry]] = {}
@@ -167,7 +168,7 @@ def render_glossary(glossary: Glossary, chunk_text: str, mode: str) -> str:
         cat = entry.category.capitalize()
         groups.setdefault(cat, []).append(entry)
 
-    lines = ["GLOSSARY (terms in this section)"]
+    lines = ["\nGLOSSARY (terms in this section)"]
 
     for category, group_entries in groups.items():
         lines.append("")
@@ -250,7 +251,7 @@ def render_rolling_summary(summaries: list[dict], max_tokens: int) -> str:
     # Restore chronological order.
     selected.reverse()
 
-    lines = ["STORY SO FAR (rolling summary)", ""]
+    lines = ["\nSTORY SO FAR (rolling summary)", ""]
     for entry in selected:
         lines.append(f"[{entry['chunk_id']}] {entry['summary']}")
 
@@ -441,20 +442,28 @@ def build_pass1_messages(
     else:
         summary_text = ""
 
-    # Load and format system prompt.
+    # Load and format system prompt (stable — no dynamic content).
     source_lang = resolve_language_name(config.languages.source)
     target_lang = resolve_language_name(config.languages.target)
     template = _load_prompt_template("translate_pass1.txt")
     system_content = template.format(
         source_language=source_lang,
         target_language=target_lang,
-        glossary=glossary_text,
-        rolling_summary=summary_text,
     )
 
     messages: list[dict] = [{"role": "system", "content": system_content}]
 
-    # Overlap context.
+    # Glossary context (skip if no matching entries).
+    if glossary_text:
+        messages.append({"role": "user", "content": glossary_text})
+        messages.append({"role": "assistant", "content": "Understood."})
+
+    # Rolling summary context (skip if no summaries).
+    if summary_text:
+        messages.append({"role": "user", "content": summary_text})
+        messages.append({"role": "assistant", "content": "Understood."})
+
+    # Overlap context (skip if no previous chunk).
     if overlap is not None:
         overlap_content = (
             f"Here is the preceding section and its {target_lang} translation, "
@@ -463,6 +472,7 @@ def build_pass1_messages(
             f"{target_lang.upper()}:\n{overlap.translated_text}"
         )
         messages.append({"role": "user", "content": overlap_content})
+        messages.append({"role": "assistant", "content": "Understood."})
 
     # Source text to translate.
     source_content = f"Translate the following {source_lang} text to {target_lang}:\n\n{chunk.text}"
@@ -512,6 +522,8 @@ def extend_qa_messages(
 
     Mutates and returns *messages*.
     """
+    qa_prompt = _load_prompt_template("translate_qa.txt")
+
     messages.append({"role": "assistant", "content": final_translation})
     messages.append(
         {
@@ -519,22 +531,7 @@ def extend_qa_messages(
             "content": "Assess translation quality. Respond in JSON only.",
         }
     )
-    messages.append(
-        {
-            "role": "user",
-            "content": (
-                "Assess the translation above against the original source. "
-                'Respond with JSON: {"result": "pass" or "fail", "issues": [...]}\n'
-                "\n"
-                "Fail if any of:\n"
-                "- Significant mistranslation of meaning\n"
-                "- Missing content (paragraphs or sentences skipped)\n"
-                "- Repetition loops\n"
-                "- Refusal to translate\n"
-                "- Glossary violations (proper nouns not matching the glossary)"
-            ),
-        }
-    )
+    messages.append({"role": "user", "content": qa_prompt})
     return messages
 
 
@@ -898,7 +895,13 @@ def run_translate_stage(
     target_ids = _filter_chunk_range(all_chunk_ids, from_chunk, to_chunk)
 
     if force:
-        reset_stage(work_dir, state, _STAGE)
+        targeted = from_chunk is not None or to_chunk is not None
+        if targeted:
+            # Only reset the specific chunks being retranslated —
+            # preserve state for all other items.
+            reset_stage_items(work_dir, state, _STAGE, target_ids)
+        else:
+            reset_stage(work_dir, state, _STAGE)
 
     # Handle --retry-failed: re-open a completed stage without wiping items.
     if retry_failed and not force:

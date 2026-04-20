@@ -1078,8 +1078,36 @@ def run_translate_stage(
         # Success.
         mark_item_completed(work_dir, state, _STAGE, chunk_id)
         completed_count += 1
-        total_tokens += final_tc.token_usage.get("total_tokens", 0)
+        chunk_tokens = final_tc.token_usage.get("total_tokens", 0)
+        total_tokens += chunk_tokens
         total_duration += final_tc.duration_seconds
+
+        logger.info(
+            "Chunk %s translated (pass %d, %s tokens, %.1fs)",
+            chunk_id,
+            final_tc.pass_count,
+            f"{chunk_tokens:,}",
+            final_tc.duration_seconds,
+        )
+
+        # Log per-spine summary when all chunks for a spine item are done.
+        spine_prefix = chunk_id.rsplit(".", 1)[0]
+        spine_chunk_ids = [cid for cid in all_chunk_ids if cid.startswith(spine_prefix + ".")]
+        if chunk_id == spine_chunk_ids[-1]:
+            # Last chunk in this spine item.
+            spine_item = next(
+                (si for si in manifest.spine if f"{si.spine_index:0{sw}d}" == spine_prefix),
+                None,
+            )
+            n_chunks = len(spine_chunk_ids)
+            label = spine_item.classification if spine_item else "unknown"
+            logger.info(
+                "Spine %s: translation complete (%d chunk%s, %s)",
+                spine_prefix,
+                n_chunks,
+                "s" if n_chunks != 1 else "",
+                label,
+            )
 
         if progress_cb is not None:
             progress_cb(

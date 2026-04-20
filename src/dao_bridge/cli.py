@@ -28,6 +28,209 @@ from dao_bridge.workdir import ensure_dirs, manifest_path
 # ---------------------------------------------------------------------------
 
 
+def _swap_logger_to_progress(progress, verbose: bool = False):
+    """Redirect the dao_bridge logger's Rich console handler through *progress*.
+
+    Returns a cleanup callable that restores the original handlers.
+    Rich internally coordinates output through the same console, so log
+    lines printed via the swapped handler won't fight with the progress bar.
+    """
+    import logging as _logging
+
+    from rich.logging import RichHandler
+
+    _logger = _logging.getLogger("dao_bridge")
+    old_handlers = []
+    for h in list(_logger.handlers):
+        if isinstance(h, RichHandler):
+            old_handlers.append(h)
+            _logger.removeHandler(h)
+    progress_handler = RichHandler(
+        level=_logging.DEBUG if verbose else _logging.INFO,
+        rich_tracebacks=True,
+        show_path=False,
+        markup=True,
+        console=progress.console,
+    )
+    progress_handler.setFormatter(_logging.Formatter("%(message)s", datefmt="[%X]"))
+    _logger.addHandler(progress_handler)
+
+    def _restore():
+        _logger.removeHandler(progress_handler)
+        for h in old_handlers:
+            _logger.addHandler(h)
+
+    return _restore
+
+
+def _run_translate_with_progress(
+    *,
+    work: Path,
+    config: AppConfig,
+    state,
+    manifest,
+    force: bool = False,
+    retry_failed: bool = False,
+    from_chunk: str | None = None,
+    to_chunk: str | None = None,
+    verbose: bool = False,
+) -> dict:
+    """Run the translate stage wrapped in a Rich Progress bar.
+
+    Returns the result dict from :func:`run_translate_stage`.
+    """
+    from rich.progress import (
+        BarColumn,
+        MofNCompleteColumn,
+        Progress,
+        TextColumn,
+        TimeElapsedColumn,
+        TimeRemainingColumn,
+    )
+
+    from dao_bridge.translate import TranslationProgress, run_translate_stage
+
+    start_time = time.monotonic()
+
+    progress = Progress(
+        TextColumn("Translating"),
+        BarColumn(bar_width=20),
+        MofNCompleteColumn(),
+        TextColumn("{task.fields[spine]}", style="cyan"),
+        TextColumn("{task.fields[chunk]}", style="bold"),
+        TextColumn("{task.fields[pass_name]}", style="dim"),
+        TextColumn("{task.fields[tokens]} tok", style="green"),
+        TextColumn("{task.fields[tok_per_sec]}/s", style="green dim"),
+        TextColumn("avg {task.fields[avg_time]}", style="dim"),
+        TimeElapsedColumn(),
+        TimeRemainingColumn(),
+        transient=True,
+        refresh_per_second=2,
+    )
+
+    task_id = None
+
+    def _on_progress(p: TranslationProgress) -> None:
+        nonlocal task_id
+        if task_id is None:
+            return
+        spine = p.chunk_id.rsplit(".", 1)[0] if "." in p.chunk_id else p.chunk_id
+        elapsed = time.monotonic() - start_time
+        avg = f"{elapsed / p.chunks_completed:.1f}s" if p.chunks_completed > 0 else "--"
+        tok_sec = f"{p.tokens_so_far / elapsed:.0f}" if elapsed > 0 and p.tokens_so_far else "--"
+        progress.update(
+            task_id,
+            completed=p.chunks_completed,
+            total=p.chunks_total,
+            spine=f"spine {spine}",
+            chunk=p.chunk_id,
+            pass_name=p.pass_name,
+            tokens=f"{p.tokens_so_far:,}",
+            tok_per_sec=tok_sec,
+            avg_time=avg,
+        )
+
+    with progress:
+        restore = _swap_logger_to_progress(progress, verbose=verbose)
+        try:
+            task_id = progress.add_task(
+                "Translating",
+                total=0,
+                spine="",
+                chunk="",
+                pass_name="",
+                tokens="0",
+                tok_per_sec="--",
+                avg_time="--",
+            )
+            result = run_translate_stage(
+                work_dir=work,
+                config=config,
+                state=state,
+                manifest=manifest,
+                force=force,
+                retry_failed=retry_failed,
+                from_chunk=from_chunk,
+                to_chunk=to_chunk,
+                on_progress=_on_progress,
+            )
+        finally:
+            restore()
+
+    return result
+
+
+def _run_glossary_build_with_progress(
+    *,
+    work: Path,
+    config: AppConfig,
+    state,
+    force: bool = False,
+    retry_failed: bool = False,
+    verbose: bool = False,
+):
+    """Run glossary-build wrapped in a Rich Progress bar.
+
+    Returns the :class:`Glossary` from :func:`glossary_build`.
+    """
+    from rich.progress import (
+        BarColumn,
+        Progress,
+        SpinnerColumn,
+        TextColumn,
+        TimeElapsedColumn,
+    )
+
+    from dao_bridge.glossary import glossary_build
+
+    progress = Progress(
+        SpinnerColumn(),
+        TextColumn("Building glossary"),
+        BarColumn(bar_width=20),
+        TextColumn("{task.fields[batch]}", style="bold"),
+        TextColumn("{task.fields[completed_text]}", style="cyan"),
+        TimeElapsedColumn(),
+        transient=True,
+        refresh_per_second=2,
+    )
+
+    completed_count = 0
+
+    def _on_progress(batch_id: str) -> None:
+        nonlocal completed_count
+        completed_count += 1
+        if task_id is not None:
+            progress.update(
+                task_id,
+                advance=1,
+                batch=batch_id,
+                completed_text=f"{completed_count} batches",
+            )
+
+    task_id = None
+    with progress:
+        restore = _swap_logger_to_progress(progress, verbose=verbose)
+        try:
+            task_id = progress.add_task(
+                "Building glossary",
+                total=None,
+                batch="",
+                completed_text="0 batches",
+            )
+            glossary = glossary_build(
+                work,
+                config,
+                state,
+                force=force,
+                retry_failed=retry_failed,
+                on_progress=_on_progress,
+            )
+        finally:
+            restore()
+
+    return glossary
+
+
 def _resolve_config(work_dir: Path) -> AppConfig:
     """Load config.yaml from the work directory."""
     cfg_path = work_dir / "config.yaml"
@@ -579,21 +782,14 @@ def glossary_build_cmd(ctx: click.Context, work_dir: str, force: bool, retry_fai
     config = _resolve_config(work)
     state = load_state(work)
 
-    from rich.progress import Progress
-
-    from dao_bridge.glossary import glossary_build
-
-    with Progress(transient=True) as progress:
-        task = progress.add_task("Building glossary...", total=None)
-
-        glossary = glossary_build(
-            work,
-            config,
-            state,
-            force=force,
-            retry_failed=retry_failed,
-            on_progress=lambda _: progress.advance(task),
-        )
+    glossary = _run_glossary_build_with_progress(
+        work=work,
+        config=config,
+        state=state,
+        force=force,
+        retry_failed=retry_failed,
+        verbose=ctx.obj["verbose"],
+    )
 
     click.echo(f"Glossary build complete: {len(glossary.entries)} entries extracted.")
 
@@ -776,67 +972,18 @@ def translate(
     if to_chunk is not None and from_chunk is None:
         raise click.ClickException("--to requires --from.")
 
-    from rich.live import Live
-    from rich.table import Table
-
-    from dao_bridge.translate import TranslationProgress, run_translate_stage
-
-    # Progress display state.
-    progress_state: dict = {
-        "chunk_id": "",
-        "pass_name": "",
-        "tokens": 0,
-        "completed": 0,
-        "total": 0,
-        "start_time": time.monotonic(),
-    }
-
-    def _build_progress_table() -> Table:
-        table = Table(show_header=False, show_edge=False, pad_edge=False)
-        table.add_column("Label", style="bold", width=22)
-        table.add_column("Value")
-        table.add_row("Chunk", progress_state["chunk_id"])
-        table.add_row("Stage", progress_state["pass_name"])
-        table.add_row("Completed", f"{progress_state['completed']}/{progress_state['total']}")
-        table.add_row("Tokens", f"{progress_state['tokens']:,}")
-
-        elapsed = time.monotonic() - progress_state["start_time"]
-        if progress_state["completed"] > 0:
-            avg_time = elapsed / progress_state["completed"]
-            remaining = progress_state["total"] - progress_state["completed"]
-            eta = avg_time * remaining
-            tok_per_sec = progress_state["tokens"] / elapsed if elapsed > 0 else 0
-            table.add_row("Avg time/chunk", f"{avg_time:.1f}s")
-            table.add_row("Tokens/sec", f"{tok_per_sec:.1f}")
-            table.add_row("ETA", f"{eta:.0f}s")
-
-        return table
-
-    def _on_progress(p: TranslationProgress) -> None:
-        progress_state["chunk_id"] = p.chunk_id
-        progress_state["pass_name"] = p.pass_name
-        progress_state["tokens"] = p.tokens_so_far
-        progress_state["completed"] = p.chunks_completed
-        progress_state["total"] = p.chunks_total
-
     try:
-        with Live(_build_progress_table(), refresh_per_second=2, transient=True) as live:
-
-            def _on_progress_live(p: TranslationProgress) -> None:
-                _on_progress(p)
-                live.update(_build_progress_table())
-
-            result = run_translate_stage(
-                work_dir=work,
-                config=config,
-                state=state,
-                manifest=manifest,
-                force=force,
-                retry_failed=retry_failed,
-                from_chunk=from_chunk,
-                to_chunk=to_chunk,
-                on_progress=_on_progress_live,
-            )
+        result = _run_translate_with_progress(
+            work=work,
+            config=config,
+            state=state,
+            manifest=manifest,
+            force=force,
+            retry_failed=retry_failed,
+            from_chunk=from_chunk,
+            to_chunk=to_chunk,
+            verbose=ctx.obj["verbose"],
+        )
     except KeyboardInterrupt:
         click.echo("\nTranslation interrupted by user.")
         sys.exit(1)
@@ -998,9 +1145,14 @@ def run(ctx: click.Context, work_dir: str, force: bool, retry_failed: bool) -> N
 
     # --- Stage 5: glossary-build ---
     def _glossary_build():
-        from dao_bridge.glossary import glossary_build
-
-        glossary = glossary_build(work, config, state, force=force, retry_failed=retry_failed)
+        glossary = _run_glossary_build_with_progress(
+            work=work,
+            config=config,
+            state=state,
+            force=force,
+            retry_failed=retry_failed,
+            verbose=ctx.obj["verbose"],
+        )
         click.echo(f"  {len(glossary.entries)} entries extracted")
 
     _run_stage("glossary-build", _glossary_build)
@@ -1025,15 +1177,14 @@ def run(ctx: click.Context, work_dir: str, force: bool, retry_failed: bool) -> N
         nonlocal manifest
         manifest = Manifest(**json.loads(mp.read_text(encoding="utf-8")))
 
-        from dao_bridge.translate import run_translate_stage
-
-        result = run_translate_stage(
-            work_dir=work,
+        result = _run_translate_with_progress(
+            work=work,
             config=config,
             state=state,
             manifest=manifest,
             force=force,
             retry_failed=retry_failed,
+            verbose=ctx.obj["verbose"],
         )
         if result["error"] is not None:
             raise RuntimeError(

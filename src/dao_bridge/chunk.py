@@ -676,7 +676,7 @@ def chunk_all(
             mark_item_completed(work_dir, state, "chunk", padded)
             chunked += 1
             total_chunks += n_chunks
-            logger.debug(
+            logger.info(
                 "Spine %s: produced %d chunk(s)",
                 padded,
                 n_chunks,

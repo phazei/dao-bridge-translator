@@ -803,3 +803,102 @@ class TestPackingEdgeCases:
         assert len(chunks) >= 2
         # First chunk should end at block 3 (the heading, latest break in flex).
         assert chunks[0].block_range[1] == 3
+
+
+# =========================================================================
+# chunk_all orchestrator — targeted --spine and --force
+# =========================================================================
+
+
+class TestChunkAllTargetedSpine:
+    """Tests for --spine overriding completed state and targeted --force."""
+
+    @staticmethod
+    def _setup(tmp_path: Path):
+        """Create a two-item manifest with clean markdown files."""
+        from dao_bridge.chunk import chunk_all
+        from dao_bridge.config import AppConfig
+        from dao_bridge.schemas import Manifest, ManifestItem as MI
+        from dao_bridge.state import is_stage_completed, load_state
+        from dao_bridge.workdir import ensure_dirs, manifest_path, pad_spine
+
+        work_dir = tmp_path / "work"
+        ensure_dirs(work_dir)
+        (work_dir / "clean").mkdir(parents=True, exist_ok=True)
+        (work_dir / "chunks").mkdir(parents=True, exist_ok=True)
+
+        # Write clean markdown for two chapters.
+        md = _make_paragraphs(5, sentences_per=20)  # ~1000 tokens, 1 chunk each
+        (work_dir / "clean" / "0001.md").write_text(md, encoding="utf-8")
+        (work_dir / "clean" / "0002.md").write_text(md, encoding="utf-8")
+
+        item1 = MI(
+            spine_index=1,
+            original_href="text/001.xhtml",
+            raw_path="raw/001.xhtml",
+            clean_path="clean/0001.md",
+            classification="chapter",
+        )
+        item2 = MI(
+            spine_index=2,
+            original_href="text/002.xhtml",
+            raw_path="raw/002.xhtml",
+            clean_path="clean/0002.md",
+            classification="chapter",
+        )
+        manifest = Manifest(
+            source_epub_path="dummy.epub",
+            book_id="test",
+            spine=[item1, item2],
+        )
+        from dao_bridge.workdir import atomic_write
+
+        atomic_write(manifest_path(work_dir), manifest.model_dump_json(indent=2))
+
+        config = AppConfig(source_epub="dummy.epub", work_dir=str(work_dir))
+        return work_dir, manifest, config, chunk_all, load_state, is_stage_completed
+
+    def test_spine_overrides_completed_state(self, tmp_path: Path):
+        """--spine N rechunks even if the item is already completed."""
+        work_dir, manifest, config, chunk_all, load_state, is_stage_completed = self._setup(
+            tmp_path
+        )
+
+        # First run: chunk all.
+        state = load_state(work_dir)
+        chunk_all(config, manifest, state, force=False)
+
+        assert is_stage_completed(load_state(work_dir), "chunk")
+
+        # Run with --spine 1 (no --force). Should rechunk item 1.
+        state2 = load_state(work_dir)
+        result = chunk_all(config, manifest, state2, spine_filter=1)
+
+        # Item 1 should have been rechunked (chunk_count set).
+        assert result.spine[0].chunk_count is not None and result.spine[0].chunk_count > 0
+
+    def test_spine_preserves_other_items_state(self, tmp_path: Path):
+        """--spine N does not reset state for other items."""
+        work_dir, manifest, config, chunk_all, load_state, _ = self._setup(tmp_path)
+
+        state = load_state(work_dir)
+        chunk_all(config, manifest, state, force=False)
+
+        state2 = load_state(work_dir)
+        chunk_all(config, manifest, state2, spine_filter=1)
+
+        state3 = load_state(work_dir)
+        assert state3.items["chunk:0002"].status == "completed"
+
+    def test_force_with_spine_is_targeted(self, tmp_path: Path):
+        """--force --spine N only resets the targeted item."""
+        work_dir, manifest, config, chunk_all, load_state, _ = self._setup(tmp_path)
+
+        state = load_state(work_dir)
+        chunk_all(config, manifest, state, force=False)
+
+        state2 = load_state(work_dir)
+        chunk_all(config, manifest, state2, force=True, spine_filter=1)
+
+        state3 = load_state(work_dir)
+        assert state3.items["chunk:0002"].status == "completed"

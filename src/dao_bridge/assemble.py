@@ -29,6 +29,7 @@ from dao_bridge.state import (
     mark_stage_started,
     reopen_stage,
     reset_stage,
+    reset_stage_items,
 )
 from dao_bridge.workdir import (
     assembled_path,
@@ -232,11 +233,15 @@ def assemble_all(
     else:
         items = list(manifest.spine)
 
-    if force:
-        reset_stage(work_dir, state, "assemble")
+    # Build item ID list (used by multiple blocks below).
+    item_ids = [pad_spine(item.spine_index, sw) for item in items]
 
-    # Handle --retry-failed: re-open a completed stage without wiping items.
-    if retry_failed and not force:
+    # --spine implies force for the targeted item(s).
+    if spine_filter is not None:
+        reset_stage_items(work_dir, state, "assemble", item_ids)
+    elif force:
+        reset_stage(work_dir, state, "assemble")
+    elif retry_failed:
         reopen_stage(work_dir, state, "assemble")
 
     if (
@@ -250,8 +255,7 @@ def assemble_all(
 
     mark_stage_started(work_dir, state, "assemble")
 
-    # Build list of item IDs for pending check.
-    item_ids = [pad_spine(item.spine_index, sw) for item in items]
+    # Build pending item list.
     pending = set(iter_pending_items(state, "assemble", item_ids))
 
     assembled_count = 0

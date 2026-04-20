@@ -902,23 +902,18 @@ def run_translate_stage(
     all_chunk_ids = _enumerate_chunk_ids(manifest)
     target_ids = _filter_chunk_range(all_chunk_ids, from_chunk, to_chunk)
 
-    if force:
-        targeted = from_chunk is not None or to_chunk is not None
-        if targeted:
-            # Only reset the specific chunks being retranslated —
-            # preserve state for all other items.
-            reset_stage_items(work_dir, state, _STAGE, target_ids)
-        else:
-            reset_stage(work_dir, state, _STAGE)
-
-    # Handle --retry-failed: re-open a completed stage without wiping items.
-    if retry_failed and not force:
+    # Targeted range (--chunk, --spine, --from/--to) implies force for
+    # those chunks.
+    targeted = from_chunk is not None or to_chunk is not None
+    if targeted:
+        reset_stage_items(work_dir, state, _STAGE, target_ids)
+    elif force:
+        reset_stage(work_dir, state, _STAGE)
+    elif retry_failed:
         reopen_stage(work_dir, state, _STAGE)
 
     # Determine which chunks need work.
-    pending_ids = iter_pending_items(state, _STAGE, target_ids)
-    if not force:
-        target_ids = pending_ids
+    target_ids = iter_pending_items(state, _STAGE, target_ids)
 
     mark_stage_started(work_dir, state, _STAGE)
 
@@ -1133,13 +1128,10 @@ def run_translate_stage(
 
     # All chunks completed.
     # Only mark stage completed if we processed the full book (no range filter).
-    if from_chunk is None and to_chunk is None and not force:
-        # Check all chunk IDs are completed.
+    if not targeted:
         remaining = iter_pending_items(state, _STAGE, all_chunk_ids)
         if not remaining:
             mark_stage_completed(work_dir, state, _STAGE)
-    elif from_chunk is None and to_chunk is None and force:
-        mark_stage_completed(work_dir, state, _STAGE)
 
     return {
         "completed": completed_count,

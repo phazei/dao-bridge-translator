@@ -39,6 +39,7 @@ from dao_bridge.state import (
     mark_stage_started,
     reopen_stage,
     reset_stage,
+    reset_stage_items,
 )
 from dao_bridge.workdir import atomic_write, manifest_path, pad_spine
 
@@ -405,18 +406,25 @@ def run_classify_stage(
     else:
         items = list(manifest.spine)
 
-    # Handle --force.
-    if force:
+    # Build item ID list (used by multiple blocks below).
+    item_ids = [pad_spine(item.spine_index, sw) for item in items]
+
+    # --spine implies force for the targeted item(s).
+    if spine_filter is not None:
+        reset_stage_items(work_dir, state, "classify", item_ids)
+        for item in items:
+            item.classification = None
+            item.title = None
+    elif force:
         reset_stage(work_dir, state, "classify")
         for item in items:
             item.classification = None
             item.title = None
-
-    # Handle --retry-failed: re-open a completed stage without wiping items.
-    if retry_failed and not force:
+    elif retry_failed:
         reopen_stage(work_dir, state, "classify")
 
-    # Skip if already completed.
+    # Skip if already completed (only when processing all items with no
+    # explicit flags).
     if (
         not force
         and not retry_failed
@@ -429,8 +437,22 @@ def run_classify_stage(
     mark_stage_started(work_dir, state, "classify")
 
     # Build pending item list.
-    item_ids = [pad_spine(item.spine_index, sw) for item in items]
     pending = set(iter_pending_items(state, "classify", item_ids))
+
+    # Option A: consistency auto-repair.  If an item's state says
+    # "completed" but the manifest still has classification=None,
+    # the data is inconsistent (e.g. from an interrupted run).
+    # Reset such items so they are reprocessed.
+    for item in items:
+        padded = pad_spine(item.spine_index, sw)
+        if padded not in pending and item.classification is None:
+            logger.warning(
+                "Spine %s: state says completed but classification is None "
+                "— resetting for reclassification",
+                padded,
+            )
+            reset_stage_items(work_dir, state, "classify", [padded])
+            pending.add(padded)
 
     # Create LLM client lazily.
     _llm_client: LLMClient | None = None

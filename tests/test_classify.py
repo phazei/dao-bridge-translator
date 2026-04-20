@@ -804,3 +804,186 @@ class TestClassificationResponse:
             reasoning="Just an image",
         )
         assert resp.title is None
+
+
+# ---------------------------------------------------------------------------
+# Targeted --spine and consistency auto-repair
+# ---------------------------------------------------------------------------
+
+
+class TestTargetedSpine:
+    """Tests for --spine overriding completed state and targeted --force."""
+
+    def test_spine_overrides_completed_state(self, tmp_path):
+        """--spine N reclassifies the item even if it's already completed in state."""
+        work_dir = tmp_path / "work"
+        ensure_dirs(work_dir)
+        config = _make_config(work_dir)
+        _make_manifest(work_dir, n_items=3)
+        _write_raw_and_clean(work_dir, 0, TOC_XHTML, "")
+        _write_raw_and_clean(work_dir, 1, PROSE_XHTML, PROSE_CLEAN_MD)
+        _write_raw_and_clean(work_dir, 2, PROSE_XHTML, PROSE_CLEAN_MD)
+
+        state = load_state(work_dir)
+
+        # First run: classify all items.
+        with patch("dao_bridge.classify.LLMClient") as mock_llm_cls:
+            mock_client = MagicMock()
+            mock_client.complete_json.return_value = _mock_llm_response(classification="chapter")
+            mock_llm_cls.return_value = mock_client
+            run_classify_stage(work_dir, config, state, force=False)
+
+        # All items should be completed now.
+        state2 = load_state(work_dir)
+        assert state2.items["classify:0001"].status == "completed"
+
+        # Now run with --spine 1 (no --force).  Should reclassify item 1.
+        with patch("dao_bridge.classify.LLMClient") as mock_llm_cls2:
+            mock_client2 = MagicMock()
+            mock_client2.complete_json.return_value = _mock_llm_response(
+                classification="frontmatter"
+            )
+            mock_llm_cls2.return_value = mock_client2
+            result = run_classify_stage(work_dir, config, state2, spine_filter=1)
+
+        # Item 1 should be reclassified.
+        assert result.spine[1].classification == "frontmatter"
+        # LLM should have been called exactly once.
+        assert mock_client2.complete_json.call_count == 1
+
+    def test_spine_preserves_other_items_state(self, tmp_path):
+        """--spine N does not reset state for other items."""
+        work_dir = tmp_path / "work"
+        ensure_dirs(work_dir)
+        config = _make_config(work_dir)
+        _make_manifest(work_dir, n_items=3)
+        _write_raw_and_clean(work_dir, 0, TOC_XHTML, "")
+        _write_raw_and_clean(work_dir, 1, PROSE_XHTML, PROSE_CLEAN_MD)
+        _write_raw_and_clean(work_dir, 2, PROSE_XHTML, PROSE_CLEAN_MD)
+
+        state = load_state(work_dir)
+
+        # First run: classify all.
+        with patch("dao_bridge.classify.LLMClient") as mock_llm_cls:
+            mock_client = MagicMock()
+            mock_client.complete_json.return_value = _mock_llm_response()
+            mock_llm_cls.return_value = mock_client
+            run_classify_stage(work_dir, config, state, force=False)
+
+        state2 = load_state(work_dir)
+
+        # Run with --spine 1.
+        with patch("dao_bridge.classify.LLMClient") as mock_llm_cls2:
+            mock_client2 = MagicMock()
+            mock_client2.complete_json.return_value = _mock_llm_response()
+            mock_llm_cls2.return_value = mock_client2
+            run_classify_stage(work_dir, config, state2, spine_filter=1)
+
+        # Other items' state should still be completed.
+        state3 = load_state(work_dir)
+        assert state3.items["classify:0000"].status == "completed"
+        assert state3.items["classify:0002"].status == "completed"
+
+    def test_force_with_spine_is_targeted(self, tmp_path):
+        """--force --spine N only resets the targeted item, not all items."""
+        work_dir = tmp_path / "work"
+        ensure_dirs(work_dir)
+        config = _make_config(work_dir)
+        _make_manifest(work_dir, n_items=3)
+        _write_raw_and_clean(work_dir, 0, TOC_XHTML, "")
+        _write_raw_and_clean(work_dir, 1, PROSE_XHTML, PROSE_CLEAN_MD)
+        _write_raw_and_clean(work_dir, 2, PROSE_XHTML, PROSE_CLEAN_MD)
+
+        state = load_state(work_dir)
+
+        # First run: classify all.
+        with patch("dao_bridge.classify.LLMClient") as mock_llm_cls:
+            mock_client = MagicMock()
+            mock_client.complete_json.return_value = _mock_llm_response()
+            mock_llm_cls.return_value = mock_client
+            run_classify_stage(work_dir, config, state, force=False)
+
+        state2 = load_state(work_dir)
+
+        # Force reclassify only item 1.
+        with patch("dao_bridge.classify.LLMClient") as mock_llm_cls2:
+            mock_client2 = MagicMock()
+            mock_client2.complete_json.return_value = _mock_llm_response(
+                classification="backmatter"
+            )
+            mock_llm_cls2.return_value = mock_client2
+            result = run_classify_stage(work_dir, config, state2, force=True, spine_filter=1)
+
+        # Item 1 reclassified.
+        assert result.spine[1].classification == "backmatter"
+        # Other items' state preserved.
+        state3 = load_state(work_dir)
+        assert state3.items["classify:0000"].status == "completed"
+        assert state3.items["classify:0002"].status == "completed"
+
+
+class TestConsistencyAutoRepair:
+    """Tests for Option A: state=completed but classification=None auto-repair."""
+
+    def test_completed_but_null_classification_is_repaired(self, tmp_path):
+        """Item with state=completed but classification=None is reclassified."""
+        work_dir = tmp_path / "work"
+        ensure_dirs(work_dir)
+        config = _make_config(work_dir)
+
+        # Create manifest with item 0 unclassified (classification=None).
+        _make_manifest(work_dir, n_items=2)
+        _write_raw_and_clean(work_dir, 0, PROSE_XHTML, PROSE_CLEAN_MD)
+        _write_raw_and_clean(work_dir, 1, PROSE_XHTML, PROSE_CLEAN_MD)
+
+        state = load_state(work_dir)
+
+        # Manually mark item 0 as completed in state (simulating the bug).
+        from dao_bridge.state import mark_item_completed, mark_stage_started
+
+        mark_stage_started(work_dir, state, "classify")
+        mark_item_completed(work_dir, state, "classify", "0000")
+        mark_item_completed(work_dir, state, "classify", "0001")
+
+        # Verify the inconsistency: state says completed, manifest says None.
+        assert state.items["classify:0000"].status == "completed"
+
+        with patch("dao_bridge.classify.LLMClient") as mock_llm_cls:
+            mock_client = MagicMock()
+            mock_client.complete_json.return_value = _mock_llm_response(classification="chapter")
+            mock_llm_cls.return_value = mock_client
+
+            result = run_classify_stage(work_dir, config, state, force=False)
+
+        # Both items should now be classified (auto-repair triggered for both).
+        assert result.spine[0].classification == "chapter"
+        assert result.spine[1].classification == "chapter"
+
+    def test_completed_with_classification_not_repaired(self, tmp_path):
+        """Item with state=completed and valid classification is NOT reclassified."""
+        work_dir = tmp_path / "work"
+        ensure_dirs(work_dir)
+        config = _make_config(work_dir)
+
+        # Item 0 has a valid classification.
+        _make_manifest(work_dir, n_items=1, classifications=["backmatter"])
+        _write_raw_and_clean(work_dir, 0, PROSE_XHTML, PROSE_CLEAN_MD)
+
+        state = load_state(work_dir)
+
+        # Classify normally.
+        with patch("dao_bridge.classify.LLMClient") as mock_llm_cls:
+            mock_client = MagicMock()
+            mock_llm_cls.return_value = mock_client
+            run_classify_stage(work_dir, config, state, force=False)
+
+        # On second run, item should be skipped (not reclassified).
+        state2 = load_state(work_dir)
+        with patch("dao_bridge.classify.LLMClient") as mock_llm_cls2:
+            mock_client2 = MagicMock()
+            mock_llm_cls2.return_value = mock_client2
+            result = run_classify_stage(work_dir, config, state2, force=False)
+
+        assert result.spine[0].classification == "backmatter"
+        # LLM should not have been called.
+        mock_client2.complete_json.assert_not_called()

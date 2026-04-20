@@ -347,3 +347,99 @@ class TestDeferredItemsPreventsStageCompletion:
 
         assert assembled_path(work_dir, 1).exists()
         assert assembled_path(work_dir, 2).exists()
+
+
+# ---------------------------------------------------------------------------
+# Targeted --spine and targeted --force
+# ---------------------------------------------------------------------------
+
+
+class TestTargetedSpineAssemble:
+    """Tests for --spine overriding completed state and targeted --force."""
+
+    def _make_two_item_setup(self, tmp_path: Path):
+        """Create a two-item manifest with chunks and translations."""
+        work_dir = _setup_work_dir(tmp_path)
+        ensure_dirs(work_dir)
+
+        item1 = ManifestItem(
+            spine_index=1,
+            original_href="text/001.xhtml",
+            raw_path="raw/001.xhtml",
+            clean_path="clean/001.md",
+            classification="chapter",
+            chunk_count=1,
+        )
+        item2 = ManifestItem(
+            spine_index=2,
+            original_href="text/002.xhtml",
+            raw_path="raw/002.xhtml",
+            clean_path="clean/002.md",
+            classification="chapter",
+            chunk_count=1,
+        )
+        manifest = Manifest(
+            source_epub_path="dummy.epub",
+            book_id="test",
+            spine=[item1, item2],
+        )
+
+        _write_chunk(work_dir, 1, 1, "Source one")
+        _write_chunk(work_dir, 2, 1, "Source two")
+        _write_translation(work_dir, 1, 1, "Trans one.")
+        _write_translation(work_dir, 2, 1, "Trans two.")
+
+        config = _make_config(work_dir)
+        return work_dir, manifest, config
+
+    def test_spine_overrides_completed_state(self, tmp_path: Path):
+        """--spine N reassembles even if the item is already completed."""
+        work_dir, manifest, config = self._make_two_item_setup(tmp_path)
+
+        # First run: assemble all.
+        state = load_state(work_dir)
+        assemble_all(config, manifest, state, force=False)
+
+        assert is_stage_completed(load_state(work_dir), "assemble")
+
+        # Update translation for item 1.
+        _write_translation(work_dir, 1, 1, "Updated trans one.")
+
+        # Run with --spine 1 (no --force). Should reassemble item 1.
+        state2 = load_state(work_dir)
+        assemble_all(config, manifest, state2, spine_filter=1)
+
+        from dao_bridge.workdir import assembled_path
+
+        content = assembled_path(work_dir, 1).read_text(encoding="utf-8")
+        assert "Updated trans one." in content
+
+    def test_spine_preserves_other_items_state(self, tmp_path: Path):
+        """--spine N does not reset state for other items."""
+        work_dir, manifest, config = self._make_two_item_setup(tmp_path)
+
+        state = load_state(work_dir)
+        assemble_all(config, manifest, state, force=False)
+
+        # Run with --spine 1.
+        state2 = load_state(work_dir)
+        assemble_all(config, manifest, state2, spine_filter=1)
+
+        # Item 2's state should still be completed.
+        state3 = load_state(work_dir)
+        assert state3.items["assemble:0002"].status == "completed"
+
+    def test_force_with_spine_is_targeted(self, tmp_path: Path):
+        """--force --spine N only resets the targeted item."""
+        work_dir, manifest, config = self._make_two_item_setup(tmp_path)
+
+        state = load_state(work_dir)
+        assemble_all(config, manifest, state, force=False)
+
+        # Force reassemble only item 1.
+        state2 = load_state(work_dir)
+        assemble_all(config, manifest, state2, force=True, spine_filter=1)
+
+        # Item 2's state should still be completed.
+        state3 = load_state(work_dir)
+        assert state3.items["assemble:0002"].status == "completed"

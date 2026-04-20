@@ -38,6 +38,7 @@ from dao_bridge.state import (
     mark_stage_started,
     reopen_stage,
     reset_stage,
+    reset_stage_items,
 )
 from dao_bridge.workdir import (
     atomic_write,
@@ -605,11 +606,15 @@ def chunk_all(
     else:
         items = list(manifest.spine)
 
-    if force:
-        reset_stage(work_dir, state, "chunk")
+    # Build item ID list (used by multiple blocks below).
+    item_ids = [pad_spine(item.spine_index, sw) for item in items]
 
-    # Handle --retry-failed: re-open a completed stage without wiping items.
-    if retry_failed and not force:
+    # --spine implies force for the targeted item(s).
+    if spine_filter is not None:
+        reset_stage_items(work_dir, state, "chunk", item_ids)
+    elif force:
+        reset_stage(work_dir, state, "chunk")
+    elif retry_failed:
         reopen_stage(work_dir, state, "chunk")
 
     if (
@@ -623,8 +628,7 @@ def chunk_all(
 
     mark_stage_started(work_dir, state, "chunk")
 
-    # Build list of item IDs for pending check.
-    item_ids = [pad_spine(item.spine_index, sw) for item in items]
+    # Build pending item list.
     pending = set(iter_pending_items(state, "chunk", item_ids))
 
     skipped = 0
@@ -665,8 +669,8 @@ def chunk_all(
         mark_item_started(work_dir, state, "chunk", padded)
 
         try:
-            # Delete existing chunks if forcing.
-            if force:
+            # Delete existing chunks when forcing or targeting a specific spine.
+            if force or spine_filter is not None:
                 cd = chunk_dir(work_dir, item.spine_index, sw)
                 if cd.exists():
                     shutil.rmtree(cd)

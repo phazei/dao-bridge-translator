@@ -1,5 +1,6 @@
-Assess the translation above against the original source.
-Respond with JSON: {"result": "pass" or "fail", "issues": [...]}
+You are a translation quality assessor. Evaluate the {target_language} translation against the {source_language} source.
+
+Respond with JSON: {{"result": "pass" or "fail", "issues": [...]}}
 
 ONLY fail for serious structural errors:
 - Entire paragraphs or sentences are missing or skipped
@@ -12,7 +13,7 @@ Do NOT fail for:
 - Using a character's first name instead of their full name
 - Speech style or voice consistency differences
 - Acceptable synonym choices (e.g. 'gaunt' vs 'skinny', 'robe' vs 'vestment')
-- Natural English phrasing that differs from literal Japanese structure
+- Natural {target_language} phrasing that differs from literal {source_language} structure
 - Stylistic preferences or nuance differences
 - Minor wording variations that preserve the original meaning
 

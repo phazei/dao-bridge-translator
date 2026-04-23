@@ -1,1 +1,9 @@
+Here is the original {source_language} source text:
+
+{source_text}
+
+And here is the draft {target_language} translation:
+
+{draft_translation}
+
 Please polish the translation above for readability and natural {target_language} flow. Output only the polished translation.

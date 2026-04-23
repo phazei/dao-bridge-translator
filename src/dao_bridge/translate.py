@@ -12,9 +12,8 @@ Translates chunked source text using a multi-pass LLM pipeline:
 4. **Rolling summary** (optional) — generates a short narrative summary
    appended to a sliding-window context file.
 
-All passes within a single chunk are executed as a progressively-extended
-conversation to benefit from prefix caching on servers that support it
-(llama-server, vLLM).
+Each pass uses a fresh conversation with only the context it needs,
+keeping token usage lean.
 """
 
 from __future__ import annotations
@@ -137,6 +136,18 @@ def _load_prompt_template(name: str) -> str:
 # ---------------------------------------------------------------------------
 
 _ANALYSIS_RE = re.compile(r"<analysis>.*?</analysis>\s*", re.DOTALL)
+
+
+def _extract_analysis(text: str) -> str | None:
+    """Extract the ``<analysis>...</analysis>`` block from Pass 1 LLM output.
+
+    Returns the full tagged block (including ``<analysis>`` tags), or
+    ``None`` if no analysis block is found.
+    """
+    match = _ANALYSIS_RE.search(text)
+    if match:
+        return match.group(0).strip()
+    return None
 
 
 def _strip_analysis(text: str) -> str:
@@ -494,14 +505,30 @@ def build_pass1_messages(
     return messages
 
 
-def extend_pass2_messages(
-    messages: list[dict],
+def build_pass2_messages(
+    source_text: str,
     pass1_response: str,
     config: AppConfig,
 ) -> list[dict]:
-    """Append Pass 2 (polish) messages to the conversation.
+    """Build a fresh message list for Pass 2 (polish).
 
-    Mutates and returns *messages* for prefix-cache friendliness.
+    Contains only the source text and the Pass 1 draft — no overlap,
+    glossary, or rolling summary.  These are unnecessary for polishing
+    and would bloat the context.
+
+    Parameters
+    ----------
+    source_text:
+        Original source text for the chunk.
+    pass1_response:
+        The Pass 1 translation output.
+    config:
+        Application config.
+
+    Returns
+    -------
+    list[dict]
+        OpenAI chat-format message list (system + user).
     """
     source_lang = resolve_language_name(config.languages.source)
     target_lang = resolve_language_name(config.languages.target)
@@ -510,37 +537,67 @@ def extend_pass2_messages(
         source_language=source_lang,
         target_language=target_lang,
     )
+
     user_template = _load_prompt_template("translate_pass2_user.txt")
     user_content = user_template.format(
+        source_language=source_lang,
         target_language=target_lang,
+        source_text=source_text,
+        draft_translation=pass1_response,
     )
 
-    messages.append({"role": "assistant", "content": pass1_response})
-    messages.append({"role": "system", "content": system_content})
-    messages.append({"role": "user", "content": user_content})
-    return messages
+    return [
+        {"role": "system", "content": system_content},
+        {"role": "user", "content": user_content},
+    ]
 
 
-def extend_qa_messages(
-    messages: list[dict],
+def build_qa_messages(
+    source_text: str,
     final_translation: str,
     config: AppConfig,
 ) -> list[dict]:
-    """Append QA assessment messages to the conversation.
+    """Build a fresh message list for QA assessment.
 
-    Mutates and returns *messages*.
+    Contains only the source text and the final translation — no overlap,
+    glossary, or rolling summary.  The QA judge only needs to compare
+    source against output.
+
+    Parameters
+    ----------
+    source_text:
+        Original source text for the chunk.
+    final_translation:
+        The final translation to assess (Pass 2 or Pass 1).
+    config:
+        Application config.
+
+    Returns
+    -------
+    list[dict]
+        OpenAI chat-format message list (system + user).
     """
-    qa_prompt = _load_prompt_template("translate_qa.txt")
+    source_lang = resolve_language_name(config.languages.source)
+    target_lang = resolve_language_name(config.languages.target)
 
-    messages.append({"role": "assistant", "content": final_translation})
-    messages.append(
-        {
-            "role": "system",
-            "content": "Assess translation quality. Respond in JSON only.",
-        }
+    system_template = _load_prompt_template("translate_qa.txt")
+    system_content = system_template.format(
+        source_language=source_lang,
+        target_language=target_lang,
     )
-    messages.append({"role": "user", "content": qa_prompt})
-    return messages
+
+    user_template = _load_prompt_template("translate_qa_user.txt")
+    user_content = user_template.format(
+        source_language=source_lang,
+        target_language=target_lang,
+        source_text=source_text,
+        translated_text=final_translation,
+    )
+
+    return [
+        {"role": "system", "content": system_content},
+        {"role": "user", "content": user_content},
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -692,7 +749,9 @@ def translate_chunk(
     # --- Pass 1 ---
     messages = build_pass1_messages(chunk, glossary, overlap, rolling_summaries, config)
     result1 = llm_client.complete(messages)
-    pass1_text = _strip_analysis(result1.text)
+    pass1_raw = result1.text
+    pass1_analysis = _extract_analysis(pass1_raw)
+    pass1_text = _strip_analysis(pass1_raw)
     model_used = result1.model or llm_client.config.model
 
     # --- Pass 2 (revision) ---
@@ -700,7 +759,7 @@ def translate_chunk(
     final_text = pass1_text
 
     if tp.double_pass:
-        messages = extend_pass2_messages(messages, pass1_text, config)
+        messages = build_pass2_messages(chunk.text, pass1_text, config)
         result2 = llm_client.complete(messages)
         final_text = result2.text.strip()
         pass_count = 2
@@ -716,9 +775,9 @@ def translate_chunk(
             qa_result_val = prog_result.result
             qa_issues = prog_result.issues
         else:
-            # LLM judge — extend the same message list for prefix caching.
+            # LLM judge — fresh conversation with source + translation only.
             # Token usage is tracked automatically by the client.
-            messages = extend_qa_messages(messages, final_text, config)
+            messages = build_qa_messages(chunk.text, final_text, config)
             try:
                 qa_resp: QAResponse = llm_client.complete_json(  # type: ignore[assignment]
                     messages,
@@ -750,6 +809,7 @@ def translate_chunk(
         chunk_id=chunk.chunk_id,
         source_text=chunk.text,
         pass1_translation=pass1_text,
+        pass1_analysis=pass1_analysis,
         translated_text=final_text,
         pass_count=pass_count,
         qa_result=qa_result_val,

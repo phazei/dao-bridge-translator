@@ -189,6 +189,7 @@ class TranslatedChunk(BaseModel):
     chunk_id: str
     source_text: str  # copy of Japanese source
     pass1_translation: str  # Pass 1 output, kept for debugging
+    pass1_analysis: str | None = None  # <analysis> block from Pass 1 (stripped from translation)
     translated_text: str  # final: Pass 2 if double_pass, else Pass 1
     pass_count: int  # 1 or 2
     qa_result: Literal["pass", "fail"] | None = None  # None if QA disabled

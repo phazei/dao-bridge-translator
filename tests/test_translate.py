@@ -35,14 +35,15 @@ from dao_bridge.translate import (
     QAResponse,
     TranslationProgress,
     _enumerate_chunk_ids,
+    _extract_analysis,
     _filter_chunk_range,
     _load_rolling_summaries,
     _save_rolling_summaries,
     _strip_analysis,
     _update_rolling_summary,
     build_pass1_messages,
-    extend_pass2_messages,
-    extend_qa_messages,
+    build_pass2_messages,
+    build_qa_messages,
     load_overlap,
     programmatic_qa_check,
     render_glossary,
@@ -455,6 +456,43 @@ class TestStripAnalysis:
         assert _strip_analysis(text) == "Translation."
 
 
+class TestExtractAnalysis:
+    """Tests for _extract_analysis()."""
+
+    def test_extracts_analysis_block(self):
+        """Returns the full tagged analysis block."""
+        text = "<analysis>\nSome notes here.\n</analysis>\nThe translation text."
+        result = _extract_analysis(text)
+        assert result is not None
+        assert "<analysis>" in result
+        assert "Some notes here." in result
+        assert "</analysis>" in result
+
+    def test_no_analysis_returns_none(self):
+        """When no analysis block is present, returns None."""
+        text = "Just the translation."
+        assert _extract_analysis(text) is None
+
+    def test_multiline_analysis(self):
+        """Multi-line analysis blocks are fully captured."""
+        text = (
+            "<analysis>\nLine 1\nLine 2\n**Bold**: stuff\n</analysis>\n"
+            "Paragraph one.\n\nParagraph two."
+        )
+        result = _extract_analysis(text)
+        assert result is not None
+        assert "Line 1" in result
+        assert "Line 2" in result
+        assert "**Bold**: stuff" in result
+
+    def test_empty_analysis(self):
+        """An empty analysis block is still returned."""
+        text = "<analysis></analysis>Translation."
+        result = _extract_analysis(text)
+        assert result is not None
+        assert result == "<analysis></analysis>"
+
+
 # =========================================================================
 # Message construction
 # =========================================================================
@@ -618,51 +656,72 @@ class TestBuildPass1Messages:
         assert chunk.text in messages[7]["content"]
 
 
-class TestExtendPass2Messages:
-    """Tests for extend_pass2_messages()."""
+class TestBuildPass2Messages:
+    """Tests for build_pass2_messages()."""
 
-    def test_appends_assistant_system_user(self, tmp_path: Path):
-        """Pass 2 appends assistant (pass 1 output), system, and user."""
+    def test_fresh_system_and_user_messages(self, tmp_path: Path):
+        """Pass 2 builds a fresh system + user message list with source
+        and draft translation."""
         work_dir = _setup_work_dir(tmp_path)
         config = _make_config(work_dir)
-        messages = [
-            {"role": "system", "content": "system prompt"},
-            {"role": "user", "content": "translate this"},
-        ]
 
-        result = extend_pass2_messages(messages, "pass1 output", config)
+        result = build_pass2_messages("original source", "pass1 output", config)
 
-        # Original 2 + 3 new = 5.
-        assert len(result) == 5
-        assert result[2]["role"] == "assistant"
-        assert result[2]["content"] == "pass1 output"
-        assert result[3]["role"] == "system"
-        assert "polish" in result[3]["content"].lower()
-        assert result[4]["role"] == "user"
-        assert "polish" in result[4]["content"].lower()
+        # Exactly 2 messages: system + user.
+        assert len(result) == 2
+        assert result[0]["role"] == "system"
+        assert "polish" in result[0]["content"].lower()
+        assert result[1]["role"] == "user"
+        # User message contains both source and draft.
+        assert "original source" in result[1]["content"]
+        assert "pass1 output" in result[1]["content"]
+        assert "polish" in result[1]["content"].lower()
 
-
-class TestExtendQAMessages:
-    """Tests for extend_qa_messages()."""
-
-    def test_appends_qa_messages(self, tmp_path: Path):
-        """QA extension appends assistant, system, and user messages."""
+    def test_no_overlap_or_glossary(self, tmp_path: Path):
+        """Pass 2 messages contain only source, draft, and polish instructions."""
         work_dir = _setup_work_dir(tmp_path)
         config = _make_config(work_dir)
-        messages = [
-            {"role": "system", "content": "system"},
-            {"role": "user", "content": "source"},
-        ]
 
-        result = extend_qa_messages(messages, "final translation", config)
+        result = build_pass2_messages("src", "draft", config)
+        all_content = " ".join(m["content"] for m in result)
 
-        assert len(result) == 5
-        assert result[2]["role"] == "assistant"
-        assert result[2]["content"] == "final translation"
-        assert result[3]["role"] == "system"
-        assert "JSON" in result[3]["content"]
-        assert result[4]["role"] == "user"
-        assert "Assess the translation" in result[4]["content"]
+        assert "GLOSSARY" not in all_content
+        assert "STORY SO FAR" not in all_content
+        assert "preceding" not in all_content.lower()
+
+
+class TestBuildQAMessages:
+    """Tests for build_qa_messages()."""
+
+    def test_fresh_system_and_user_messages(self, tmp_path: Path):
+        """QA builds a fresh system + user message list with source
+        and translation."""
+        work_dir = _setup_work_dir(tmp_path)
+        config = _make_config(work_dir)
+
+        result = build_qa_messages("original source", "final translation", config)
+
+        # Exactly 2 messages: system + user.
+        assert len(result) == 2
+        assert result[0]["role"] == "system"
+        assert "JSON" in result[0]["content"]
+        assert result[1]["role"] == "user"
+        # User message contains both source and translation.
+        assert "original source" in result[1]["content"]
+        assert "final translation" in result[1]["content"]
+        assert "Assess the translation" in result[1]["content"]
+
+    def test_no_overlap_or_glossary(self, tmp_path: Path):
+        """QA messages contain only source, translation, and QA prompt."""
+        work_dir = _setup_work_dir(tmp_path)
+        config = _make_config(work_dir)
+
+        result = build_qa_messages("src", "translation", config)
+        all_content = " ".join(m["content"] for m in result)
+
+        assert "GLOSSARY" not in all_content
+        assert "STORY SO FAR" not in all_content
+        assert "preceding" not in all_content.lower()
 
 
 # =========================================================================
@@ -847,6 +906,7 @@ class TestTranslateChunk:
         result = translate_chunk(chunk, config, glossary, None, [], mock_client)
 
         assert result.pass1_translation == "Pass 1 result."
+        assert result.pass1_analysis is None
         assert result.translated_text == "Pass 1 result."
         assert result.pass_count == 1
         mock_client.complete.assert_called_once()
@@ -873,9 +933,33 @@ class TestTranslateChunk:
         result = translate_chunk(chunk, config, glossary, None, [], mock_client)
 
         assert result.pass1_translation == "Pass 1 draft."
+        assert result.pass1_analysis is None
         assert result.translated_text == "Pass 2 revised."
         assert result.pass_count == 2
         assert mock_client.complete.call_count == 2
+
+    def test_pass1_analysis_captured(self, tmp_path: Path):
+        """When Pass 1 returns an <analysis> block, it is extracted and
+        stored in pass1_analysis, stripped from pass1_translation."""
+        work_dir = _setup_work_dir(tmp_path)
+        config = _make_config(work_dir)
+        config.translation_phase.double_pass = False
+        config.translation_phase.qa_check = False
+        config.translation_phase.rolling_summary = False
+
+        raw_output = "<analysis>\nTerminology check.\n</analysis>\nThe final translation."
+        mock_client = _make_mock_client(_mock_completion(raw_output))
+
+        chunk = _make_chunk()
+        glossary = _make_glossary()
+
+        result = translate_chunk(chunk, config, glossary, None, [], mock_client)
+
+        assert result.pass1_analysis is not None
+        assert "<analysis>" in result.pass1_analysis
+        assert "Terminology check." in result.pass1_analysis
+        assert result.pass1_translation == "The final translation."
+        assert result.translated_text == "The final translation."
 
     def test_qa_pass(self, tmp_path: Path):
         """QA enabled, judge returns pass — chunk saved with qa_result='pass'."""

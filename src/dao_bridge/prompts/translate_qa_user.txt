@@ -1,0 +1,9 @@
+ORIGINAL ({source_language}):
+
+{source_text}
+
+TRANSLATION ({target_language}):
+
+{translated_text}
+
+Assess the translation above against the original source.

@@ -84,7 +84,7 @@ is passed. Add `--verbose` to any command for DEBUG-level console output.
 | `clean` | Convert raw XHTML to markdown in `clean/NNN.md` |
 | `classify` | Classify spine items (chapter, frontmatter, illustration, etc.) |
 | `chunk` | Chunk cleaned markdown into `chunks/NNN/NNN.MMM.json` |
-| `glossary-build` | Extract per-book glossary from chunked source text |
+| `glossary-build` | Extract per-book glossary from chunked source text (spine-aligned batches) |
 | `glossary-reconcile` | Resolve within-book glossary conflicts via LLM |
 | `glossary-export` | Export glossary as human-readable markdown |
 | `translate` | Translate all chunks using LLM (double-pass, QA) |
@@ -93,8 +93,11 @@ is passed. Add `--verbose` to any command for DEBUG-level console output.
 | `run` | Chain all stages (extract through rebuild) |
 | `status` | Display pipeline stage completion status |
 
-The `classify`, `chunk`, and `assemble` commands support `--spine N` to process
-a single spine item, and `--force` to reprocess even if already complete.
+The `classify`, `chunk`, `glossary-build`, and `assemble` commands support
+`--spine N` to process a single spine item, and `--force` to reprocess even
+if already complete.  `glossary-build` also supports `--batch ID` to redo a
+specific sub-batch (e.g. `--batch 0003.b2`); `--batch` takes precedence over
+`--spine`.
 
 The `translate` command supports `--spine N`, `--chunk ID`, `--from/--to` for
 range-based translation, and `--force` to retranslate completed chunks.
@@ -129,10 +132,12 @@ dao-bridge run --work-dir ./work --retry-failed
 The glossary stages extract and refine a per-book glossary of proper nouns,
 character names, and notable terms:
 
-1. **glossary-build** -- Greedy-packs chunks into batches and sends each to
-   the LLM for extraction. Entries accumulate across batches; the glossary is
-   saved after each batch for crash-resumability. Conflicting English proposals
-   and corrections are logged for the reconcile stage.
+1. **glossary-build** -- Groups chunks by spine item and packs each spine's
+   chunks into sub-batches (item IDs like `0003.b2`).  Each sub-batch is sent
+   to the LLM for extraction.  Entries accumulate across batches; the glossary
+   is saved after each batch for crash-resumability.  Use `--spine N` or
+   `--batch ID` to redo specific items.  Conflicting English proposals and
+   corrections are logged for the reconcile stage.
 
 2. **glossary-reconcile** -- Resolves within-book conflicts (differing English
    translations, corrections) via LLM calls, and consolidates multiple

@@ -25,6 +25,7 @@ import json
 import logging
 from collections import defaultdict
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -52,12 +53,14 @@ from dao_bridge.state import (
     mark_stage_started,
     reopen_stage,
     reset_stage,
+    reset_stage_items,
 )
 from dao_bridge.workdir import (
     atomic_write,
     chunk_dir,
     glossary_path,
     manifest_path,
+    pad_spine,
 )
 
 logger = logging.getLogger("dao_bridge")
@@ -184,37 +187,163 @@ def _load_all_chunks(work_dir: Path, manifest) -> list[Chunk]:
 
 
 # ---------------------------------------------------------------------------
-# Batch packing
+# Progress callback dataclass
 # ---------------------------------------------------------------------------
 
 
-def _pack_batches(chunks: list[Chunk], target_tokens: int) -> list[list[Chunk]]:
-    """Greedy-pack chunks into batches up to *target_tokens*.
+@dataclass
+class GlossaryBuildProgress:
+    """Passed to the *on_progress* callback after each sub-batch completes."""
 
-    Accumulates chunks in order until adding the next chunk would exceed
-    the target.  Emits the current batch and starts a new one.  The last
-    batch is emitted as-is regardless of size.
+    item_id: str
+    """Spine-aligned item ID, e.g. ``"0003.b2"``."""
+    spine_batch_count: int
+    """Total sub-batches for this spine item (e.g. 5)."""
+    items_total: int
+    """Total work items across all spines."""
+
+
+@dataclass(frozen=True)
+class _GlossaryBatch:
+    """A deterministic glossary extraction batch covering contiguous chunks.
+
+    Each batch maps to a single LLM call during the build stage.  The
+    *item_id* is the state-tracking key (e.g. ``"0003.b2"``).
+    """
+
+    item_id: str
+    """State-tracking key, e.g. ``"0003.b2"``."""
+    spine_index: int
+    chunks: tuple[Chunk, ...]
+    """Immutable tuple of chunks — never split, never reordered."""
+    spine_batch_count: int
+    """Total sub-batches for this spine item."""
+
+    @property
+    def token_count(self) -> int:
+        """Total tokens across all chunks in this batch."""
+        return sum(c.token_count for c in self.chunks)
+
+    @property
+    def chunk_range_label(self) -> str:
+        """Human-readable chunk range for logging, e.g. ``'0003.004-0003.006'``."""
+        start = self.chunks[0].chunk_id
+        end = self.chunks[-1].chunk_id
+        return start if start == end else f"{start}-{end}"
+
+
+# ---------------------------------------------------------------------------
+# Spine grouping and batch packing
+# ---------------------------------------------------------------------------
+
+
+def _group_chunks_by_spine(chunks: list[Chunk]) -> list[tuple[int, list[Chunk]]]:
+    """Group a flat chunk list by spine index, preserving order.
+
+    Returns a list of ``(spine_index, chunks)`` tuples, ordered by spine
+    index.  Each spine's chunks are in chunk-index order.
+    """
+    by_spine: dict[int, list[Chunk]] = defaultdict(list)
+    for chunk in chunks:
+        by_spine[chunk.spine_index].append(chunk)
+
+    # Sort by spine index; chunks within each spine are already sorted
+    # because the input is sorted by (spine_index, chunk_index).
+    return sorted(by_spine.items())
+
+
+def _rebalance_final_two_batches(
+    previous: list[Chunk],
+    last: list[Chunk],
+) -> tuple[list[Chunk], list[Chunk]]:
+    """Re-split the final two batches at the most even chunk boundary.
+
+    Merges *previous* and *last* into a single list, then evaluates
+    every possible split point using a prefix-sum to find the one that
+    minimises the absolute token difference between the two halves.
+
+    On ties, the earlier split point is preferred so the first batch
+    stays smaller.
+
+    Returns
+    -------
+    tuple[list[Chunk], list[Chunk]]
+        The rebalanced (previous, last) pair.
+    """
+    combined = previous + last
+    if len(combined) < 2:
+        return previous, last
+
+    # Build prefix sums.
+    prefix_tokens: list[int] = []
+    running = 0
+    for chunk in combined:
+        running += chunk.token_count
+        prefix_tokens.append(running)
+
+    total_tokens = prefix_tokens[-1]
+
+    # Evaluate every valid split point (1 .. len-1).
+    best_split = 1
+    best_delta = abs(prefix_tokens[0] - (total_tokens - prefix_tokens[0]))
+
+    for split_idx in range(2, len(combined)):
+        left_tokens = prefix_tokens[split_idx - 1]
+        right_tokens = total_tokens - left_tokens
+        delta = abs(left_tokens - right_tokens)
+        if delta < best_delta:
+            best_split = split_idx
+            best_delta = delta
+
+    return combined[:best_split], combined[best_split:]
+
+
+def _pack_spine_batches(
+    spine_chunks: list[Chunk],
+    target_tokens: int,
+    min_batch_tokens: int,
+    redistribute_threshold: float,
+) -> list[list[Chunk]]:
+    """Pack chunks for a single spine item into sub-batches.
+
+    Greedy-packs chunks up to *target_tokens*, then applies remainder
+    balancing to avoid runt final batches:
+
+    - If the final sub-batch has fewer than *min_batch_tokens* tokens,
+      absorb it into the previous sub-batch.
+    - If the final sub-batch has fewer than
+      ``target_tokens * redistribute_threshold`` tokens (but above
+      *min_batch_tokens*), redistribute the last two sub-batches evenly
+      via :func:`_rebalance_final_two_batches`.
 
     Parameters
     ----------
-    chunks:
-        Flat list of chunks in spine+chunk order.
+    spine_chunks:
+        Chunks for a single spine item, in chunk-index order.
     target_tokens:
-        Maximum token count per batch.
+        Maximum token count per sub-batch.
+    min_batch_tokens:
+        Threshold below which the final sub-batch is absorbed into the
+        previous one.
+    redistribute_threshold:
+        Fraction of *target_tokens*.  If the final sub-batch is below
+        this threshold (but above *min_batch_tokens*), the last two
+        sub-batches are redistributed evenly.
 
     Returns
     -------
     list[list[Chunk]]
-        List of batches, each batch a list of chunks.
+        List of sub-batches, each a list of whole chunks.
     """
-    if not chunks:
+    if not spine_chunks:
         return []
 
+    # --- Greedy packing ---
     batches: list[list[Chunk]] = []
     current_batch: list[Chunk] = []
     current_tokens = 0
 
-    for chunk in chunks:
+    for chunk in spine_chunks:
         if current_batch and current_tokens + chunk.token_count > target_tokens:
             batches.append(current_batch)
             current_batch = []
@@ -224,6 +353,18 @@ def _pack_batches(chunks: list[Chunk], target_tokens: int) -> list[list[Chunk]]:
 
     if current_batch:
         batches.append(current_batch)
+
+    # --- Remainder balancing ---
+    if len(batches) >= 2:
+        last_tokens = sum(c.token_count for c in batches[-1])
+        threshold_tokens = target_tokens * redistribute_threshold
+
+        if last_tokens < min_batch_tokens:
+            # Absorb the final sub-batch into the previous one.
+            batches[-2].extend(batches[-1])
+            batches.pop()
+        elif last_tokens < threshold_tokens:
+            batches[-2], batches[-1] = _rebalance_final_two_batches(batches[-2], batches[-1])
 
     return batches
 
@@ -567,6 +708,60 @@ def _record_category_conflict(
 # ---------------------------------------------------------------------------
 
 
+def _build_work_items(
+    all_chunks: list[Chunk],
+    target_tokens: int,
+    min_batch_tokens: int,
+    redistribute_threshold: float,
+    spine_width: int,
+) -> list[_GlossaryBatch]:
+    """Enumerate spine-aligned work items for glossary build.
+
+    Returns a list of :class:`_GlossaryBatch` objects, each representing
+    one LLM call.  Item IDs use the format ``"NNNN.bM"`` where NNNN is
+    the padded spine index and M is the 1-based sub-batch index within
+    that spine.
+
+    Parameters
+    ----------
+    all_chunks:
+        All chunks from the book, sorted by ``(spine_index, chunk_index)``.
+    target_tokens:
+        Token budget per LLM call.
+    min_batch_tokens:
+        Absorb final sub-batch into previous if below this.
+    redistribute_threshold:
+        Redistribute last two sub-batches if final is below
+        ``target_tokens * redistribute_threshold``.
+    spine_width:
+        Zero-padding width for spine indices (from manifest).
+
+    Returns
+    -------
+    list[_GlossaryBatch]
+        One batch per LLM call, in spine order then sub-batch order.
+    """
+    spine_groups = _group_chunks_by_spine(all_chunks)
+    work_items: list[_GlossaryBatch] = []
+
+    for spine_index, spine_chunks in spine_groups:
+        sub_batches = _pack_spine_batches(
+            spine_chunks, target_tokens, min_batch_tokens, redistribute_threshold
+        )
+        spine_batch_count = len(sub_batches)
+        for bi, batch in enumerate(sub_batches, 1):
+            work_items.append(
+                _GlossaryBatch(
+                    item_id=f"{pad_spine(spine_index, spine_width)}.b{bi}",
+                    spine_index=spine_index,
+                    chunks=tuple(batch),
+                    spine_batch_count=spine_batch_count,
+                )
+            )
+
+    return work_items
+
+
 def glossary_build(
     work_dir: Path,
     config: AppConfig,
@@ -574,14 +769,16 @@ def glossary_build(
     *,
     force: bool = False,
     retry_failed: bool = False,
-    on_progress: Callable[[str], None] | None = None,
+    target_spine: int | None = None,
+    target_batch: str | None = None,
+    on_progress: Callable[[GlossaryBuildProgress], None] | None = None,
 ) -> Glossary:
     """Extract the per-book glossary from chunked source text.
 
-    Greedy-packs chunks into batches up to
-    ``config.glossary_phase.target_tokens_per_call``, then sends each
-    batch to the LLM for extraction.  Entries are merged into the
-    glossary progressively, saving after each batch.
+    Groups chunks by spine item and packs each spine's chunks into
+    sub-batches up to ``config.glossary_phase.target_tokens_per_call``.
+    Each sub-batch is a separately tracked, resumable work item with an
+    ID like ``"0003.b2"`` (spine 3, sub-batch 2).
 
     Parameters
     ----------
@@ -596,9 +793,17 @@ def glossary_build(
     retry_failed:
         If *True*, re-enter a completed stage to retry only failed batches.
         Preserves completed batch state (unlike ``force``).
+    target_spine:
+        If set, redo only the sub-batches for this spine index.
+        Implies force for the targeted items.  Ignored if *target_batch*
+        is also set.
+    target_batch:
+        If set, redo only this specific sub-batch (e.g. ``"0003.b2"``).
+        Implies force for the targeted item.  Takes precedence over
+        *target_spine*.
     on_progress:
-        Optional callback invoked with the batch ID after each batch
-        is processed.
+        Optional callback invoked with a :class:`GlossaryBuildProgress`
+        after each sub-batch is processed.
 
     Returns
     -------
@@ -619,8 +824,12 @@ def glossary_build(
     if not is_stage_completed(state, "chunk"):
         raise RuntimeError("Chunk stage not completed. Run 'dao-bridge chunk' first.")
 
+    # Determine if this is a targeted (partial) run.
+    targeted = target_batch is not None or target_spine is not None
+
     # Handle force / already-completed.
-    if force:
+    # Targeted runs handle their own reset below; skip full-stage reset.
+    if force and not targeted:
         reset_stage(work_dir, state, stage)
         # Also reset glossary and meta files.
         gp = glossary_path(work_dir)
@@ -631,16 +840,16 @@ def glossary_build(
             bmp.unlink()
 
     # Handle --retry-failed: re-open a completed stage without wiping items.
-    if retry_failed and not force:
+    if retry_failed and not force and not targeted:
         reopen_stage(work_dir, state, stage)
 
-    if not force and not retry_failed and is_stage_completed(state, stage):
+    if not force and not retry_failed and not targeted and is_stage_completed(state, stage):
         logger.info("Glossary build already completed — skipping (use --force to re-run)")
         return _load_glossary(work_dir)
 
     mark_stage_started(work_dir, state, stage)
 
-    # Load all chunks and pack into batches.
+    # Load all chunks and build spine-aligned work items.
     all_chunks = _load_all_chunks(work_dir, manifest)
     if not all_chunks:
         logger.warning("No chunks found — glossary will be empty.")
@@ -652,11 +861,40 @@ def glossary_build(
         return glossary
 
     target_tokens = config.glossary_phase.target_tokens_per_call
-    batches = _pack_batches(all_chunks, target_tokens)
-    batch_ids = [f"glossary_build.batch.{i + 1:03d}" for i in range(len(batches))]
+    all_work_items = _build_work_items(
+        all_chunks,
+        target_tokens=target_tokens,
+        min_batch_tokens=config.glossary_phase.min_batch_tokens,
+        redistribute_threshold=config.glossary_phase.redistribute_threshold,
+        spine_width=manifest.spine_padding_width,
+    )
+    all_item_ids = [batch.item_id for batch in all_work_items]
 
-    # Determine pending batches.
-    pending = set(iter_pending_items(state, stage, batch_ids))
+    # Filter to targeted items and reset their state.
+    if targeted:
+        if target_batch is not None:
+            # --batch takes precedence: redo a single sub-batch.
+            target_ids = [bid for bid in all_item_ids if bid == target_batch]
+            if not target_ids:
+                raise RuntimeError(
+                    f"Batch '{target_batch}' not found.  Valid batch IDs: {', '.join(all_item_ids)}"
+                )
+        else:
+            # --spine: redo all sub-batches for that spine.
+            spine_prefix = f"{pad_spine(target_spine, manifest.spine_padding_width)}."  # type: ignore[arg-type]
+            target_ids = [bid for bid in all_item_ids if bid.startswith(spine_prefix)]
+            if not target_ids:
+                raise RuntimeError(f"Spine {target_spine} has no glossary batches.")
+        reset_stage_items(work_dir, state, stage, target_ids)
+        work_items = [b for b in all_work_items if b.item_id in set(target_ids)]
+    else:
+        work_items = all_work_items
+
+    item_ids = [batch.item_id for batch in work_items]
+    items_total = len(item_ids)
+
+    # Determine pending items.
+    pending = set(iter_pending_items(state, stage, item_ids))
 
     # Load existing glossary and meta (for resume).
     glossary = _load_glossary(work_dir)
@@ -695,19 +933,25 @@ def glossary_build(
             _llm_client = LLMClient(config.models.glossary, config.llm)
         return _llm_client
 
-    # Process each batch.
-    for batch, batch_id in zip(batches, batch_ids):
-        if batch_id not in pending:
+    # Process each sub-batch.
+    for batch in work_items:
+        if batch.item_id not in pending:
             if on_progress:
-                on_progress(batch_id)
+                on_progress(
+                    GlossaryBuildProgress(
+                        item_id=batch.item_id,
+                        spine_batch_count=batch.spine_batch_count,
+                        items_total=items_total,
+                    )
+                )
             continue
 
-        mark_item_started(work_dir, state, stage, batch_id)
+        mark_item_started(work_dir, state, stage, batch.item_id)
 
         try:
             # Build the chunk text for the prompt.
             chunk_texts = []
-            for c in batch:
+            for c in batch.chunks:
                 chunk_texts.append(f"--- chunk {c.chunk_id} ---\n{c.text}")
             chunk_batch_str = "\n\n".join(chunk_texts)
 
@@ -732,46 +976,64 @@ def glossary_build(
             response = client.complete_json(
                 messages,
                 response_model=GlossaryExtractionResponse,
-                context_label=batch_id,
+                context_label=batch.item_id,
             )
 
             # Merge results.
-            first_chunk_id = batch[0].chunk_id
-            _merge_extraction_into_glossary(glossary, response, batch_id, first_chunk_id, meta)
+            first_chunk_id = batch.chunks[0].chunk_id
+            _merge_extraction_into_glossary(glossary, response, batch.item_id, first_chunk_id, meta)
 
-            # Save after each batch (resumable).
+            # Save after each sub-batch (resumable).
             _save_glossary(work_dir, glossary)
             _save_build_meta(work_dir, meta)
-            mark_item_completed(work_dir, state, stage, batch_id)
+            mark_item_completed(work_dir, state, stage, batch.item_id)
 
             logger.debug(
-                "Batch %s: extracted %d entries, %d corrections",
-                batch_id,
+                "Item %s (%s): extracted %d entries, %d corrections",
+                batch.item_id,
+                batch.chunk_range_label,
                 len(response.entries),
                 len(response.corrections),
             )
 
         except LLMStructuredOutputError as exc:
-            logger.error("Structured output failed for batch %s: %s", batch_id, exc)
-            mark_item_failed(work_dir, state, stage, batch_id, str(exc))
+            logger.error(
+                "Structured output failed for item %s (%s): %s",
+                batch.item_id,
+                batch.chunk_range_label,
+                exc,
+            )
+            mark_item_failed(work_dir, state, stage, batch.item_id, str(exc))
             # Save progress so far even on failure.
             _save_glossary(work_dir, glossary)
             _save_build_meta(work_dir, meta)
             raise
         except Exception as exc:
-            logger.error("Unexpected error in batch %s: %s", batch_id, exc)
-            mark_item_failed(work_dir, state, stage, batch_id, str(exc))
+            logger.error(
+                "Unexpected error in item %s (%s): %s",
+                batch.item_id,
+                batch.chunk_range_label,
+                exc,
+            )
+            mark_item_failed(work_dir, state, stage, batch.item_id, str(exc))
             _save_glossary(work_dir, glossary)
             _save_build_meta(work_dir, meta)
             raise
 
         if on_progress:
-            on_progress(batch_id)
+            on_progress(
+                GlossaryBuildProgress(
+                    item_id=batch.item_id,
+                    spine_batch_count=batch.spine_batch_count,
+                    items_total=items_total,
+                )
+            )
 
-    # Mark stage completed.
-    remaining = list(iter_pending_items(state, stage, batch_ids))
-    if not remaining:
-        mark_stage_completed(work_dir, state, stage)
+    # Mark stage completed only for full (non-targeted) runs.
+    if not targeted:
+        remaining = list(iter_pending_items(state, stage, all_item_ids))
+        if not remaining:
+            mark_stage_completed(work_dir, state, stage)
 
     logger.info(
         "Glossary build complete: %d entries, %d conflicts",

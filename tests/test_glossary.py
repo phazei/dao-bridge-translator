@@ -11,10 +11,14 @@ import pytest
 from dao_bridge.config import AppConfig
 from dao_bridge.glossary import (
     _BuildMeta,
+    _GlossaryBatch,
+    _build_work_items,
+    _group_chunks_by_spine,
     _load_build_meta,
     _load_glossary,
     _merge_extraction_into_glossary,
-    _pack_batches,
+    _pack_spine_batches,
+    _rebalance_final_two_batches,
     _save_build_meta,
     _save_glossary,
     glossary_build,
@@ -158,11 +162,84 @@ def _mark_prior_stages_complete(work_dir: Path, state: PipelineState) -> None:
 # ---------------------------------------------------------------------------
 
 
-class TestBatchPacking:
-    """Tests for the greedy batch packing algorithm."""
+class TestSpineBatchPacking:
+    """Tests for the spine-aware batch packing algorithm."""
+
+    # Default balancing params used across tests unless overridden.
+    TARGET = 1000
+    MIN_BATCH = 100
+    THRESHOLD = 0.4  # 400 tokens
+
+    def _make_chunks(self, count: int, token_count: int, spine_index: int = 0):
+        """Create a list of chunks for a single spine."""
+        return [
+            Chunk(
+                chunk_id=f"{spine_index:04d}.{i:03d}",
+                spine_index=spine_index,
+                chunk_index=i,
+                source_file=f"clean/{spine_index:04d}.md",
+                block_range=(0, 5),
+                token_count=token_count,
+                text="text",
+            )
+            for i in range(1, count + 1)
+        ]
 
     def test_single_batch_all_fit(self):
         """All chunks fit in one batch."""
+        chunks = self._make_chunks(3, token_count=100)
+        batches = _pack_spine_batches(chunks, self.TARGET, self.MIN_BATCH, self.THRESHOLD)
+        assert len(batches) == 1
+        assert len(batches[0]) == 3
+
+    def test_multiple_batches(self):
+        """Chunks are split across multiple batches."""
+        # 5 chunks @ 400 tokens = 2000 total, target 1000.
+        # Greedy: [400+400]=800, [400+400]=800, [400].
+        # Last batch = 400 = 40% of target = threshold boundary.
+        # 400 is NOT < 400 (threshold), so no redistribution.
+        chunks = self._make_chunks(5, token_count=400)
+        batches = _pack_spine_batches(chunks, self.TARGET, self.MIN_BATCH, self.THRESHOLD)
+        assert len(batches) == 3
+        assert len(batches[0]) == 2
+        assert len(batches[1]) == 2
+        assert len(batches[2]) == 1
+
+    def test_last_batch_larger_than_threshold(self):
+        """Last batch above threshold is left as-is."""
+        # 3 chunks @ 600 tokens, target 1000.
+        # Greedy: [600], [600], [600]. Last = 600 > 400 threshold.
+        chunks = self._make_chunks(3, token_count=600)
+        batches = _pack_spine_batches(chunks, self.TARGET, self.MIN_BATCH, self.THRESHOLD)
+        assert len(batches) == 3
+        assert all(len(b) == 1 for b in batches)
+
+    def test_single_chunk(self):
+        """Single chunk returns one batch."""
+        chunks = self._make_chunks(1, token_count=5000)
+        batches = _pack_spine_batches(chunks, self.TARGET, self.MIN_BATCH, self.THRESHOLD)
+        assert len(batches) == 1
+        assert len(batches[0]) == 1
+
+    def test_empty_input(self):
+        """Empty chunk list returns no batches."""
+        batches = _pack_spine_batches([], self.TARGET, self.MIN_BATCH, self.THRESHOLD)
+        assert batches == []
+
+    def test_exact_fit(self):
+        """Chunks that exactly fill the target go in one batch."""
+        chunks = self._make_chunks(2, token_count=500)
+        batches = _pack_spine_batches(chunks, self.TARGET, self.MIN_BATCH, self.THRESHOLD)
+        assert len(batches) == 1
+        assert len(batches[0]) == 2
+
+    # --- Remainder balancing tests ---
+
+    def test_absorb_tiny_final_batch(self):
+        """Final batch below min_batch_tokens is absorbed into previous."""
+        # 3 chunks: 800, 800, 50 tokens. Target 1000, min_batch 100.
+        # Greedy: [800], [800], [50]. Last = 50 < 100 -> absorb.
+        # Result: [800], [800+50=850].
         chunks = [
             Chunk(
                 chunk_id=f"0000.{i:03d}",
@@ -170,17 +247,309 @@ class TestBatchPacking:
                 chunk_index=i,
                 source_file="clean/0000.md",
                 block_range=(0, 5),
-                token_count=100,
+                token_count=tc,
                 text="text",
             )
-            for i in range(1, 4)
+            for i, tc in enumerate([800, 800, 50], start=1)
         ]
-        batches = _pack_batches(chunks, target_tokens=1000)
-        assert len(batches) == 1
-        assert len(batches[0]) == 3
+        batches = _pack_spine_batches(chunks, self.TARGET, self.MIN_BATCH, self.THRESHOLD)
+        assert len(batches) == 2
+        assert len(batches[0]) == 1  # [800]
+        assert len(batches[1]) == 2  # [800, 50]
 
-    def test_multiple_batches(self):
-        """Chunks are split across multiple batches."""
+    def test_redistribute_small_final_batch(self):
+        """Final batch between min_batch and threshold is redistributed."""
+        # 5 chunks: 900, 900, 900, 900, 200 tokens. Target 1000, min_batch 100, threshold 40%.
+        # Greedy: [900], [900], [900], [900], [200].
+        # Last = 200 > 100 (min) but < 400 (threshold) -> redistribute last two.
+        # Merge last two: [900, 200] = 1100 tokens. Half = 550.
+        # Split: chunk 900 alone = 900 >= 550 -> split_idx=1.
+        # Result: [900], [900], [900], [900], [200].
+        # Wait — overshoot=900-550=350, undershoot=550-0=550. 350 < 550, so split_idx=1.
+        # After: batches[-2] = [900], batches[-1] = [200].
+        # Hmm, that doesn't change anything. Let me reconsider with different values.
+        #
+        # Better example: 4 chunks: 800, 800, 800, 300.
+        # Greedy: [800], [800], [800, 300] — wait, 800+300=1100 > 1000, so:
+        # [800], [800], [800], [300].
+        # Last = 300 > 100 (min) but < 400 (threshold) -> redistribute last two.
+        # Merge: [800, 300] = 1100. Half = 550.
+        # First chunk=800. running=800 >= 550. overshoot=250, undershoot=550. i=0 but i>0 is false, so split_idx=1.
+        # Result: [800], [300] — same as before. The issue is we only have 2 chunks to redistribute.
+        #
+        # For redistribution to visibly change things, we need more chunks in the merged pair.
+        # 6 chunks: 400, 400, 400, 400, 400, 150.
+        # Greedy: [400+400]=800, [400+400]=800, [400], [150].
+        # Last = 150 > 100 but < 400 -> redistribute last two.
+        # Merge: [400, 150] = 550. Half = 275.
+        # chunk 400: running=400 >= 275. overshoot=125, undershoot=275. i=0 so split_idx=1.
+        # Result: [400], [150] — still same. Redistribution with 2 single-chunk batches can't
+        # help unless the chunks themselves are divisible, which they're not.
+        #
+        # The redistribution really helps when the two batches have multiple chunks.
+        # 7 chunks: 450, 450, 450, 450, 450, 450, 200.
+        # Greedy: [450+450]=900, [450+450]=900, [450+450]=900, [200].
+        # Wait, last greedy step: current=450, add 450 -> 900 <= 1000. Add 200 -> 1100 > 1000.
+        # So: [450,450], [450,450], [450,450], [200].
+        # Last = 200 < 400 -> redistribute last two: merge [450,450,200] = 1100. Half = 550.
+        # chunk 450: running=450 < 550.
+        # chunk 450: running=900 >= 550. overshoot=350, undershoot=100. i=1, i>0, undershoot<overshoot -> split_idx=1.
+        # batches[-2] = [450], batches[-1] = [450, 200].
+        # Tokens: 450 and 650 — more balanced than 900 and 200.
+        chunks = [
+            Chunk(
+                chunk_id=f"0000.{i:03d}",
+                spine_index=0,
+                chunk_index=i,
+                source_file="clean/0000.md",
+                block_range=(0, 5),
+                token_count=tc,
+                text="text",
+            )
+            for i, tc in enumerate([450, 450, 450, 450, 450, 450, 200], start=1)
+        ]
+        batches = _pack_spine_batches(chunks, self.TARGET, self.MIN_BATCH, self.THRESHOLD)
+        assert len(batches) == 4
+        # First two batches unchanged.
+        assert len(batches[0]) == 2  # [450, 450]
+        assert len(batches[1]) == 2  # [450, 450]
+        # Last two redistributed: [450] and [450, 200].
+        assert len(batches[2]) == 1  # [450]
+        assert len(batches[3]) == 2  # [450, 200]
+        # Verify token balance.
+        last_two_tokens = [
+            sum(c.token_count for c in batches[2]),
+            sum(c.token_count for c in batches[3]),
+        ]
+        assert last_two_tokens == [450, 650]
+
+    def test_no_balancing_with_single_batch(self):
+        """Single-batch spine has no balancing (nothing to absorb into)."""
+        chunks = self._make_chunks(1, token_count=50)
+        batches = _pack_spine_batches(chunks, self.TARGET, self.MIN_BATCH, self.THRESHOLD)
+        assert len(batches) == 1
+        assert len(batches[0]) == 1
+
+    def test_balancing_is_deterministic(self):
+        """Same input always produces the same batches."""
+        chunks = [
+            Chunk(
+                chunk_id=f"0000.{i:03d}",
+                spine_index=0,
+                chunk_index=i,
+                source_file="clean/0000.md",
+                block_range=(0, 5),
+                token_count=tc,
+                text="text",
+            )
+            for i, tc in enumerate([450, 450, 450, 450, 450, 450, 200], start=1)
+        ]
+        result1 = _pack_spine_batches(chunks, self.TARGET, self.MIN_BATCH, self.THRESHOLD)
+        result2 = _pack_spine_batches(chunks, self.TARGET, self.MIN_BATCH, self.THRESHOLD)
+        assert len(result1) == len(result2)
+        for b1, b2 in zip(result1, result2):
+            assert [c.chunk_id for c in b1] == [c.chunk_id for c in b2]
+
+
+class TestRebalanceFinalTwoBatches:
+    """Tests for _rebalance_final_two_batches."""
+
+    def _make_chunks(self, token_counts: list[int]):
+        return [
+            Chunk(
+                chunk_id=f"0000.{i:03d}",
+                spine_index=0,
+                chunk_index=i,
+                source_file="clean/0000.md",
+                block_range=(0, 5),
+                token_count=tc,
+                text="text",
+            )
+            for i, tc in enumerate(token_counts, start=1)
+        ]
+
+    def test_even_split(self):
+        """Perfectly even token totals split in the middle."""
+        prev = self._make_chunks([500, 500])
+        last = self._make_chunks([500, 500])
+        # Adjust chunk IDs for last batch.
+        new_prev, new_last = _rebalance_final_two_batches(prev, last)
+        total_left = sum(c.token_count for c in new_prev)
+        total_right = sum(c.token_count for c in new_last)
+        assert total_left == total_right
+
+    def test_tie_prefers_earlier_split(self):
+        """Equal split candidates choose the earlier chunk boundary."""
+        chunks = self._make_chunks([2000, 2000, 2000, 2000])
+        prev = chunks[:3]  # 6000 tokens
+        last = chunks[3:]  # 2000 tokens
+        new_prev, new_last = _rebalance_final_two_batches(prev, last)
+        # Total = 8000, half = 4000.
+        # Split at 2 gives [2000,2000]=4000 vs [2000,2000]=4000 -> delta=0.
+        # Split at 1 gives [2000] vs [2000,2000,2000]=6000 -> delta=4000.
+        # Split at 3 gives [2000,2000,2000]=6000 vs [2000]=2000 -> delta=4000.
+        # Best = split at 2.
+        assert len(new_prev) == 2
+        assert len(new_last) == 2
+
+    def test_uneven_picks_closest(self):
+        """Uneven chunks pick the boundary closest to half."""
+        prev = self._make_chunks([800, 800])
+        last = self._make_chunks([300])
+        # Adjust chunk_ids for clarity — doesn't matter for the algorithm.
+        new_prev, new_last = _rebalance_final_two_batches(prev, last)
+        # Total = 1900, half = 950.
+        # Split at 1: left=800 vs right=1100 -> delta=300.
+        # Split at 2: left=1600 vs right=300 -> delta=1300.
+        # Best = split at 1.
+        assert len(new_prev) == 1
+        assert len(new_last) == 2
+
+    def test_single_chunk_each_unchanged(self):
+        """Single-chunk batches can't be rebalanced further."""
+        prev = self._make_chunks([800])
+        last = self._make_chunks([200])
+        new_prev, new_last = _rebalance_final_two_batches(prev, last)
+        assert len(new_prev) == 1
+        assert len(new_last) == 1
+
+    def test_single_chunk_total_returned_unchanged(self):
+        """A single chunk in combined returns the original batches."""
+        prev = self._make_chunks([800])
+        new_prev, new_last = _rebalance_final_two_batches(prev, [])
+        assert new_prev == prev
+        assert new_last == []
+
+
+class TestGroupChunksBySpine:
+    """Tests for _group_chunks_by_spine."""
+
+    def test_groups_by_spine(self):
+        """Chunks from different spines are grouped correctly."""
+        chunks = [
+            Chunk(
+                chunk_id="0000.001",
+                spine_index=0,
+                chunk_index=1,
+                source_file="clean/0000.md",
+                block_range=(0, 5),
+                token_count=100,
+                text="text",
+            ),
+            Chunk(
+                chunk_id="0000.002",
+                spine_index=0,
+                chunk_index=2,
+                source_file="clean/0000.md",
+                block_range=(0, 5),
+                token_count=100,
+                text="text",
+            ),
+            Chunk(
+                chunk_id="0001.001",
+                spine_index=1,
+                chunk_index=1,
+                source_file="clean/0001.md",
+                block_range=(0, 5),
+                token_count=100,
+                text="text",
+            ),
+        ]
+        groups = _group_chunks_by_spine(chunks)
+        assert len(groups) == 2
+        assert groups[0][0] == 0
+        assert len(groups[0][1]) == 2
+        assert groups[1][0] == 1
+        assert len(groups[1][1]) == 1
+
+    def test_empty_input(self):
+        """Empty chunk list returns no groups."""
+        assert _group_chunks_by_spine([]) == []
+
+
+class TestBuildWorkItems:
+    """Tests for _build_work_items which creates spine-aligned _GlossaryBatch objects."""
+
+    def test_single_spine_single_batch(self):
+        """One spine with chunks fitting in one batch."""
+        chunks = [
+            Chunk(
+                chunk_id="0000.001",
+                spine_index=0,
+                chunk_index=1,
+                source_file="clean/0000.md",
+                block_range=(0, 5),
+                token_count=100,
+                text="text",
+            ),
+        ]
+        items = _build_work_items(
+            chunks,
+            target_tokens=1000,
+            min_batch_tokens=100,
+            redistribute_threshold=0.4,
+            spine_width=4,
+        )
+        assert len(items) == 1
+        batch = items[0]
+        assert isinstance(batch, _GlossaryBatch)
+        assert batch.item_id == "0000.b1"
+        assert len(batch.chunks) == 1
+        assert batch.spine_batch_count == 1
+        assert batch.spine_index == 0
+        assert batch.token_count == 100
+        assert batch.chunk_range_label == "0000.001"
+
+    def test_multi_spine_multi_batch(self):
+        """Multiple spines, some needing multiple batches."""
+        chunks = []
+        # Spine 0: 3 chunks @ 400 tokens = 1200, target 1000 -> 2 batches.
+        for i in range(1, 4):
+            chunks.append(
+                Chunk(
+                    chunk_id=f"0000.{i:03d}",
+                    spine_index=0,
+                    chunk_index=i,
+                    source_file="clean/0000.md",
+                    block_range=(0, 5),
+                    token_count=400,
+                    text="text",
+                )
+            )
+        # Spine 1: 1 chunk @ 200 tokens -> 1 batch.
+        chunks.append(
+            Chunk(
+                chunk_id="0001.001",
+                spine_index=1,
+                chunk_index=1,
+                source_file="clean/0001.md",
+                block_range=(0, 5),
+                token_count=200,
+                text="text",
+            )
+        )
+
+        items = _build_work_items(
+            chunks,
+            target_tokens=1000,
+            min_batch_tokens=100,
+            redistribute_threshold=0.4,
+            spine_width=4,
+        )
+        # Spine 0: [400,400] and [400] -> but 400 >= 400*0.4=400... not < threshold.
+        # So 2 batches for spine 0. 1 batch for spine 1. Total = 3.
+        assert len(items) == 3
+        assert items[0].item_id == "0000.b1"
+        assert items[0].spine_batch_count == 2
+        assert items[0].chunk_range_label == "0000.001-0000.002"
+        assert items[1].item_id == "0000.b2"
+        assert items[1].spine_batch_count == 2
+        assert items[1].chunk_range_label == "0000.003"
+        assert items[2].item_id == "0001.b1"
+        assert items[2].spine_batch_count == 1
+
+    def test_item_ids_are_deterministic(self):
+        """Same input always produces same item IDs."""
         chunks = [
             Chunk(
                 chunk_id=f"0000.{i:03d}",
@@ -193,39 +562,26 @@ class TestBatchPacking:
             )
             for i in range(1, 6)
         ]
-        batches = _pack_batches(chunks, target_tokens=1000)
-        # 5 chunks @ 400 tokens each = 2000 total.
-        # Batch 1: 400 + 400 = 800 (add third -> 1200 > 1000, emit)
-        # Batch 2: 400 + 400 = 800 (add fifth -> 1200 > 1000, emit)
-        # Batch 3: 400 (last batch)
-        assert len(batches) == 3
-        assert len(batches[0]) == 2
-        assert len(batches[1]) == 2
-        assert len(batches[2]) == 1
+        items1 = _build_work_items(
+            chunks,
+            target_tokens=1000,
+            min_batch_tokens=100,
+            redistribute_threshold=0.4,
+            spine_width=4,
+        )
+        items2 = _build_work_items(
+            chunks,
+            target_tokens=1000,
+            min_batch_tokens=100,
+            redistribute_threshold=0.4,
+            spine_width=4,
+        )
+        ids1 = [b.item_id for b in items1]
+        ids2 = [b.item_id for b in items2]
+        assert ids1 == ids2
 
-    def test_last_batch_smaller(self):
-        """The last batch can be smaller than target."""
-        chunks = [
-            Chunk(
-                chunk_id=f"0000.{i:03d}",
-                spine_index=0,
-                chunk_index=i,
-                source_file="clean/0000.md",
-                block_range=(0, 5),
-                token_count=600,
-                text="text",
-            )
-            for i in range(1, 4)
-        ]
-        batches = _pack_batches(chunks, target_tokens=1000)
-        # Batch 1: 600 (add second -> 1200 > 1000, emit)
-        # Batch 2: 600 (add third -> 1200 > 1000, emit)
-        # Batch 3: 600 (last batch)
-        assert len(batches) == 3
-        assert all(len(b) == 1 for b in batches)
-
-    def test_single_chunk(self):
-        """Single chunk returns one batch."""
+    def test_chunks_stored_as_tuples(self):
+        """Batch chunks are immutable tuples, not lists."""
         chunks = [
             Chunk(
                 chunk_id="0000.001",
@@ -233,36 +589,18 @@ class TestBatchPacking:
                 chunk_index=1,
                 source_file="clean/0000.md",
                 block_range=(0, 5),
-                token_count=5000,
+                token_count=100,
                 text="text",
-            )
+            ),
         ]
-        batches = _pack_batches(chunks, target_tokens=1000)
-        assert len(batches) == 1
-        assert len(batches[0]) == 1
-
-    def test_empty_input(self):
-        """Empty chunk list returns no batches."""
-        batches = _pack_batches([], target_tokens=1000)
-        assert batches == []
-
-    def test_exact_fit(self):
-        """Chunks that exactly fill the target go in one batch."""
-        chunks = [
-            Chunk(
-                chunk_id=f"0000.{i:03d}",
-                spine_index=0,
-                chunk_index=i,
-                source_file="clean/0000.md",
-                block_range=(0, 5),
-                token_count=500,
-                text="text",
-            )
-            for i in range(1, 3)
-        ]
-        batches = _pack_batches(chunks, target_tokens=1000)
-        assert len(batches) == 1
-        assert len(batches[0]) == 2
+        items = _build_work_items(
+            chunks,
+            target_tokens=1000,
+            min_batch_tokens=100,
+            redistribute_threshold=0.4,
+            spine_width=4,
+        )
+        assert isinstance(items[0].chunks, tuple)
 
 
 # ---------------------------------------------------------------------------
@@ -749,6 +1087,157 @@ class TestBuildResume:
         assert len(glossary.entries) == 2
         assert any(e.english == "Emilia" for e in glossary.entries)
         assert any(e.english == "Rem" for e in glossary.entries)
+
+
+# ---------------------------------------------------------------------------
+# TestBuildTargeted
+# ---------------------------------------------------------------------------
+
+
+class TestBuildTargeted:
+    """Tests for --spine and --batch targeted redo."""
+
+    def _setup_completed_build(self, tmp_path):
+        """Set up a work dir with a completed glossary build (2 spines, 2 chunks each)."""
+        work = _setup_work_dir(tmp_path)
+        config = _make_config(work)
+        state = load_state(work)
+        _mark_prior_stages_complete(work, state)
+        _make_manifest(work, n_spines=2, chunks_per_spine=2)
+        _write_chunks(work, n_spines=2, chunks_per_spine=2, tokens_per_chunk=500)
+
+        # Run a full build first.
+        mock_response = _mock_extraction_response(
+            entries=[
+                {
+                    "source_term": "スバル",
+                    "english_proposed": "Subaru",
+                    "category": "character",
+                },
+            ]
+        )
+
+        with patch("dao_bridge.glossary.LLMClient") as mock_llm_cls:
+            mock_client = MagicMock()
+            mock_client.complete_json.return_value = mock_response
+            mock_llm_cls.return_value = mock_client
+            glossary_build(work, config, state, force=True)
+
+        assert state.stages["glossary_build"].status == "completed"
+        return work, config, state
+
+    def test_target_spine_redoes_only_that_spine(self, tmp_path):
+        """--spine N resets and re-runs only that spine's batches."""
+        work, config, state = self._setup_completed_build(tmp_path)
+
+        # All items should be completed before the targeted run.
+        spine0_items = [k for k in state.items if k.startswith("glossary_build:0000.")]
+        spine1_items = [k for k in state.items if k.startswith("glossary_build:0001.")]
+        assert all(state.items[k].status == "completed" for k in spine0_items)
+        assert all(state.items[k].status == "completed" for k in spine1_items)
+
+        new_response = _mock_extraction_response(
+            entries=[
+                {
+                    "source_term": "エミリア",
+                    "english_proposed": "Emilia",
+                    "category": "character",
+                },
+            ]
+        )
+
+        with patch("dao_bridge.glossary.LLMClient") as mock_llm_cls:
+            mock_client = MagicMock()
+            mock_client.complete_json.return_value = new_response
+            mock_llm_cls.return_value = mock_client
+
+            glossary_build(work, config, state, target_spine=0)
+
+            # Only spine 0 batches should have been called.
+            call_count = mock_client.complete_json.call_count
+            assert call_count >= 1
+
+        # Spine 1 items should still be completed (untouched).
+        refreshed_state = load_state(work)
+        for k in spine1_items:
+            assert refreshed_state.items[k].status == "completed"
+
+    def test_target_batch_redoes_only_that_batch(self, tmp_path):
+        """--batch ID resets and re-runs only that specific batch."""
+        work, config, state = self._setup_completed_build(tmp_path)
+
+        new_response = _mock_extraction_response(
+            entries=[
+                {
+                    "source_term": "レム",
+                    "english_proposed": "Rem",
+                    "category": "character",
+                },
+            ]
+        )
+
+        with patch("dao_bridge.glossary.LLMClient") as mock_llm_cls:
+            mock_client = MagicMock()
+            mock_client.complete_json.return_value = new_response
+            mock_llm_cls.return_value = mock_client
+
+            glossary_build(work, config, state, target_batch="0000.b1")
+
+            # Exactly one LLM call for the single batch.
+            assert mock_client.complete_json.call_count == 1
+
+    def test_targeted_run_does_not_mark_stage_completed(self, tmp_path):
+        """A targeted run should not mark the stage as completed."""
+        work, config, state = self._setup_completed_build(tmp_path)
+
+        new_response = _mock_extraction_response(entries=[])
+
+        with patch("dao_bridge.glossary.LLMClient") as mock_llm_cls:
+            mock_client = MagicMock()
+            mock_client.complete_json.return_value = new_response
+            mock_llm_cls.return_value = mock_client
+
+            glossary_build(work, config, state, target_batch="0000.b1")
+
+        # Stage should be running (not completed) after a targeted run.
+        assert state.stages["glossary_build"].status == "running"
+
+    def test_invalid_batch_id_raises(self, tmp_path):
+        """An invalid batch ID raises a clear error."""
+        work, config, state = self._setup_completed_build(tmp_path)
+
+        with pytest.raises(RuntimeError, match="not found"):
+            glossary_build(work, config, state, target_batch="9999.b1")
+
+    def test_invalid_spine_raises(self, tmp_path):
+        """A spine with no batches raises a clear error."""
+        work, config, state = self._setup_completed_build(tmp_path)
+
+        with pytest.raises(RuntimeError, match="no glossary batches"):
+            glossary_build(work, config, state, target_spine=99)
+
+    def test_batch_takes_precedence_over_spine(self, tmp_path):
+        """When both --batch and --spine are set, --batch wins."""
+        work, config, state = self._setup_completed_build(tmp_path)
+
+        new_response = _mock_extraction_response(entries=[])
+
+        with patch("dao_bridge.glossary.LLMClient") as mock_llm_cls:
+            mock_client = MagicMock()
+            mock_client.complete_json.return_value = new_response
+            mock_llm_cls.return_value = mock_client
+
+            # Pass both spine and batch; batch should win.
+            glossary_build(
+                work,
+                config,
+                state,
+                target_spine=1,
+                target_batch="0000.b1",
+            )
+
+            # Only one call (the single batch), not all of spine 1.
+            assert mock_client.complete_json.call_count == 1
 
 
 # ---------------------------------------------------------------------------

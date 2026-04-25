@@ -158,6 +158,13 @@ class GlossaryPhaseConfig(BaseModel):
 
     target_tokens_per_call: int = 8000
     overlap_chunks: int = 0
+    min_batch_tokens: int = 1000
+    """If the final sub-batch for a spine item has fewer tokens than this,
+    absorb it into the previous sub-batch."""
+    redistribute_threshold: float = 0.4
+    """If the final sub-batch is between *min_batch_tokens* and
+    *target_tokens_per_call * redistribute_threshold*, redistribute tokens
+    evenly across the last two sub-batches instead of leaving a runt."""
 
 
 # ---------------------------------------------------------------------------

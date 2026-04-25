@@ -167,6 +167,8 @@ def _run_glossary_build_with_progress(
     state,
     force: bool = False,
     retry_failed: bool = False,
+    target_spine: int | None = None,
+    target_batch: str | None = None,
     verbose: bool = False,
 ):
     """Run glossary-build wrapped in a Rich Progress bar.
@@ -175,36 +177,37 @@ def _run_glossary_build_with_progress(
     """
     from rich.progress import (
         BarColumn,
+        MofNCompleteColumn,
         Progress,
         SpinnerColumn,
         TextColumn,
         TimeElapsedColumn,
     )
 
-    from dao_bridge.glossary import glossary_build
+    from dao_bridge.glossary import GlossaryBuildProgress, glossary_build
 
     progress = Progress(
         SpinnerColumn(),
         TextColumn("Building glossary"),
         BarColumn(bar_width=20),
-        TextColumn("{task.fields[batch]}", style="bold"),
-        TextColumn("{task.fields[completed_text]}", style="cyan"),
+        MofNCompleteColumn(),
+        TextColumn("{task.fields[item]}", style="bold"),
+        TextColumn("{task.fields[of_batch]}", style="cyan"),
         TimeElapsedColumn(),
         transient=True,
         refresh_per_second=2,
     )
 
-    completed_count = 0
-
-    def _on_progress(batch_id: str) -> None:
-        nonlocal completed_count
-        completed_count += 1
+    def _on_progress(p: GlossaryBuildProgress) -> None:
         if task_id is not None:
+            # Extract sub-batch index from item_id (e.g. "0003.b2" -> "b2").
+            _dot, batch_part = p.item_id.rsplit(".", 1)
             progress.update(
                 task_id,
+                total=p.items_total,
                 advance=1,
-                batch=batch_id,
-                completed_text=f"{completed_count} batches",
+                item=p.item_id,
+                of_batch=f"of {batch_part[0]}{p.spine_batch_count}",
             )
 
     task_id = None
@@ -214,8 +217,8 @@ def _run_glossary_build_with_progress(
             task_id = progress.add_task(
                 "Building glossary",
                 total=None,
-                batch="",
-                completed_text="0 batches",
+                item="",
+                of_batch="",
             )
             glossary = glossary_build(
                 work,
@@ -223,6 +226,8 @@ def _run_glossary_build_with_progress(
                 state,
                 force=force,
                 retry_failed=retry_failed,
+                target_spine=target_spine,
+                target_batch=target_batch,
                 on_progress=_on_progress,
             )
         finally:
@@ -288,6 +293,8 @@ def _default_config_yaml(epub_path: str, work_dir: str) -> str:
         "glossary_phase": {
             "target_tokens_per_call": 8000,
             "overlap_chunks": 0,
+            "min_batch_tokens": 1000,
+            "redistribute_threshold": 0.4,
         },
         "translation_phase": {
             "chunks_per_call": 1,
@@ -757,6 +764,20 @@ def assemble(
 @click.option(
     "--work-dir", type=click.Path(exists=True), default="./work", help="Work directory path."
 )
+@click.option(
+    "--spine",
+    "spine_index",
+    type=int,
+    default=None,
+    help="Redo only this spine's glossary batches.",
+)
+@click.option(
+    "--batch",
+    "single_batch",
+    type=str,
+    default=None,
+    help="Redo a single glossary batch (e.g. 0003.b2).",
+)
 @click.option("--force", is_flag=True, help="Rebuild glossary from scratch.")
 @click.option(
     "--retry-failed",
@@ -764,17 +785,33 @@ def assemble(
     help="Re-enter a completed stage to retry only failed batches.",
 )
 @click.pass_context
-def glossary_build_cmd(ctx: click.Context, work_dir: str, force: bool, retry_failed: bool) -> None:
+def glossary_build_cmd(
+    ctx: click.Context,
+    work_dir: str,
+    spine_index: int | None,
+    single_batch: str | None,
+    force: bool,
+    retry_failed: bool,
+) -> None:
     """Extract a per-book glossary from chunked source text.
 
-    Greedy-packs chunks into batches and sends each batch to the LLM for
-    glossary extraction.  Entries are merged progressively and saved after
-    each batch, making the stage resumable.
+    Packs chunks into per-spine batches and sends each batch to the LLM
+    for glossary extraction.  Entries are merged progressively and saved
+    after each batch, making the stage resumable.
+
+    Use --spine or --batch to redo specific items without rebuilding
+    the entire glossary.  --batch takes precedence over --spine.
 
     Requires: extract, clean, classify, chunk stages completed.
     """
     if force and retry_failed:
         raise click.ClickException("--force and --retry-failed are mutually exclusive.")
+
+    targeted = single_batch is not None or spine_index is not None
+    if targeted and (force or retry_failed):
+        raise click.ClickException(
+            "--spine/--batch cannot be combined with --force or --retry-failed."
+        )
 
     work = Path(work_dir).resolve()
     setup_logging(work, ctx.obj["verbose"])
@@ -787,6 +824,8 @@ def glossary_build_cmd(ctx: click.Context, work_dir: str, force: bool, retry_fai
         state=state,
         force=force,
         retry_failed=retry_failed,
+        target_spine=spine_index,
+        target_batch=single_batch,
         verbose=ctx.obj["verbose"],
     )
 

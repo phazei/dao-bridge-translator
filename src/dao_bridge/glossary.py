@@ -415,6 +415,10 @@ def _merge_extraction_into_glossary(
             logger.debug("Skipping user-sourced entry: %s", existing.english)
             continue
 
+        # Backfill reading if an earlier extraction did not have one.
+        if not existing.reading and ext_entry.reading:
+            existing.reading = ext_entry.reading
+
         # Union aliases.
         alias_set = set(existing.aliases)
         for alias in ext_entry.aliases:
@@ -941,6 +945,8 @@ def glossary_reconcile(
                 if entry:
                     entry.english = result.chosen_english
 
+                _save_glossary(work_dir, glossary)
+
                 term_decisions.append(
                     {
                         "source_term": conflict.source_term,
@@ -1025,6 +1031,8 @@ def glossary_reconcile(
 
             entry.speech_style = result.consolidated_speech_style
 
+            _save_glossary(work_dir, glossary)
+
             speech_decisions.append(
                 {
                     "character": entry.english,
@@ -1050,7 +1058,7 @@ def glossary_reconcile(
         if on_progress:
             on_progress(item_id)
 
-    # Save updated glossary.
+    # Save updated glossary in case only non-mutating items were processed.
     _save_glossary(work_dir, glossary)
 
     # Write reconciliation report.

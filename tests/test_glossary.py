@@ -13,6 +13,7 @@ from dao_bridge.glossary import (
     _BuildMeta,
     _load_build_meta,
     _load_glossary,
+    _merge_extraction_into_glossary,
     _pack_batches,
     _save_build_meta,
     _save_glossary,
@@ -36,6 +37,7 @@ from dao_bridge.schemas import (
 from dao_bridge.state import (
     PipelineState,
     load_state,
+    mark_item_completed,
     mark_stage_completed,
     mark_stage_started,
 )
@@ -643,6 +645,41 @@ class TestGlossaryBuild:
         conflict = next(c for c in meta.conflicts if c.source_term == "ルグニカ")
         assert any(a["english"] == "Lugunica" for a in conflict.alternatives)
 
+    def test_missing_reading_backfilled_on_merge(self):
+        """A later extraction can fill in a previously missing reading."""
+        glossary = Glossary(
+            entries=[
+                GlossaryEntry(
+                    source_term="スバル",
+                    reading=None,
+                    english="Subaru",
+                    category="character",
+                    source="extracted",
+                )
+            ]
+        )
+        response = _mock_extraction_response(
+            entries=[
+                {
+                    "source_term": "スバル",
+                    "reading": "すばる",
+                    "english_proposed": "Subaru",
+                    "category": "character",
+                }
+            ]
+        )
+        meta = _BuildMeta()
+
+        _merge_extraction_into_glossary(
+            glossary,
+            response,
+            "glossary_build.batch.001",
+            "0000.001",
+            meta,
+        )
+
+        assert glossary.entries[0].reading == "すばる"
+
 
 # ---------------------------------------------------------------------------
 # TestBuildResume
@@ -797,6 +834,37 @@ class TestGlossaryReconcile:
         entry = next(e for e in glossary.entries if e.source_term == "ルグニカ")
         assert entry.english == "Lugunica"
 
+    def test_term_change_persisted_before_item_completion(self, tmp_path):
+        """Disk glossary is updated before a term item is marked complete."""
+        work, config, state = self._setup_with_conflicts(tmp_path)
+
+        mock_reconcile = GlossaryReconcileResponse(
+            chosen_english="Lugunica",
+            reasoning="More common romanization.",
+        )
+
+        def checking_mark_item_completed(work_dir, pipeline_state, stage, item_id):
+            if item_id.startswith("glossary_reconcile.term."):
+                disk_glossary = _load_glossary(work_dir)
+                entry = next(e for e in disk_glossary.entries if e.source_term == "ルグニカ")
+                assert entry.english == "Lugunica"
+            return mark_item_completed(work_dir, pipeline_state, stage, item_id)
+
+        with (
+            patch("dao_bridge.glossary.LLMClient") as mock_llm_cls,
+            patch(
+                "dao_bridge.glossary.mark_item_completed", side_effect=checking_mark_item_completed
+            ),
+        ):
+            mock_client = MagicMock()
+            mock_client.complete_json.return_value = mock_reconcile
+            mock_llm_cls.return_value = mock_client
+
+            glossary = glossary_reconcile(work, config, state, force=True)
+
+        entry = next(e for e in glossary.entries if e.source_term == "ルグニカ")
+        assert entry.english == "Lugunica"
+
     def test_report_generated(self, tmp_path):
         """Reconcile report markdown is written."""
         work, config, state = self._setup_with_conflicts(tmp_path)
@@ -858,6 +926,55 @@ class TestGlossaryReconcile:
         subaru = next(e for e in glossary.entries if e.english == "Subaru")
         assert subaru.speech_style == "Speaks casually with modern slang and frequent sarcasm."
         assert "\n" not in subaru.speech_style
+
+    def test_speech_change_persisted_before_item_completion(self, tmp_path):
+        """Disk glossary is updated before a speech item is marked complete."""
+        work = _setup_work_dir(tmp_path)
+        config = _make_config(work)
+        state = load_state(work)
+        _mark_prior_stages_complete(work, state)
+        mark_stage_started(work, state, "glossary_build")
+        mark_stage_completed(work, state, "glossary_build")
+
+        glossary = Glossary(
+            entries=[
+                GlossaryEntry(
+                    source_term="スバル",
+                    english="Subaru",
+                    category="character",
+                    source="extracted",
+                    speech_style="Casual speech.\nUses modern slang.",
+                ),
+            ]
+        )
+        _save_glossary(work, glossary)
+        _save_build_meta(work, _BuildMeta())
+
+        mock_speech = GlossarySpeechMergeResponse(
+            consolidated_speech_style="Speaks casually with modern slang."
+        )
+
+        def checking_mark_item_completed(work_dir, pipeline_state, stage, item_id):
+            if item_id.startswith("glossary_reconcile.speech."):
+                disk_glossary = _load_glossary(work_dir)
+                entry = next(e for e in disk_glossary.entries if e.english == "Subaru")
+                assert entry.speech_style == "Speaks casually with modern slang."
+            return mark_item_completed(work_dir, pipeline_state, stage, item_id)
+
+        with (
+            patch("dao_bridge.glossary.LLMClient") as mock_llm_cls,
+            patch(
+                "dao_bridge.glossary.mark_item_completed", side_effect=checking_mark_item_completed
+            ),
+        ):
+            mock_client = MagicMock()
+            mock_client.complete_json.return_value = mock_speech
+            mock_llm_cls.return_value = mock_client
+
+            glossary = glossary_reconcile(work, config, state, force=True)
+
+        subaru = next(e for e in glossary.entries if e.english == "Subaru")
+        assert subaru.speech_style == "Speaks casually with modern slang."
 
     def test_no_conflicts_completes_immediately(self, tmp_path):
         """Stage completes as no-op when no conflicts exist."""

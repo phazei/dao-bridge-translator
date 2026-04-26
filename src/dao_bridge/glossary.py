@@ -242,6 +242,22 @@ class GlossaryBuildProgress:
     """Total work items across all spines."""
 
 
+@dataclass
+class GlossaryReconcileProgress:
+    """Passed to the *on_progress* callback after each reconcile item completes."""
+
+    phase: str
+    """Current phase: ``"surface_form"``, ``"entity_conflict"``, or ``"speech_style"``."""
+    phase_label: str
+    """Human-readable phase description, e.g. ``"Surface-form conflicts"``."""
+    item_label: str
+    """Short display label for the current item, e.g. ``"character_000001 / アベル"``."""
+    completed: int
+    """Number of items completed in this phase so far (including this one)."""
+    total: int
+    """Total items in this phase."""
+
+
 @dataclass(frozen=True)
 class _GlossaryBatch:
     """A deterministic glossary extraction batch covering contiguous chunks.
@@ -1944,7 +1960,7 @@ def glossary_reconcile(
     *,
     force: bool = False,
     retry_failed: bool = False,
-    on_progress: Callable[[str], None] | None = None,
+    on_progress: Callable[[GlossaryReconcileProgress], None] | None = None,
 ) -> Glossary:
     """Resolve within-book glossary conflicts from the build stage.
 
@@ -1975,8 +1991,9 @@ def glossary_reconcile(
         If *True*, re-enter a completed stage to retry only failed items.
         Preserves completed item state (unlike ``force``).
     on_progress:
-        Optional callback invoked with the item ID after each item
-        is processed.
+        Optional callback invoked with a :class:`GlossaryReconcileProgress`
+        after each item is processed.  Reports phase, item label,
+        completed count, and total for the current phase.
 
     Returns
     -------
@@ -2091,7 +2108,8 @@ def glossary_reconcile(
     speech_decisions: list[dict] = []
 
     # --- Resolve surface-form conflicts (before entity-level) ---
-    for item_id, entity_id, sf in sf_conflict_items:
+    sf_total = len(sf_conflict_items)
+    for sf_idx, (item_id, entity_id, sf) in enumerate(sf_conflict_items, 1):
         try:
             variants = list(sf.english_variants)
             alternatives_str = ", ".join(f'"{variant}"' for variant in variants)
@@ -2161,13 +2179,30 @@ def glossary_reconcile(
             raise
 
         if on_progress:
-            on_progress(item_id)
+            on_progress(
+                GlossaryReconcileProgress(
+                    phase="surface_form",
+                    phase_label="Surface-form conflicts",
+                    item_label=f"{entity_id} / {sf.source}",
+                    completed=sf_idx,
+                    total=sf_total,
+                )
+            )
 
     # --- Resolve entity conflicts ---
-    for item_id, conflict in term_items:
+    term_total = len(term_items)
+    for term_idx, (item_id, conflict) in enumerate(term_items, 1):
         if item_id not in pending:
             if on_progress:
-                on_progress(item_id)
+                on_progress(
+                    GlossaryReconcileProgress(
+                        phase="entity_conflict",
+                        phase_label="Entity conflicts",
+                        item_label=conflict.entity_id,
+                        completed=term_idx,
+                        total=term_total,
+                    )
+                )
             continue
 
         mark_item_started(work_dir, state, stage, item_id)
@@ -2265,13 +2300,30 @@ def glossary_reconcile(
             raise
 
         if on_progress:
-            on_progress(item_id)
+            on_progress(
+                GlossaryReconcileProgress(
+                    phase="entity_conflict",
+                    phase_label="Entity conflicts",
+                    item_label=conflict.entity_id,
+                    completed=term_idx,
+                    total=term_total,
+                )
+            )
 
     # --- Consolidate speech styles ---
-    for item_id, entity in speech_items:
+    speech_total = len(speech_items)
+    for speech_idx, (item_id, entity) in enumerate(speech_items, 1):
         if item_id not in pending:
             if on_progress:
-                on_progress(item_id)
+                on_progress(
+                    GlossaryReconcileProgress(
+                        phase="speech_style",
+                        phase_label="Speech styles",
+                        item_label=entity.canonical_english,
+                        completed=speech_idx,
+                        total=speech_total,
+                    )
+                )
             continue
 
         mark_item_started(work_dir, state, stage, item_id)
@@ -2326,7 +2378,15 @@ def glossary_reconcile(
             raise
 
         if on_progress:
-            on_progress(item_id)
+            on_progress(
+                GlossaryReconcileProgress(
+                    phase="speech_style",
+                    phase_label="Speech styles",
+                    item_label=entity.canonical_english,
+                    completed=speech_idx,
+                    total=speech_total,
+                )
+            )
 
     # Save updated glossary in case only non-mutating items were processed.
     _save_glossary(work_dir, glossary)

@@ -236,6 +236,86 @@ def _run_glossary_build_with_progress(
     return glossary
 
 
+def _run_glossary_reconcile_with_progress(
+    *,
+    work: Path,
+    config: AppConfig,
+    state,
+    force: bool = False,
+    retry_failed: bool = False,
+    verbose: bool = False,
+):
+    """Run glossary-reconcile wrapped in a Rich Progress bar.
+
+    Returns the :class:`Glossary` from :func:`glossary_reconcile`.
+    """
+    from rich.progress import (
+        BarColumn,
+        MofNCompleteColumn,
+        Progress,
+        SpinnerColumn,
+        TextColumn,
+        TimeElapsedColumn,
+    )
+
+    from dao_bridge.glossary import GlossaryReconcileProgress, glossary_reconcile
+
+    progress = Progress(
+        SpinnerColumn(),
+        TextColumn("{task.description}"),
+        BarColumn(bar_width=20),
+        MofNCompleteColumn(),
+        TextColumn("{task.fields[item]}", style="bold"),
+        TimeElapsedColumn(),
+        transient=True,
+        refresh_per_second=2,
+    )
+
+    current_phase: list[str | None] = [None]
+
+    def _on_progress(p: GlossaryReconcileProgress) -> None:
+        if task_id is None:
+            return
+        if p.phase != current_phase[0]:
+            # Phase changed — reset the task for the new phase.
+            current_phase[0] = p.phase
+            progress.update(
+                task_id,
+                description=p.phase_label,
+                completed=p.completed,
+                total=p.total,
+                item=p.item_label,
+            )
+        else:
+            progress.update(
+                task_id,
+                completed=p.completed,
+                item=p.item_label,
+            )
+
+    task_id = None
+    with progress:
+        restore = _swap_logger_to_progress(progress, verbose=verbose)
+        try:
+            task_id = progress.add_task(
+                "Reconciling glossary...",
+                total=None,
+                item="",
+            )
+            glossary = glossary_reconcile(
+                work,
+                config,
+                state,
+                force=force,
+                retry_failed=retry_failed,
+                on_progress=_on_progress,
+            )
+        finally:
+            restore()
+
+    return glossary
+
+
 def _resolve_config(work_dir: Path) -> AppConfig:
     """Load config.yaml from the work directory."""
     cfg_path = work_dir / "config.yaml"
@@ -926,21 +1006,14 @@ def glossary_reconcile_cmd(
     config = _resolve_config(work)
     state = load_state(work)
 
-    from rich.progress import Progress
-
-    from dao_bridge.glossary import glossary_reconcile
-
-    with Progress(transient=True) as progress:
-        task = progress.add_task("Reconciling glossary...", total=None)
-
-        glossary = glossary_reconcile(
-            work,
-            config,
-            state,
-            force=force,
-            retry_failed=retry_failed,
-            on_progress=lambda _: progress.advance(task),
-        )
+    glossary = _run_glossary_reconcile_with_progress(
+        work=work,
+        config=config,
+        state=state,
+        force=force,
+        retry_failed=retry_failed,
+        verbose=ctx.obj["verbose"],
+    )
 
     click.echo(f"Glossary reconcile complete: {len(glossary.entities)} entities.")
     click.echo(f"Report: {work / 'glossary_reconcile_report.md'}")
@@ -1265,9 +1338,14 @@ def run(ctx: click.Context, work_dir: str, force: bool, retry_failed: bool) -> N
 
     # --- Stage 7: glossary-reconcile ---
     def _glossary_reconcile():
-        from dao_bridge.glossary import glossary_reconcile
-
-        glossary = glossary_reconcile(work, config, state, force=force, retry_failed=retry_failed)
+        glossary = _run_glossary_reconcile_with_progress(
+            work=work,
+            config=config,
+            state=state,
+            force=force,
+            retry_failed=retry_failed,
+            verbose=ctx.obj["verbose"],
+        )
         click.echo(f"  {len(glossary.entities)} entities (reconciled)")
 
     _run_stage("glossary-reconcile", _glossary_reconcile)

@@ -2483,6 +2483,220 @@ class TestGlossaryReconcile:
 
 
 # ---------------------------------------------------------------------------
+# TestReconcileProgress
+# ---------------------------------------------------------------------------
+
+
+class TestReconcileProgress:
+    """Structured progress is emitted with correct phases, totals, and labels."""
+
+    def test_progress_phases_and_totals(self, tmp_path):
+        """All three phases emit correct phase, total, completed, and item_label."""
+        from dao_bridge.glossary import GlossaryReconcileProgress
+
+        work = _setup_work_dir(tmp_path)
+        config = _make_config(work)
+        state = load_state(work)
+        _mark_prior_stages_complete(work, state)
+        mark_stage_started(work, state, "glossary_build")
+        mark_stage_completed(work, state, "glossary_build")
+        mark_stage_started(work, state, "glossary_cluster")
+        mark_stage_completed(work, state, "glossary_cluster")
+
+        # Entity with a surface-form conflict, an entity-level conflict,
+        # and a speech-style consolidation item.
+        glossary = Glossary(
+            entities=[
+                GlossaryEntity(
+                    entity_id="character_000001",
+                    category="character",
+                    canonical_english="Abel",
+                    surface_forms=[
+                        SurfaceForm(
+                            source="アベル",
+                            english="Abel",
+                            english_variants=["Aberu"],
+                        ),
+                    ],
+                    speech_style="polite\nrude",
+                    source="extracted",
+                ),
+            ]
+        )
+        _save_glossary(work, glossary, glossary_cluster_path(work))
+
+        # Entity-level conflict (from build).
+        from dao_bridge.glossary import _ConflictRecord
+
+        meta = _BuildMeta(
+            conflicts=[
+                _ConflictRecord(
+                    entity_id="character_000001",
+                    source_form="アベル",
+                    current_english="Abel",
+                    alternatives=[
+                        {"english": "Abell", "context_snippet": "batch 1", "batch_id": "0000.b1"}
+                    ],
+                ),
+            ]
+        )
+        _save_build_meta(work, meta)
+
+        # Mock LLM: surface-form -> "Aberu", entity -> "Abell", speech -> consolidated.
+        responses = [
+            GlossaryReconcileResponse(chosen_english="Aberu", reasoning="surface form"),
+            GlossaryReconcileResponse(chosen_english="Abell", reasoning="entity"),
+            GlossarySpeechMergeResponse(consolidated_speech_style="polite but sometimes rude"),
+        ]
+
+        progress_calls: list[GlossaryReconcileProgress] = []
+
+        with patch("dao_bridge.glossary.LLMClient") as mock_llm_cls:
+            mock_client = MagicMock()
+            mock_client.complete_json.side_effect = responses
+            mock_llm_cls.return_value = mock_client
+
+            glossary_reconcile(
+                work,
+                config,
+                state,
+                force=True,
+                on_progress=lambda p: progress_calls.append(p),
+            )
+
+        assert len(progress_calls) == 3
+
+        # Phase 1: surface_form
+        p0 = progress_calls[0]
+        assert p0.phase == "surface_form"
+        assert p0.phase_label == "Surface-form conflicts"
+        assert p0.completed == 1
+        assert p0.total == 1
+        assert "アベル" in p0.item_label
+        assert "character_000001" in p0.item_label
+
+        # Phase 2: entity_conflict
+        p1 = progress_calls[1]
+        assert p1.phase == "entity_conflict"
+        assert p1.phase_label == "Entity conflicts"
+        assert p1.completed == 1
+        assert p1.total == 1
+        assert "character_000001" in p1.item_label
+
+        # Phase 3: speech_style
+        p2 = progress_calls[2]
+        assert p2.phase == "speech_style"
+        assert p2.phase_label == "Speech styles"
+        assert p2.completed == 1
+        assert p2.total == 1
+        assert p2.item_label == "Abell"  # canonical_english after entity reconcile
+
+    def test_empty_phases_emit_no_progress(self, tmp_path):
+        """Phases with zero items are skipped entirely."""
+        from dao_bridge.glossary import GlossaryReconcileProgress
+
+        work = _setup_work_dir(tmp_path)
+        config = _make_config(work)
+        state = load_state(work)
+        _mark_prior_stages_complete(work, state)
+        mark_stage_started(work, state, "glossary_build")
+        mark_stage_completed(work, state, "glossary_build")
+        mark_stage_started(work, state, "glossary_cluster")
+        mark_stage_completed(work, state, "glossary_cluster")
+
+        # Entity with no conflicts, no variants, no speech delimiter.
+        glossary = Glossary(
+            entities=[
+                GlossaryEntity(
+                    entity_id="character_000001",
+                    category="character",
+                    canonical_english="Abel",
+                    surface_forms=[
+                        SurfaceForm(source="アベル", english="Abel"),
+                    ],
+                    source="extracted",
+                ),
+            ]
+        )
+        _save_glossary(work, glossary, glossary_cluster_path(work))
+        _save_build_meta(work, _BuildMeta())
+
+        progress_calls: list[GlossaryReconcileProgress] = []
+
+        with patch("dao_bridge.glossary.LLMClient") as mock_llm_cls:
+            glossary_reconcile(
+                work,
+                config,
+                state,
+                force=True,
+                on_progress=lambda p: progress_calls.append(p),
+            )
+
+        assert len(progress_calls) == 0
+
+    def test_surface_form_only_progress(self, tmp_path):
+        """When only surface-form conflicts exist, only that phase emits progress."""
+        from dao_bridge.glossary import GlossaryReconcileProgress
+
+        work = _setup_work_dir(tmp_path)
+        config = _make_config(work)
+        state = load_state(work)
+        _mark_prior_stages_complete(work, state)
+        mark_stage_started(work, state, "glossary_build")
+        mark_stage_completed(work, state, "glossary_build")
+        mark_stage_started(work, state, "glossary_cluster")
+        mark_stage_completed(work, state, "glossary_cluster")
+
+        glossary = Glossary(
+            entities=[
+                GlossaryEntity(
+                    entity_id="character_000001",
+                    category="character",
+                    canonical_english="Abel",
+                    surface_forms=[
+                        SurfaceForm(source="アベル", english="Abel", english_variants=["Aberu"]),
+                        SurfaceForm(
+                            source="アベルちゃん",
+                            english="Abel-chan",
+                            english_variants=["Aberu-chan"],
+                        ),
+                    ],
+                    source="extracted",
+                ),
+            ]
+        )
+        _save_glossary(work, glossary, glossary_cluster_path(work))
+        _save_build_meta(work, _BuildMeta())
+
+        responses = [
+            GlossaryReconcileResponse(chosen_english="Aberu", reasoning="r1"),
+            GlossaryReconcileResponse(chosen_english="Aberu-chan", reasoning="r2"),
+        ]
+
+        progress_calls: list[GlossaryReconcileProgress] = []
+
+        with patch("dao_bridge.glossary.LLMClient") as mock_llm_cls:
+            mock_client = MagicMock()
+            mock_client.complete_json.side_effect = responses
+            mock_llm_cls.return_value = mock_client
+
+            glossary_reconcile(
+                work,
+                config,
+                state,
+                force=True,
+                on_progress=lambda p: progress_calls.append(p),
+            )
+
+        assert len(progress_calls) == 2
+        assert all(p.phase == "surface_form" for p in progress_calls)
+        assert progress_calls[0].completed == 1
+        assert progress_calls[0].total == 2
+        assert progress_calls[1].completed == 2
+        assert progress_calls[1].total == 2
+
+
+# ---------------------------------------------------------------------------
 # TestGlossaryExport
 # ---------------------------------------------------------------------------
 

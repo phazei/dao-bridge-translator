@@ -203,8 +203,18 @@ def summary_path(work_dir: Path) -> Path:
 
 
 def glossary_path(work_dir: Path) -> Path:
-    """``glossary.json``"""
+    """``glossary.json`` — final glossary consumed by translation and export."""
     return work_dir / "glossary.json"
+
+
+def glossary_build_path(work_dir: Path) -> Path:
+    """``glossary_build.json`` — output of the build stage."""
+    return work_dir / "glossary_build.json"
+
+
+def glossary_cluster_path(work_dir: Path) -> Path:
+    """``glossary_cluster.json`` — output of the cluster stage."""
+    return work_dir / "glossary_cluster.json"
 
 
 def manifest_path(work_dir: Path) -> Path:

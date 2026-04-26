@@ -406,11 +406,16 @@ def _merge_surface_forms(winner: GlossaryEntity, loser: GlossaryEntity) -> None:
                 if hint and hint not in existing.context_hints:
                     existing.context_hints.append(hint)
 
-            # If English differs, preserve the alternate as a context hint.
+            # If English differs, preserve the alternate as a proper variant
+            # so reconcile can inspect and resolve translation conflicts.
             if sf_loser.english != existing.english:
-                alt_hint = f"alternate English: {sf_loser.english}"
-                if alt_hint not in existing.context_hints:
-                    existing.context_hints.append(alt_hint)
+                if sf_loser.english not in existing.english_variants:
+                    existing.english_variants.append(sf_loser.english)
+
+            # Union any existing english_variants from the loser.
+            for variant in sf_loser.english_variants:
+                if variant not in existing.english_variants and variant != existing.english:
+                    existing.english_variants.append(variant)
 
             # Merge notes.
             if sf_loser.notes:

@@ -57,6 +57,8 @@ from dao_bridge.state import (
 from dao_bridge.workdir import (
     atomic_write,
     chunk_dir,
+    glossary_build_path,
+    glossary_cluster_path,
     glossary_path,
     manifest_path,
     pad_spine,
@@ -838,6 +840,138 @@ class TestSurfaceFormMerge:
         add_or_update_surface_form(entity, mention, "0000.001")
         assert entity.surface_forms[0].reading == "すばる"
 
+    def test_same_source_different_english_adds_variant(self):
+        """Same source with different English is preserved in english_variants."""
+        entity = _make_entity(
+            surface_forms=[{"source": "スバル", "english": "Subaru"}],
+        )
+        mention = _make_mention(source="スバル", english="Subaru Natsuki")
+        add_or_update_surface_form(entity, mention, "0000.001")
+        sf = entity.surface_forms[0]
+        assert sf.english == "Subaru"
+        assert sf.english_variants == ["Subaru Natsuki"]
+
+    def test_same_source_different_english_deduped(self):
+        """Repeat same-source variant is not duplicated."""
+        entity = _make_entity(
+            surface_forms=[
+                {"source": "スバル", "english": "Subaru", "english_variants": ["Subaru Natsuki"]}
+            ],
+        )
+        mention = _make_mention(source="スバル", english="Subaru Natsuki")
+        add_or_update_surface_form(entity, mention, "0000.001")
+        sf = entity.surface_forms[0]
+        assert sf.english_variants == ["Subaru Natsuki"]
+
+
+# ---------------------------------------------------------------------------
+# TestMentionConflictRouting
+# ---------------------------------------------------------------------------
+
+
+class TestMentionConflictRouting:
+    """Same-source English disagreements should NOT create entity-level ConflictRecord."""
+
+    def test_same_source_different_english_no_entity_conflict(self):
+        """Same source with different English only creates english_variants, not ConflictRecord."""
+        from dao_bridge.glossary import _BuildMeta, _merge_mention_into_glossary
+
+        glossary = Glossary(
+            entities=[
+                GlossaryEntity(
+                    entity_id="character_000001",
+                    category="character",
+                    canonical_english="Subaru",
+                    surface_forms=[SurfaceForm(source="スバル", english="Subaru")],
+                    source="extracted",
+                ),
+            ]
+        )
+        meta = _BuildMeta()
+
+        mention = ExtractedMention(
+            source="スバル",
+            english="Subaru Natsuki",
+            category="character",
+        )
+        _merge_mention_into_glossary(glossary, mention, "0001.b1", "0001.001", meta)
+
+        # Should NOT have created an entity-level conflict.
+        assert len(meta.conflicts) == 0
+        # Should be captured in english_variants instead.
+        sf = glossary.entities[0].surface_forms[0]
+        assert "Subaru Natsuki" in sf.english_variants
+
+    def test_different_source_different_translation_adds_surface_form(self):
+        """New source form with different translation adds a surface form, no conflict."""
+        from dao_bridge.glossary import _BuildMeta, _merge_mention_into_glossary
+
+        glossary = Glossary(
+            entities=[
+                GlossaryEntity(
+                    entity_id="character_000001",
+                    category="character",
+                    canonical_english="Subaru",
+                    surface_forms=[SurfaceForm(source="スバル", english="Subaru")],
+                    source="extracted",
+                ),
+            ]
+        )
+        meta = _BuildMeta()
+
+        # Force entity linking to return the existing entity even though
+        # the source form is different.  In practice this happens via
+        # Jaro-Winkler >= 0.95 or reading+english match.
+        mention = ExtractedMention(
+            source="ナツキ・スバル",
+            english="Subaru Natsuki",
+            category="character",
+        )
+        with patch(
+            "dao_bridge.glossary.find_entity_for_mention",
+            return_value=glossary.entities[0],
+        ):
+            _merge_mention_into_glossary(glossary, mention, "0001.b1", "0001.001", meta)
+
+        # Verify it attached to the existing entity.
+        assert len(glossary.entities) == 1
+        # New source form with a legitimately different translation should
+        # NOT create an entity-level conflict — it is simply another valid
+        # surface form (e.g. full name vs short name).
+        assert len(meta.conflicts) == 0
+        # The new surface form should be present on the entity.
+        sources = {sf.source for sf in glossary.entities[0].surface_forms}
+        assert "ナツキ・スバル" in sources
+        translations = {sf.english for sf in glossary.entities[0].surface_forms}
+        assert "Subaru Natsuki" in translations
+
+    def test_same_source_same_english_no_conflict(self):
+        """Same source with same English creates no conflicts at all."""
+        from dao_bridge.glossary import _BuildMeta, _merge_mention_into_glossary
+
+        glossary = Glossary(
+            entities=[
+                GlossaryEntity(
+                    entity_id="character_000001",
+                    category="character",
+                    canonical_english="Subaru",
+                    surface_forms=[SurfaceForm(source="スバル", english="Subaru")],
+                    source="extracted",
+                ),
+            ]
+        )
+        meta = _BuildMeta()
+
+        mention = ExtractedMention(
+            source="スバル",
+            english="Subaru",
+            category="character",
+        )
+        _merge_mention_into_glossary(glossary, mention, "0001.b1", "0001.001", meta)
+
+        assert len(meta.conflicts) == 0
+        assert glossary.entities[0].surface_forms[0].english_variants == []
+
 
 # ---------------------------------------------------------------------------
 # TestSummaryMerge
@@ -1111,6 +1245,7 @@ class TestGlossaryBuild:
                     ),
                 ]
             ),
+            glossary_build_path(work),
         )
 
         mock_response = _mock_extraction_response(
@@ -1147,7 +1282,7 @@ class TestGlossaryBuild:
         _make_manifest(work, n_spines=1, chunks_per_spine=2)
         _write_chunks(work, n_spines=1, chunks_per_spine=2, tokens_per_chunk=500)
 
-        # Pre-seed a user entity.
+        # Pre-seed a user entity in build output.
         pre_glossary = Glossary(
             entities=[
                 GlossaryEntity(
@@ -1160,7 +1295,7 @@ class TestGlossaryBuild:
                 )
             ]
         )
-        _save_glossary(work, pre_glossary)
+        _save_glossary(work, pre_glossary, glossary_build_path(work))
 
         mock_response = _mock_extraction_response(
             mentions=[
@@ -1287,6 +1422,70 @@ class TestGlossaryBuild:
 
 
 # ---------------------------------------------------------------------------
+# TestBuildFileFlow
+# ---------------------------------------------------------------------------
+
+
+class TestBuildFileFlow:
+    """Tests for the build stage's per-stage output file convention."""
+
+    def test_build_writes_to_glossary_build_json(self, tmp_path):
+        """Build output goes to glossary_build.json, not glossary.json."""
+        work = _setup_work_dir(tmp_path)
+        config = _make_config(work)
+        state = load_state(work)
+        _mark_prior_stages_complete(work, state)
+        _make_manifest(work, n_spines=1, chunks_per_spine=1)
+        _write_chunks(work, n_spines=1, chunks_per_spine=1, tokens_per_chunk=500)
+
+        mock_response = _mock_extraction_response(
+            mentions=[
+                {"source": "スバル", "english": "Subaru", "category": "character"},
+            ]
+        )
+
+        with patch("dao_bridge.glossary.LLMClient") as mock_llm_cls:
+            mock_client = MagicMock()
+            mock_client.complete_json.return_value = mock_response
+            mock_llm_cls.return_value = mock_client
+            glossary_build(work, config, state, force=True)
+
+        # Build output exists at glossary_build.json.
+        assert glossary_build_path(work).exists()
+        build_glossary = _load_glossary(work, glossary_build_path(work))
+        assert len(build_glossary.entities) == 1
+        assert build_glossary.entities[0].canonical_english == "Subaru"
+
+        # glossary.json should NOT exist (reconcile hasn't run).
+        assert not glossary_path(work).exists()
+
+    def test_build_force_deletes_downstream(self, tmp_path):
+        """--force on build deletes glossary_cluster.json and glossary.json."""
+        work = _setup_work_dir(tmp_path)
+        config = _make_config(work)
+        state = load_state(work)
+        _mark_prior_stages_complete(work, state)
+        _make_manifest(work, n_spines=1, chunks_per_spine=1)
+        _write_chunks(work, n_spines=1, chunks_per_spine=1, tokens_per_chunk=500)
+
+        # Create fake downstream files.
+        glossary_cluster_path(work).write_text("{}", encoding="utf-8")
+        glossary_path(work).write_text("{}", encoding="utf-8")
+
+        mock_response = _mock_extraction_response(mentions=[])
+
+        with patch("dao_bridge.glossary.LLMClient") as mock_llm_cls:
+            mock_client = MagicMock()
+            mock_client.complete_json.return_value = mock_response
+            mock_llm_cls.return_value = mock_client
+            glossary_build(work, config, state, force=True)
+
+        # Downstream files should have been deleted.
+        assert not glossary_cluster_path(work).exists()
+        assert not glossary_path(work).exists()
+
+
+# ---------------------------------------------------------------------------
 # TestBuildResume
 # ---------------------------------------------------------------------------
 
@@ -1295,7 +1494,7 @@ class TestBuildResume:
     """Tests for build-stage resumability."""
 
     def test_resume_after_partial(self, tmp_path):
-        """Re-running from a partial glossary.json picks up at next batch."""
+        """Re-running from a partial glossary_build.json picks up at next batch."""
         work = _setup_work_dir(tmp_path)
         config = _make_config(work)
         config.glossary_phase.target_tokens_per_call = 1200
@@ -1325,8 +1524,8 @@ class TestBuildResume:
             with pytest.raises(RuntimeError, match="LLM crashed"):
                 glossary_build(work, config, state, force=True)
 
-        # Verify first batch was saved.
-        glossary = _load_glossary(work)
+        # Verify first batch was saved to build output.
+        glossary = _load_glossary(work, glossary_build_path(work))
         assert len(glossary.entities) == 1
         assert glossary.entities[0].canonical_english == "Emilia"
 
@@ -1497,6 +1696,349 @@ class TestBuildTargeted:
 
 
 # ---------------------------------------------------------------------------
+# Issue 1+2: Build force/targeted downstream state invalidation
+# ---------------------------------------------------------------------------
+
+
+class TestBuildDownstreamInvalidation:
+    """Build --force and --spine/--batch should reset downstream stage state."""
+
+    def _setup_full_pipeline(self, tmp_path):
+        """Build -> cluster -> reconcile all completed."""
+        work = _setup_work_dir(tmp_path)
+        config = _make_config(work)
+        state = load_state(work)
+        _mark_prior_stages_complete(work, state)
+        _make_manifest(work, n_spines=1, chunks_per_spine=1)
+        _write_chunks(work, n_spines=1, chunks_per_spine=1, tokens_per_chunk=500)
+
+        # Complete build.
+        mock_response = _mock_extraction_response(
+            mentions=[
+                {"source": "スバル", "english": "Subaru", "category": "character"},
+            ]
+        )
+        with patch("dao_bridge.glossary.LLMClient") as mock_llm_cls:
+            mock_client = MagicMock()
+            mock_client.complete_json.return_value = mock_response
+            mock_llm_cls.return_value = mock_client
+            glossary_build(work, config, state, force=True)
+
+        # Mark cluster and reconcile as completed with fake output files.
+        mark_stage_started(work, state, "glossary_cluster")
+        mark_stage_completed(work, state, "glossary_cluster")
+        mark_stage_started(work, state, "glossary_reconcile")
+        mark_stage_completed(work, state, "glossary_reconcile")
+        glossary_cluster_path(work).write_text('{"entities":[], "version": 2}', encoding="utf-8")
+        glossary_path(work).write_text('{"entities":[], "version": 2}', encoding="utf-8")
+
+        return work, config, state
+
+    def test_build_force_resets_downstream_stage_state(self, tmp_path):
+        """--force on build resets cluster and reconcile to pending."""
+        work, config, state = self._setup_full_pipeline(tmp_path)
+
+        assert state.stages["glossary_cluster"].status == "completed"
+        assert state.stages["glossary_reconcile"].status == "completed"
+
+        mock_response = _mock_extraction_response(mentions=[])
+        with patch("dao_bridge.glossary.LLMClient") as mock_llm_cls:
+            mock_client = MagicMock()
+            mock_client.complete_json.return_value = mock_response
+            mock_llm_cls.return_value = mock_client
+            glossary_build(work, config, state, force=True)
+
+        # Both downstream stages should be reset.
+        assert state.stages["glossary_cluster"].status == "pending"
+        assert state.stages["glossary_reconcile"].status == "pending"
+        # Downstream output files should be deleted.
+        assert not glossary_cluster_path(work).exists()
+        assert not glossary_path(work).exists()
+
+    def test_targeted_spine_resets_downstream_stage_state(self, tmp_path):
+        """--spine on build resets cluster and reconcile to pending."""
+        work, config, state = self._setup_full_pipeline(tmp_path)
+
+        assert state.stages["glossary_cluster"].status == "completed"
+        assert state.stages["glossary_reconcile"].status == "completed"
+
+        mock_response = _mock_extraction_response(
+            mentions=[
+                {"source": "エミリア", "english": "Emilia", "category": "character"},
+            ]
+        )
+        with patch("dao_bridge.glossary.LLMClient") as mock_llm_cls:
+            mock_client = MagicMock()
+            mock_client.complete_json.return_value = mock_response
+            mock_llm_cls.return_value = mock_client
+            glossary_build(work, config, state, target_spine=0)
+
+        # Both downstream stages should be reset.
+        assert state.stages["glossary_cluster"].status == "pending"
+        assert state.stages["glossary_reconcile"].status == "pending"
+
+    def test_targeted_batch_resets_downstream_stage_state(self, tmp_path):
+        """--batch on build resets cluster and reconcile to pending."""
+        work, config, state = self._setup_full_pipeline(tmp_path)
+
+        assert state.stages["glossary_cluster"].status == "completed"
+        assert state.stages["glossary_reconcile"].status == "completed"
+
+        mock_response = _mock_extraction_response(
+            mentions=[
+                {"source": "レム", "english": "Rem", "category": "character"},
+            ]
+        )
+        with patch("dao_bridge.glossary.LLMClient") as mock_llm_cls:
+            mock_client = MagicMock()
+            mock_client.complete_json.return_value = mock_response
+            mock_llm_cls.return_value = mock_client
+            glossary_build(work, config, state, target_batch="0000.b1")
+
+        # Both downstream stages should be reset.
+        assert state.stages["glossary_cluster"].status == "pending"
+        assert state.stages["glossary_reconcile"].status == "pending"
+
+    def test_build_force_prevents_stale_cluster_skip(self, tmp_path):
+        """After build --force, cluster does not skip on is_stage_completed."""
+        work, config, state = self._setup_full_pipeline(tmp_path)
+
+        # Cluster was "completed" before the build --force.
+        assert state.stages["glossary_cluster"].status == "completed"
+
+        mock_response = _mock_extraction_response(mentions=[])
+        with patch("dao_bridge.glossary.LLMClient") as mock_llm_cls:
+            mock_client = MagicMock()
+            mock_client.complete_json.return_value = mock_response
+            mock_llm_cls.return_value = mock_client
+            glossary_build(work, config, state, force=True)
+
+        # Now cluster should NOT skip -- its state has been reset.
+        from dao_bridge.state import is_stage_completed
+
+        assert not is_stage_completed(state, "glossary_cluster")
+        assert not is_stage_completed(state, "glossary_reconcile")
+
+
+# ---------------------------------------------------------------------------
+# Surface-form Reconcile
+# ---------------------------------------------------------------------------
+
+
+class TestEnglishVariantsReconcile:
+    """Surface-form english_variants are reconciled directly from the glossary."""
+
+    def test_surface_form_conflict_resolved_from_english_variants(self, tmp_path):
+        """Reconcile updates the surface form and clears english_variants."""
+        work = _setup_work_dir(tmp_path)
+        config = _make_config(work)
+        state = load_state(work)
+        _mark_prior_stages_complete(work, state)
+        mark_stage_started(work, state, "glossary_build")
+        mark_stage_completed(work, state, "glossary_build")
+        mark_stage_started(work, state, "glossary_cluster")
+        mark_stage_completed(work, state, "glossary_cluster")
+
+        glossary = Glossary(
+            entities=[
+                GlossaryEntity(
+                    entity_id="character_000001",
+                    category="character",
+                    canonical_english="Abel",
+                    surface_forms=[
+                        SurfaceForm(
+                            source="アベル",
+                            english="Abel",
+                            english_variants=["Aberu", "Abell"],
+                        )
+                    ],
+                    source="extracted",
+                )
+            ]
+        )
+        _save_glossary(work, glossary, glossary_cluster_path(work))
+        _save_build_meta(work, _BuildMeta())
+
+        mock_reconcile = GlossaryReconcileResponse(
+            chosen_english="Abell",
+            reasoning="Best rendering for this exact form.",
+        )
+
+        with patch("dao_bridge.glossary.LLMClient") as mock_llm_cls:
+            mock_client = MagicMock()
+            mock_client.complete_json.return_value = mock_reconcile
+            mock_llm_cls.return_value = mock_client
+
+            glossary = glossary_reconcile(work, config, state, force=True)
+
+        entity = next(e for e in glossary.entities if e.entity_id == "character_000001")
+        sf = entity.surface_forms[0]
+        assert sf.english == "Abell"
+        assert sf.english_variants == []
+        assert entity.canonical_english == "Abel"
+
+    def test_multi_surface_forms_resolved_independently(self, tmp_path):
+        """Each surface form with variants becomes its own reconcile item."""
+        work = _setup_work_dir(tmp_path)
+        config = _make_config(work)
+        state = load_state(work)
+        _mark_prior_stages_complete(work, state)
+        mark_stage_started(work, state, "glossary_build")
+        mark_stage_completed(work, state, "glossary_build")
+        mark_stage_started(work, state, "glossary_cluster")
+        mark_stage_completed(work, state, "glossary_cluster")
+
+        glossary = Glossary(
+            entities=[
+                GlossaryEntity(
+                    entity_id="character_000001",
+                    category="character",
+                    canonical_english="Abel",
+                    surface_forms=[
+                        SurfaceForm(source="アベル", english="Abel", english_variants=["Aberu"]),
+                        SurfaceForm(
+                            source="ヴィンセント",
+                            english="Vincent",
+                            english_variants=["Vincento"],
+                        ),
+                    ],
+                    source="extracted",
+                )
+            ]
+        )
+        _save_glossary(work, glossary, glossary_cluster_path(work))
+        _save_build_meta(work, _BuildMeta())
+
+        responses = [
+            GlossaryReconcileResponse(
+                chosen_english="Aberu",
+                reasoning="Preferred for this form.",
+            ),
+            GlossaryReconcileResponse(
+                chosen_english="Vincento",
+                reasoning="Preferred for this form.",
+            ),
+        ]
+
+        with patch("dao_bridge.glossary.LLMClient") as mock_llm_cls:
+            mock_client = MagicMock()
+            mock_client.complete_json.side_effect = responses
+            mock_llm_cls.return_value = mock_client
+
+            glossary = glossary_reconcile(work, config, state, force=True)
+
+        entity = next(e for e in glossary.entities if e.entity_id == "character_000001")
+        by_source = {sf.source: sf for sf in entity.surface_forms}
+        assert by_source["アベル"].english == "Aberu"
+        assert by_source["ヴィンセント"].english == "Vincento"
+        assert by_source["アベル"].english_variants == []
+        assert by_source["ヴィンセント"].english_variants == []
+        assert mock_client.complete_json.call_count == 2
+
+    def test_surface_form_change_and_variant_clear_persisted_together(self, tmp_path):
+        """Disk glossary persists chosen English and cleared variants in one save."""
+        work = _setup_work_dir(tmp_path)
+        config = _make_config(work)
+        state = load_state(work)
+        _mark_prior_stages_complete(work, state)
+        mark_stage_started(work, state, "glossary_build")
+        mark_stage_completed(work, state, "glossary_build")
+        mark_stage_started(work, state, "glossary_cluster")
+        mark_stage_completed(work, state, "glossary_cluster")
+
+        glossary = Glossary(
+            entities=[
+                GlossaryEntity(
+                    entity_id="character_000001",
+                    category="character",
+                    canonical_english="Abel",
+                    surface_forms=[
+                        SurfaceForm(source="アベル", english="Abel", english_variants=["Aberu"])
+                    ],
+                    source="extracted",
+                )
+            ]
+        )
+        _save_glossary(work, glossary, glossary_cluster_path(work))
+        _save_build_meta(work, _BuildMeta())
+
+        mock_reconcile = GlossaryReconcileResponse(
+            chosen_english="Aberu",
+            reasoning="Best rendering for this form.",
+        )
+
+        saved_states: list[tuple[str, list[str]]] = []
+
+        real_save_glossary = _save_glossary
+
+        def checking_save_glossary(work_dir, glossary, path=None):
+            real_save_glossary(work_dir, glossary, path)
+            disk_glossary = _load_glossary(work_dir, path)
+            entity = next(e for e in disk_glossary.entities if e.entity_id == "character_000001")
+            sf = entity.surface_forms[0]
+            saved_states.append((sf.english, list(sf.english_variants)))
+
+        with (
+            patch("dao_bridge.glossary.LLMClient") as mock_llm_cls,
+            patch(
+                "dao_bridge.glossary._save_glossary",
+                side_effect=checking_save_glossary,
+            ),
+        ):
+            mock_client = MagicMock()
+            mock_client.complete_json.return_value = mock_reconcile
+            mock_llm_cls.return_value = mock_client
+            glossary = glossary_reconcile(work, config, state, force=True)
+
+        entity = next(e for e in glossary.entities if e.entity_id == "character_000001")
+        assert entity.surface_forms[0].english == "Aberu"
+        assert entity.surface_forms[0].english_variants == []
+        assert ("Aberu", []) in saved_states
+
+    def test_surface_form_conflicts_do_not_create_item_state(self, tmp_path):
+        """Surface-form conflicts are resumed from glossary data, not state items."""
+        work = _setup_work_dir(tmp_path)
+        config = _make_config(work)
+        state = load_state(work)
+        _mark_prior_stages_complete(work, state)
+        mark_stage_started(work, state, "glossary_build")
+        mark_stage_completed(work, state, "glossary_build")
+        mark_stage_started(work, state, "glossary_cluster")
+        mark_stage_completed(work, state, "glossary_cluster")
+
+        glossary = Glossary(
+            entities=[
+                GlossaryEntity(
+                    entity_id="character_000001",
+                    category="character",
+                    canonical_english="Abel",
+                    surface_forms=[
+                        SurfaceForm(source="アベル", english="Abel", english_variants=["Aberu"])
+                    ],
+                    source="extracted",
+                )
+            ]
+        )
+        _save_glossary(work, glossary, glossary_cluster_path(work))
+        _save_build_meta(work, _BuildMeta())
+
+        mock_reconcile = GlossaryReconcileResponse(
+            chosen_english="Aberu",
+            reasoning="Best rendering for this form.",
+        )
+
+        with patch("dao_bridge.glossary.LLMClient") as mock_llm_cls:
+            mock_client = MagicMock()
+            mock_client.complete_json.return_value = mock_reconcile
+            mock_llm_cls.return_value = mock_client
+            glossary_reconcile(work, config, state, force=True)
+
+        assert not any(
+            key.startswith("glossary_reconcile:glossary_reconcile.sf.") for key in state.items
+        )
+
+
+# ---------------------------------------------------------------------------
 # TestGlossaryReconcile
 # ---------------------------------------------------------------------------
 
@@ -1528,7 +2070,8 @@ class TestGlossaryReconcile:
         mark_stage_started(work, state, "glossary_cluster")
         mark_stage_completed(work, state, "glossary_cluster")
 
-        # Create glossary with an entity.
+        # Create glossary with an entity — written to cluster output
+        # (reconcile's input).
         glossary = Glossary(
             entities=[
                 GlossaryEntity(
@@ -1542,7 +2085,7 @@ class TestGlossaryReconcile:
                 ),
             ]
         )
-        _save_glossary(work, glossary)
+        _save_glossary(work, glossary, glossary_cluster_path(work))
 
         # Create build meta with a conflict.
         meta = _BuildMeta(
@@ -1664,7 +2207,7 @@ class TestGlossaryReconcile:
                 ),
             ]
         )
-        _save_glossary(work, glossary)
+        _save_glossary(work, glossary, glossary_cluster_path(work))
         _save_build_meta(work, _BuildMeta())
 
         mock_speech = GlossarySpeechMergeResponse(
@@ -1705,7 +2248,7 @@ class TestGlossaryReconcile:
                 ),
             ]
         )
-        _save_glossary(work, glossary)
+        _save_glossary(work, glossary, glossary_cluster_path(work))
         _save_build_meta(work, _BuildMeta())
 
         mock_speech = GlossarySpeechMergeResponse(
@@ -1758,7 +2301,7 @@ class TestGlossaryReconcile:
                 ),
             ]
         )
-        _save_glossary(work, glossary)
+        _save_glossary(work, glossary, glossary_cluster_path(work))
         _save_build_meta(work, _BuildMeta())
 
         with patch("dao_bridge.glossary.LLMClient") as mock_llm_cls:
@@ -1790,7 +2333,7 @@ class TestGlossaryReconcile:
                 ),
             ]
         )
-        _save_glossary(work, glossary)
+        _save_glossary(work, glossary, glossary_cluster_path(work))
 
         meta = _BuildMeta(
             conflicts=[
@@ -1834,10 +2377,109 @@ class TestGlossaryReconcile:
                 ),
             ]
         )
-        _save_glossary(work, bad_glossary)
+        _save_glossary(work, bad_glossary, glossary_build_path(work))
 
         with pytest.raises(ValueError, match="weapon"):
             glossary_build(work, config, state, force=False)
+
+    def test_reconcile_reads_from_cluster_output(self, tmp_path):
+        """Reconcile loads from glossary_cluster.json."""
+        work, config, state = self._setup_with_conflicts(tmp_path)
+
+        # glossary_cluster.json should exist (written by setup), glossary.json should not.
+        assert glossary_cluster_path(work).exists()
+        assert not glossary_path(work).exists()
+
+        mock_response = GlossaryReconcileResponse(
+            chosen_english="Lugunica", reasoning="Fan convention."
+        )
+
+        with patch("dao_bridge.glossary.LLMClient") as mock_llm_cls:
+            mock_client = MagicMock()
+            mock_client.complete_json.return_value = mock_response
+            mock_llm_cls.return_value = mock_client
+            glossary = glossary_reconcile(work, config, state, force=True)
+
+        # Should have loaded the entity from cluster output.
+        assert len(glossary.entities) == 1
+        assert glossary.entities[0].canonical_english == "Lugunica"
+
+    def test_reconcile_writes_to_glossary_json(self, tmp_path):
+        """Reconcile output goes to glossary.json (final output)."""
+        work, config, state = self._setup_with_conflicts(tmp_path)
+
+        mock_response = GlossaryReconcileResponse(
+            chosen_english="Lugunica", reasoning="Fan convention."
+        )
+
+        with patch("dao_bridge.glossary.LLMClient") as mock_llm_cls:
+            mock_client = MagicMock()
+            mock_client.complete_json.return_value = mock_response
+            mock_llm_cls.return_value = mock_client
+            glossary_reconcile(work, config, state, force=True)
+
+        # glossary.json should exist as the final output.
+        assert glossary_path(work).exists()
+        final = _load_glossary(work)
+        assert final.entities[0].canonical_english == "Lugunica"
+
+    def test_reconcile_force_rereads_cluster_output(self, tmp_path):
+        """--force on reconcile deletes glossary.json and re-reads from glossary_cluster.json."""
+        work, config, state = self._setup_with_conflicts(tmp_path)
+
+        # Record original entity data from cluster output.
+        original = _load_glossary(work, glossary_cluster_path(work))
+        original_english = original.entities[0].canonical_english
+        assert original_english == "Lugnica"
+
+        mock_response = GlossaryReconcileResponse(
+            chosen_english="Lugunica", reasoning="Fan convention."
+        )
+
+        with patch("dao_bridge.glossary.LLMClient") as mock_llm_cls:
+            mock_client = MagicMock()
+            mock_client.complete_json.return_value = mock_response
+            mock_llm_cls.return_value = mock_client
+            glossary = glossary_reconcile(work, config, state, force=True)
+
+        # Reconcile changed the entity.
+        assert glossary.entities[0].canonical_english == "Lugunica"
+
+        # Force re-run: should delete glossary.json and re-read from
+        # glossary_cluster.json (which still has "Lugnica").
+        mock_response2 = GlossaryReconcileResponse(
+            chosen_english="Lugnica Kingdom", reasoning="Different choice."
+        )
+
+        with patch("dao_bridge.glossary.LLMClient") as mock_llm_cls:
+            mock_client = MagicMock()
+            mock_client.complete_json.return_value = mock_response2
+            mock_llm_cls.return_value = mock_client
+            glossary = glossary_reconcile(work, config, state, force=True)
+
+        # Should have the new LLM choice, applied from pristine cluster output.
+        assert glossary.entities[0].canonical_english == "Lugnica Kingdom"
+
+    def test_cluster_output_not_mutated_by_reconcile(self, tmp_path):
+        """glossary_cluster.json is byte-identical before and after reconcile."""
+        work, config, state = self._setup_with_conflicts(tmp_path)
+
+        # Record cluster output bytes.
+        cluster_bytes_before = glossary_cluster_path(work).read_bytes()
+
+        mock_response = GlossaryReconcileResponse(
+            chosen_english="Lugunica", reasoning="Fan convention."
+        )
+
+        with patch("dao_bridge.glossary.LLMClient") as mock_llm_cls:
+            mock_client = MagicMock()
+            mock_client.complete_json.return_value = mock_response
+            mock_llm_cls.return_value = mock_client
+            glossary_reconcile(work, config, state, force=True)
+
+        # Cluster output must not have been mutated.
+        cluster_bytes_after = glossary_cluster_path(work).read_bytes()
+        assert cluster_bytes_before == cluster_bytes_after
 
 
 # ---------------------------------------------------------------------------
@@ -2090,6 +2732,7 @@ class TestLanguageAgnostic:
                     )
                 ]
             ),
+            glossary_build_path(work),
         )
 
         captured_messages = []
@@ -2201,11 +2844,17 @@ class TestGlossaryIntegration:
         assert any(e.canonical_english == "Subaru" for e in glossary.entities)
         assert any(e.canonical_english == "Emilia" for e in glossary.entities)
 
-        # Verify glossary.json exists on disk.
-        gp = glossary_path(work)
-        assert gp.exists()
-        disk_glossary = Glossary(**json.loads(gp.read_text(encoding="utf-8")))
+        # Verify glossary_build.json exists on disk (build output).
+        bp = glossary_build_path(work)
+        assert bp.exists()
+        disk_glossary = Glossary(**json.loads(bp.read_text(encoding="utf-8")))
         assert len(disk_glossary.entities) >= 2
+
+        # glossary.json should NOT exist yet (reconcile hasn't run).
+        assert not glossary_path(work).exists()
+
+        # Record build output bytes for immutability check.
+        build_bytes = bp.read_bytes()
 
         # --- glossary-cluster (no duplicates, so no-op) ---
         from dao_bridge.glossary import glossary_cluster
@@ -2218,6 +2867,11 @@ class TestGlossaryIntegration:
         cluster_report_path = work / "glossary_cluster_report.md"
         assert cluster_report_path.exists()
 
+        # glossary_cluster.json should exist.
+        assert glossary_cluster_path(work).exists()
+        # Build output must not have been mutated by clustering.
+        assert bp.read_bytes() == build_bytes
+
         # --- glossary-reconcile (no conflicts, so no-op) ---
         with patch("dao_bridge.glossary.LLMClient") as mock_llm_cls:
             glossary = glossary_reconcile(work, config, state, force=True)
@@ -2229,3 +2883,9 @@ class TestGlossaryIntegration:
 
         report_path = work / "glossary_reconcile_report.md"
         assert report_path.exists()
+
+        # glossary.json should now exist (reconcile output).
+        assert glossary_path(work).exists()
+        # All three stage output files should coexist.
+        assert glossary_build_path(work).exists()
+        assert glossary_cluster_path(work).exists()

@@ -64,6 +64,8 @@ from dao_bridge.state import (
 from dao_bridge.workdir import (
     atomic_write,
     chunk_dir,
+    glossary_build_path,
+    glossary_cluster_path,
     glossary_path,
     manifest_path,
     pad_spine,
@@ -77,6 +79,7 @@ logger = logging.getLogger("dao_bridge")
 
 _PROMPT_DIR = Path(__file__).parent / "prompts"
 _BUILD_META_FILENAME = "_glossary_build_meta.json"
+_CLUSTER_META_FILENAME = "_glossary_cluster_meta.json"
 
 # Delimiter used to accumulate multiple speech-style observations before
 # the reconcile stage consolidates them.
@@ -120,6 +123,24 @@ class _BuildMeta(BaseModel):
     conflicts: list[_ConflictRecord] = Field(default_factory=list)
     corrections: list[dict] = Field(default_factory=list)
     processed_batches: list[str] = Field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# Cluster metadata sidecar
+# ---------------------------------------------------------------------------
+
+
+class _ClusterMeta(BaseModel):
+    """Internal sidecar persisted during the clustering stage.
+
+    Tracks which iterations completed and accumulates the merge log so
+    that resumed runs can skip completed iterations and the final report
+    includes all merges across runs.
+    """
+
+    completed_iterations: list[int] = Field(default_factory=list)
+    merge_log: list[dict] = Field(default_factory=list)
+    total_candidates_evaluated: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -568,6 +589,8 @@ def add_or_update_surface_form(
     for sf in entity.surface_forms:
         if sf.source == mention.source:
             sf.occurrence_count += 1
+            if mention.english != sf.english and mention.english not in sf.english_variants:
+                sf.english_variants.append(mention.english)
             # Backfill reading.
             if not sf.reading and mention.reading:
                 sf.reading = mention.reading
@@ -745,6 +768,59 @@ def _render_existing_glossary(glossary: Glossary, max_tokens: int) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Stage invalidation cascade
+# ---------------------------------------------------------------------------
+
+# Pipeline ordering: glossary_build -> glossary_cluster -> glossary_reconcile
+_DOWNSTREAM_STAGES: dict[str, list[str]] = {
+    "glossary_build": ["glossary_cluster", "glossary_reconcile"],
+    "glossary_cluster": ["glossary_reconcile"],
+}
+
+# Mapping from stage name to output file path functions and meta sidecars
+# that should be deleted when the stage is invalidated.
+_STAGE_OUTPUT_FILES: dict[str, list[str]] = {
+    "glossary_cluster": ["glossary_cluster", "cluster_meta"],
+    "glossary_reconcile": ["glossary"],
+}
+
+
+def _invalidate_downstream_stages(
+    work_dir: Path,
+    state: PipelineState,
+    from_stage: str,
+) -> None:
+    """Reset downstream stages and delete their output/meta files.
+
+    Called when *from_stage* produces new output that makes downstream
+    outputs stale.  For each downstream stage, this:
+
+    1. Resets the stage status and all its items to ``"pending"``.
+    2. Deletes the stage's output files and meta sidecars.
+
+    This is the **only** place downstream invalidation logic lives,
+    ensuring consistent behaviour across ``--force``, ``--spine``,
+    ``--batch``, and any future partial-rerun modes.
+    """
+    for downstream in _DOWNSTREAM_STAGES.get(from_stage, []):
+        reset_stage(work_dir, state, downstream)
+
+    # Delete output files for all downstream stages.
+    file_getters = {
+        "glossary_cluster": glossary_cluster_path,
+        "cluster_meta": _cluster_meta_path,
+        "glossary": glossary_path,
+    }
+    for downstream in _DOWNSTREAM_STAGES.get(from_stage, []):
+        for file_key in _STAGE_OUTPUT_FILES.get(downstream, []):
+            getter = file_getters.get(file_key)
+            if getter:
+                fp = getter(work_dir)
+                if fp.exists():
+                    fp.unlink()
+
+
+# ---------------------------------------------------------------------------
 # Build-meta sidecar helpers
 # ---------------------------------------------------------------------------
 
@@ -768,14 +844,85 @@ def _save_build_meta(work_dir: Path, meta: _BuildMeta) -> None:
     atomic_write(_build_meta_path(work_dir), meta.model_dump_json(indent=2))
 
 
+def _remap_build_meta_conflicts(
+    meta: _BuildMeta,
+    loser_id: str,
+    winner_id: str,
+) -> None:
+    """Update conflict records in *meta* after merging *loser_id* into *winner_id*.
+
+    If the loser has a conflict record, its ``entity_id`` is remapped to the
+    winner.  If both the winner and loser have records, their ``alternatives``
+    and ``category_variants`` are merged (deduplicated) and the loser's record
+    is removed.
+    """
+    winner_record: _ConflictRecord | None = None
+    loser_record: _ConflictRecord | None = None
+
+    for conflict in meta.conflicts:
+        if conflict.entity_id == winner_id:
+            winner_record = conflict
+        elif conflict.entity_id == loser_id:
+            loser_record = conflict
+
+    if loser_record is not None:
+        if winner_record is None:
+            # Simple case: just remap the entity_id.
+            loser_record.entity_id = winner_id
+        else:
+            # Both have records — merge loser into winner and remove loser.
+            existing_english = {a["english"] for a in winner_record.alternatives}
+            for alt in loser_record.alternatives:
+                if alt["english"] not in existing_english:
+                    winner_record.alternatives.append(alt)
+                    existing_english.add(alt["english"])
+            for cat in loser_record.category_variants:
+                if cat not in winner_record.category_variants:
+                    winner_record.category_variants.append(cat)
+            meta.conflicts.remove(loser_record)
+
+
+# ---------------------------------------------------------------------------
+# Cluster-meta sidecar helpers
+# ---------------------------------------------------------------------------
+
+
+def _cluster_meta_path(work_dir: Path) -> Path:
+    """Return the path to the cluster-meta sidecar file."""
+    return work_dir / _CLUSTER_META_FILENAME
+
+
+def _load_cluster_meta(work_dir: Path) -> _ClusterMeta:
+    """Load the cluster-meta sidecar, returning a fresh one if absent."""
+    p = _cluster_meta_path(work_dir)
+    if p.exists():
+        data = json.loads(p.read_text(encoding="utf-8"))
+        return _ClusterMeta(**data)
+    return _ClusterMeta()
+
+
+def _save_cluster_meta(work_dir: Path, meta: _ClusterMeta) -> None:
+    """Atomically save the cluster-meta sidecar."""
+    atomic_write(_cluster_meta_path(work_dir), meta.model_dump_json(indent=2))
+
+
 # ---------------------------------------------------------------------------
 # Glossary load / save helpers
 # ---------------------------------------------------------------------------
 
 
-def _load_glossary(work_dir: Path) -> Glossary:
-    """Load ``glossary.json`` from the work directory, or return a fresh one."""
-    gp = glossary_path(work_dir)
+def _load_glossary(work_dir: Path, path: Path | None = None) -> Glossary:
+    """Load a glossary JSON file, or return a fresh one if absent.
+
+    Parameters
+    ----------
+    work_dir:
+        Work directory (used to derive the default path).
+    path:
+        Explicit file path.  When *None*, falls back to
+        ``glossary_path(work_dir)`` (``glossary.json``).
+    """
+    gp = path or glossary_path(work_dir)
     if gp.exists():
         data = json.loads(gp.read_text(encoding="utf-8"))
         return Glossary(**data)
@@ -800,10 +947,22 @@ def load_glossary(work_dir: Path, config: AppConfig) -> Glossary:
     return glossary
 
 
-def _save_glossary(work_dir: Path, glossary: Glossary) -> None:
-    """Atomically save ``glossary.json``."""
+def _save_glossary(work_dir: Path, glossary: Glossary, path: Path | None = None) -> None:
+    """Atomically save a glossary JSON file.
+
+    Parameters
+    ----------
+    work_dir:
+        Work directory (used to derive the default path).
+    glossary:
+        The glossary to persist.
+    path:
+        Explicit file path.  When *None*, falls back to
+        ``glossary_path(work_dir)`` (``glossary.json``).
+    """
     glossary.updated_at = datetime.now(timezone.utc)
-    atomic_write(glossary_path(work_dir), glossary.model_dump_json(indent=2))
+    gp = path or glossary_path(work_dir)
+    atomic_write(gp, glossary.model_dump_json(indent=2))
 
 
 # ---------------------------------------------------------------------------
@@ -875,6 +1034,11 @@ def _merge_mention_into_glossary(
         return
 
     # Add or update the surface form on the entity.
+    # Same-source translation disagreements are captured as
+    # translation_variants on the SurfaceForm and resolved by
+    # surface-form reconciliation.  New source forms with different
+    # translations are legitimate (e.g. full name vs short name) and
+    # do not warrant an entity-level conflict record.
     add_or_update_surface_form(entity, mention, chunk_id)
 
     # Merge summary.
@@ -885,24 +1049,6 @@ def _merge_mention_into_glossary(
 
     # Update temporal tracking.
     entity.latest_evidence_chunk = chunk_id
-
-    # Check for English-form conflict (mention's English vs entity's canonical).
-    if mention.english != entity.canonical_english:
-        # Only record a conflict if the English differs from ALL existing
-        # surface forms — if a surface form with this English already exists,
-        # it's just a different surface form, not a conflict.
-        existing_english_set = {sf.english for sf in entity.surface_forms}
-        if mention.english not in existing_english_set:
-            _record_conflict(
-                meta,
-                entity_id=entity.entity_id,
-                source_form=mention.source,
-                reading=mention.reading,
-                current_english=entity.canonical_english,
-                proposed_english=mention.english,
-                batch_id=batch_id,
-                context_snippet=f"Batch {batch_id}",
-            )
 
     # Check for category conflict.
     if mention.category != entity.category:
@@ -1166,13 +1312,22 @@ def glossary_build(
     # Targeted runs handle their own reset below; skip full-stage reset.
     if force and not targeted:
         reset_stage(work_dir, state, stage)
-        # Also reset glossary and meta files.
-        gp = glossary_path(work_dir)
-        if gp.exists():
-            gp.unlink()
+        # Delete build output.
+        bp = glossary_build_path(work_dir)
+        if bp.exists():
+            bp.unlink()
+        # Delete build meta.
         bmp = _build_meta_path(work_dir)
         if bmp.exists():
             bmp.unlink()
+        # Invalidate downstream stages (cluster + reconcile) — their
+        # outputs depend on build output and are now stale.
+        _invalidate_downstream_stages(work_dir, state, stage)
+        # Migration cleanup: remove old snapshot files if they exist.
+        for legacy in ["glossary_pre_cluster.json", "glossary_pre_reconcile.json"]:
+            lp = work_dir / legacy
+            if lp.exists():
+                lp.unlink()
 
     # Handle --retry-failed: re-open a completed stage without wiping items.
     if retry_failed and not force and not targeted:
@@ -1180,7 +1335,7 @@ def glossary_build(
 
     if not force and not retry_failed and not targeted and is_stage_completed(state, stage):
         logger.info("Glossary build already completed — skipping (use --force to re-run)")
-        return _load_glossary(work_dir)
+        return _load_glossary(work_dir, glossary_build_path(work_dir))
 
     mark_stage_started(work_dir, state, stage)
 
@@ -1188,10 +1343,10 @@ def glossary_build(
     all_chunks = _load_all_chunks(work_dir, manifest)
     if not all_chunks:
         logger.warning("No chunks found — glossary will be empty.")
-        glossary = _load_glossary(work_dir)
+        glossary = _load_glossary(work_dir, glossary_build_path(work_dir))
         glossary.book_id = manifest.book_id
         glossary.book_metadata = manifest.metadata
-        _save_glossary(work_dir, glossary)
+        _save_glossary(work_dir, glossary, glossary_build_path(work_dir))
         mark_stage_completed(work_dir, state, stage)
         return glossary
 
@@ -1221,6 +1376,8 @@ def glossary_build(
             if not target_ids:
                 raise RuntimeError(f"Spine {target_spine} has no glossary batches.")
         reset_stage_items(work_dir, state, stage, target_ids)
+        # Targeted reruns change build output, making downstream stale.
+        _invalidate_downstream_stages(work_dir, state, stage)
         work_items = [b for b in all_work_items if b.item_id in set(target_ids)]
     else:
         work_items = all_work_items
@@ -1232,7 +1389,7 @@ def glossary_build(
     pending = set(iter_pending_items(state, stage, item_ids))
 
     # Load existing glossary and meta (for resume).
-    glossary = _load_glossary(work_dir)
+    glossary = _load_glossary(work_dir, glossary_build_path(work_dir))
     glossary.book_id = manifest.book_id
     glossary.book_metadata = manifest.metadata
     meta = _load_build_meta(work_dir)
@@ -1314,7 +1471,7 @@ def glossary_build(
             _merge_extraction_into_glossary(glossary, response, batch.item_id, first_chunk_id, meta)
 
             # Save after each sub-batch (resumable).
-            _save_glossary(work_dir, glossary)
+            _save_glossary(work_dir, glossary, glossary_build_path(work_dir))
             _save_build_meta(work_dir, meta)
             mark_item_completed(work_dir, state, stage, batch.item_id)
 
@@ -1335,7 +1492,7 @@ def glossary_build(
             )
             mark_item_failed(work_dir, state, stage, batch.item_id, str(exc))
             # Save progress so far even on failure.
-            _save_glossary(work_dir, glossary)
+            _save_glossary(work_dir, glossary, glossary_build_path(work_dir))
             _save_build_meta(work_dir, meta)
             raise
         except Exception as exc:
@@ -1346,7 +1503,7 @@ def glossary_build(
                 exc,
             )
             mark_item_failed(work_dir, state, stage, batch.item_id, str(exc))
-            _save_glossary(work_dir, glossary)
+            _save_glossary(work_dir, glossary, glossary_build_path(work_dir))
             _save_build_meta(work_dir, meta)
             raise
 
@@ -1401,6 +1558,15 @@ def glossary_cluster(
     exposes a substring match to C).  Iterations are capped by
     ``config.glossary.cluster.max_iterations``.
 
+    State is tracked at the **iteration** level (one item per iteration).
+    If an iteration fails mid-batch, the completed merges from earlier
+    batches are preserved in the glossary and the iteration is re-run
+    from fresh candidates on resume.
+
+    Reads from ``glossary_build.json`` (never mutated) and writes to
+    ``glossary_cluster.json``.  Running with ``--force`` deletes the
+    cluster output and re-reads from the pristine build output.
+
     Writes a clustering report to ``<work_dir>/glossary_cluster_report.md``.
 
     Parameters
@@ -1412,13 +1578,14 @@ def glossary_cluster(
     state:
         Pipeline state (mutated in place).
     force:
-        If *True*, reset and cluster from scratch.
+        If *True*, delete cluster output, reset state and cluster meta,
+        and cluster from scratch using ``glossary_build.json``.
     retry_failed:
-        If *True*, re-enter a completed stage to retry only failed items.
-        Preserves completed item state (unlike ``force``).
+        If *True*, re-enter a completed stage to retry only failed
+        iterations.  Preserves completed iteration state.
     on_progress:
-        Optional callback invoked with the item ID after each batch
-        is processed.
+        Optional callback invoked with the iteration item ID (e.g.
+        ``"iter1"``) after each iteration is processed.
 
     Returns
     -------
@@ -1426,6 +1593,7 @@ def glossary_cluster(
         The updated glossary with duplicate entities merged.
     """
     from dao_bridge.glossary_clustering import (
+        _resolve_id,
         generate_cluster_candidates,
         merge_entities,
         remap_entity_id,
@@ -1442,9 +1610,20 @@ def glossary_cluster(
             "Glossary build stage not completed. Run 'dao-bridge glossary-build' first."
         )
 
-    # Handle force / already-completed.
+    # Handle force: delete cluster output, reset state + meta.
     if force:
         reset_stage(work_dir, state, stage)
+        # Delete cluster output — will be regenerated from glossary_build.json.
+        cp = glossary_cluster_path(work_dir)
+        if cp.exists():
+            cp.unlink()
+        # Delete cluster meta.
+        cmp = _cluster_meta_path(work_dir)
+        if cmp.exists():
+            cmp.unlink()
+        # Invalidate downstream stages (reconcile) — output depends on
+        # cluster output and is now stale.
+        _invalidate_downstream_stages(work_dir, state, stage)
 
     # Handle --retry-failed: re-open a completed stage without wiping items.
     if retry_failed and not force:
@@ -1452,10 +1631,22 @@ def glossary_cluster(
 
     if not force and not retry_failed and is_stage_completed(state, stage):
         logger.info("Glossary cluster already completed — skipping (use --force to re-run)")
-        return _load_glossary(work_dir)
+        return _load_glossary(work_dir, glossary_cluster_path(work_dir))
 
-    # Load glossary and validate categories.
-    glossary = _load_glossary(work_dir)
+    # Validate build output exists.
+    bp = glossary_build_path(work_dir)
+    if not bp.exists():
+        raise RuntimeError(
+            "Glossary build output not found. Run 'dao-bridge glossary-build' first."
+        )
+
+    # Load glossary: on resume load the in-progress cluster output if it
+    # exists; on clean start load from build output.
+    cp = glossary_cluster_path(work_dir)
+    if cp.exists():
+        glossary = _load_glossary(work_dir, cp)
+    else:
+        glossary = _load_glossary(work_dir, bp)
     validate_glossary_categories(glossary, config.glossary.categories)
 
     mark_stage_started(work_dir, state, stage)
@@ -1479,9 +1670,19 @@ def glossary_cluster(
             _llm_client = LLMClient(config.models.glossary, config.llm)
         return _llm_client
 
-    # Tracking for the report.
-    merge_log: list[dict] = []
-    total_candidates_evaluated = 0
+    # Load cluster meta (for resume — contains merge_log from prior iterations).
+    cluster_meta = _load_cluster_meta(work_dir)
+
+    # Load build meta so we can remap conflict entity_ids as merges occur.
+    # Conflicts are keyed by entity_id; when clustering absorbs an entity,
+    # its conflict records must follow the surviving entity so that
+    # reconcile can still find and apply them.
+    build_meta = _load_build_meta(work_dir)
+
+    # Seed report accumulators from cluster meta (so resumed runs include
+    # data from prior completed iterations).
+    merge_log: list[dict] = list(cluster_meta.merge_log)
+    total_candidates_evaluated = cluster_meta.total_candidates_evaluated
 
     # Entity ID lookup helper.
     def _entity_by_id(eid: str) -> GlossaryEntity | None:
@@ -1493,11 +1694,25 @@ def glossary_cluster(
     # Iterative clustering loop.
     iteration = 0
     for iteration in range(1, cluster_config.max_iterations + 1):
-        # Generate candidates fresh each iteration.
+        item_id = f"iter{iteration}"
+
+        # Skip completed iterations.
+        pending = list(iter_pending_items(state, stage, [item_id]))
+        if not pending:
+            if on_progress:
+                on_progress(item_id)
+            continue
+
+        mark_item_started(work_dir, state, stage, item_id)
+
+        # Generate candidates fresh from the current glossary state.
         candidates = generate_cluster_candidates(glossary, cluster_config)
 
         if not candidates:
             logger.debug("Clustering iteration %d: no candidates — stopping early", iteration)
+            mark_item_completed(work_dir, state, stage, item_id)
+            if on_progress:
+                on_progress(item_id)
             break
 
         # Sort for deterministic processing order.
@@ -1509,22 +1724,13 @@ def glossary_cluster(
             batches.append(candidate_list[start : start + batch_size])
 
         merges_this_iteration = 0
+        iteration_merge_entries: list[dict] = []
+        iteration_candidates = 0
         # ID remap table for this iteration: absorbed_id -> surviving_id.
         id_map: dict[str, str] = {}
 
-        for batch_idx, batch_pairs in enumerate(batches, 1):
-            item_id = f"iter{iteration}.batch{batch_idx}"
-
-            # Check if already completed (for resumability).
-            pending = iter_pending_items(state, stage, [item_id])
-            if not pending:
-                if on_progress:
-                    on_progress(item_id)
-                continue
-
-            mark_item_started(work_dir, state, stage, item_id)
-
-            try:
+        try:
+            for batch_idx, batch_pairs in enumerate(batches, 1):
                 # Remap entity IDs in case earlier batches in this
                 # iteration already merged some of these entities.
                 raw_decisions = [(a, b, None) for a, b in batch_pairs]
@@ -1533,9 +1739,6 @@ def glossary_cluster(
                 active_pairs = [(a, b) for a, b, _ in remapped]
 
                 if not active_pairs:
-                    mark_item_completed(work_dir, state, stage, item_id)
-                    if on_progress:
-                        on_progress(item_id)
                     continue
 
                 # Build prompt with entity pair renderings.
@@ -1552,9 +1755,6 @@ def glossary_cluster(
                     )
 
                 if not pair_texts:
-                    mark_item_completed(work_dir, state, stage, item_id)
-                    if on_progress:
-                        on_progress(item_id)
                     continue
 
                 entity_pairs_str = "\n\n".join(pair_texts)
@@ -1570,57 +1770,59 @@ def glossary_cluster(
                 response = client.complete_json(
                     messages,
                     response_model=GlossaryClusterResponse,
-                    context_label=f"cluster.{item_id}",
+                    context_label=f"cluster.{item_id}.batch{batch_idx}",
                 )
-                total_candidates_evaluated += len(active_pairs)
+                iteration_candidates += len(active_pairs)
 
-                # Collect confirmed merge decisions.
-                merge_decisions: list[tuple[str, str, str | None]] = []
-                for decision in response.decisions:
-                    if not decision.same_entity:
+                # Execute merges directly from the original LLM
+                # decisions, resolving IDs on the fly through the remap
+                # chain.  This handles same-batch chaining (A+B then
+                # B+C) correctly regardless of chain depth, without
+                # needing to re-remap a separate decisions list.
+                for dec in response.decisions:
+                    if not dec.same_entity:
                         continue
-                    merge_decisions.append(
-                        (
-                            decision.entity_id_a,
-                            decision.entity_id_b,
-                            decision.preferred_canonical_english,
-                        )
-                    )
 
-                # Apply remapping to the LLM's decisions in case the
-                # LLM returned IDs that were already absorbed.
-                merge_decisions = remap_entity_id(merge_decisions, id_map)
+                    # Resolve both IDs through any prior merges.
+                    resolved_a = _resolve_id(dec.entity_id_a, id_map)
+                    resolved_b = _resolve_id(dec.entity_id_b, id_map)
 
-                # Execute merges.
-                for eid_a, eid_b, pref_english in merge_decisions:
-                    ea = _entity_by_id(eid_a)
-                    eb = _entity_by_id(eid_b)
+                    # Already the same entity after earlier merges.
+                    if resolved_a == resolved_b:
+                        continue
+
+                    ea = _entity_by_id(resolved_a)
+                    eb = _entity_by_id(resolved_b)
                     if ea is None or eb is None:
                         logger.warning(
                             "Cluster merge skipped: entity %s or %s not found",
-                            eid_a,
-                            eid_b,
+                            resolved_a,
+                            resolved_b,
                         )
                         continue
 
-                    # Determine winner — look for preferred_entity_id
-                    # in the original LLM decisions.
+                    # Determine winner from the LLM's preferred_entity_id,
+                    # resolved through the remap chain.
                     winner, loser = ea, eb
-                    preferred_id = None
-                    for dec in response.decisions:
-                        if dec.same_entity and (
-                            {dec.entity_id_a, dec.entity_id_b} == {eid_a, eid_b}
-                            or {dec.entity_id_a, dec.entity_id_b}
-                            == {
-                                _reverse_lookup(eid_a, id_map, eid_a),
-                                _reverse_lookup(eid_b, id_map, eid_b),
-                            }
-                        ):
-                            preferred_id = dec.preferred_entity_id
-                            break
+                    if dec.preferred_entity_id:
+                        resolved_pref = _resolve_id(dec.preferred_entity_id, id_map)
+                        if resolved_pref == ea.entity_id:
+                            winner, loser = ea, eb
+                        elif resolved_pref == eb.entity_id:
+                            winner, loser = eb, ea
+                        else:
+                            logger.warning(
+                                "Cluster merge: preferred_entity_id %s "
+                                "(resolved: %s) matches neither %s nor %s "
+                                "— using default winner",
+                                dec.preferred_entity_id,
+                                resolved_pref,
+                                ea.entity_id,
+                                eb.entity_id,
+                            )
 
-                    if preferred_id and preferred_id == eb.entity_id:
-                        winner, loser = eb, ea
+                    pref_english = dec.preferred_canonical_english
+                    reasoning = dec.reasoning or ""
 
                     # Record surface forms being added before merge.
                     existing_sources = {sf.source for sf in winner.surface_forms}
@@ -1630,23 +1832,17 @@ def glossary_cluster(
                         if sf.source not in existing_sources
                     ]
 
-                    # Find the reasoning from the LLM.
-                    reasoning = ""
-                    for dec in response.decisions:
-                        if dec.same_entity and {dec.entity_id_a, dec.entity_id_b} & {
-                            eid_a,
-                            eid_b,
-                        }:
-                            reasoning = dec.reasoning
-                            break
-
                     merge_entities(winner, loser, pref_english)
                     glossary.entities.remove(loser)
 
                     # Update ID remap table.
                     id_map[loser.entity_id] = winner.entity_id
 
-                    merge_log.append(
+                    # Remap build-meta conflict records so reconcile can
+                    # still find and apply them to the surviving entity.
+                    _remap_build_meta_conflicts(build_meta, loser.entity_id, winner.entity_id)
+
+                    iteration_merge_entries.append(
                         {
                             "winner_id": winner.entity_id,
                             "loser_id": loser.entity_id,
@@ -1662,30 +1858,44 @@ def glossary_cluster(
 
                     merges_this_iteration += 1
 
-                # Save after each batch.
-                _save_glossary(work_dir, glossary)
-                mark_item_completed(work_dir, state, stage, item_id)
+                # Save glossary and build meta after each batch for crash safety.
+                _save_glossary(work_dir, glossary, glossary_cluster_path(work_dir))
+                _save_build_meta(work_dir, build_meta)
 
                 logger.debug(
-                    "Cluster %s: %d pairs evaluated, %d merges",
+                    "Cluster %s batch %d: %d pairs evaluated, %d merges",
                     item_id,
+                    batch_idx,
                     len(active_pairs),
                     sum(1 for d in response.decisions if d.same_entity),
                 )
 
-            except LLMStructuredOutputError as exc:
-                logger.error("Structured output failed for cluster %s: %s", item_id, exc)
-                mark_item_failed(work_dir, state, stage, item_id, str(exc))
-                _save_glossary(work_dir, glossary)
-                raise
-            except Exception as exc:
-                logger.error("Unexpected error in cluster %s: %s", item_id, exc)
-                mark_item_failed(work_dir, state, stage, item_id, str(exc))
-                _save_glossary(work_dir, glossary)
-                raise
+            # All batches in this iteration succeeded.
+            merge_log.extend(iteration_merge_entries)
+            total_candidates_evaluated += iteration_candidates
+            cluster_meta.completed_iterations.append(iteration)
+            cluster_meta.merge_log.extend(iteration_merge_entries)
+            cluster_meta.total_candidates_evaluated += iteration_candidates
+            _save_cluster_meta(work_dir, cluster_meta)
+            mark_item_completed(work_dir, state, stage, item_id)
 
-            if on_progress:
-                on_progress(item_id)
+        except LLMStructuredOutputError as exc:
+            logger.error("Structured output failed in cluster %s: %s", item_id, exc)
+            mark_item_failed(work_dir, state, stage, item_id, str(exc))
+            _save_glossary(work_dir, glossary, glossary_cluster_path(work_dir))
+            _save_cluster_meta(work_dir, cluster_meta)
+            _save_build_meta(work_dir, build_meta)
+            raise
+        except Exception as exc:
+            logger.error("Unexpected error in cluster %s: %s", item_id, exc)
+            mark_item_failed(work_dir, state, stage, item_id, str(exc))
+            _save_glossary(work_dir, glossary, glossary_cluster_path(work_dir))
+            _save_cluster_meta(work_dir, cluster_meta)
+            _save_build_meta(work_dir, build_meta)
+            raise
+
+        if on_progress:
+            on_progress(item_id)
 
         logger.info(
             "Clustering iteration %d: %d candidates, %d merges",
@@ -1698,6 +1908,12 @@ def glossary_cluster(
         # produce the same candidates — stop early.
         if merges_this_iteration == 0:
             break
+
+    # Ensure the cluster output file exists (e.g. zero candidates, no batches).
+    _save_glossary(work_dir, glossary, glossary_cluster_path(work_dir))
+
+    # Persist build meta with remapped conflict entity_ids.
+    _save_build_meta(work_dir, build_meta)
 
     # Write clustering report.
     report_path = work_dir / "glossary_cluster_report.md"
@@ -1714,14 +1930,6 @@ def glossary_cluster(
     )
 
     return glossary
-
-
-def _reverse_lookup(target: str, id_map: dict[str, str], default: str) -> str:
-    """Find a key in *id_map* that maps to *target*, or return *default*."""
-    for k, v in id_map.items():
-        if v == target:
-            return k
-    return default
 
 
 # ---------------------------------------------------------------------------
@@ -1744,6 +1952,11 @@ def glossary_reconcile(
     form.  For character entities with multiple accumulated speech-style
     observations, consolidates them into a single coherent description.
 
+    Reads from ``glossary_cluster.json`` (never mutated) and writes to
+    ``glossary.json`` (the final glossary consumed by translation and
+    export).  Running with ``--force`` deletes the reconcile output and
+    re-reads from the pristine cluster output.
+
     Writes a reconciliation report to
     ``<work_dir>/glossary_reconcile_report.md``.
 
@@ -1756,7 +1969,8 @@ def glossary_reconcile(
     state:
         Pipeline state (mutated in place).
     force:
-        If *True*, reset and reconcile from scratch.
+        If *True*, delete reconcile output, reset state, and reconcile
+        from scratch using ``glossary_cluster.json``.
     retry_failed:
         If *True*, re-enter a completed stage to retry only failed items.
         Preserves completed item state (unlike ``force``).
@@ -1777,9 +1991,13 @@ def glossary_reconcile(
             "Glossary cluster stage not completed. Run 'dao-bridge glossary-cluster' first."
         )
 
-    # Handle force / already-completed.
+    # Handle force: delete reconcile output and reset state.
     if force:
         reset_stage(work_dir, state, stage)
+        # Delete reconcile output — will be regenerated from glossary_cluster.json.
+        gp = glossary_path(work_dir)
+        if gp.exists():
+            gp.unlink()
 
     # Handle --retry-failed: re-open a completed stage without wiping items.
     if retry_failed and not force:
@@ -1789,8 +2007,22 @@ def glossary_reconcile(
         logger.info("Glossary reconcile already completed — skipping (use --force to re-run)")
         return _load_glossary(work_dir)
 
-    # Load glossary and build meta.
-    glossary = _load_glossary(work_dir)
+    # Validate cluster output exists.
+    cp = glossary_cluster_path(work_dir)
+    if not cp.exists():
+        raise RuntimeError(
+            "Glossary cluster output not found. Run 'dao-bridge glossary-cluster' first."
+        )
+
+    # Load glossary: on resume load the in-progress reconcile output
+    # (glossary.json) if it exists; on clean start load from cluster output.
+    gp = glossary_path(work_dir)
+    if gp.exists() and not is_stage_completed(state, stage):
+        # Resuming — load in-progress reconcile output.
+        glossary = _load_glossary(work_dir, gp)
+    else:
+        glossary = _load_glossary(work_dir, cp)
+
     meta = _load_build_meta(work_dir)
 
     # Validate categories.
@@ -1803,6 +2035,15 @@ def glossary_reconcile(
     target_lang = resolve_language_name(config.languages.target)
 
     # Build work items.
+    # 0. Surface-form conflicts (resolved first so that entity-level
+    #    conflicts see clean surface forms).
+    sf_conflict_items: list[tuple[str, str, SurfaceForm]] = []
+    for entity in glossary.entities:
+        for sf in entity.surface_forms:
+            if sf.english_variants:
+                item_id = f"glossary_reconcile.sf.{entity.entity_id}.{sf.source}"
+                sf_conflict_items.append((item_id, entity.entity_id, sf))
+
     # 1. Entity conflicts (English form or category mismatches).
     term_items: list[tuple[str, _ConflictRecord]] = []
     for conflict in meta.conflicts:
@@ -1820,17 +2061,18 @@ def glossary_reconcile(
     all_item_ids = [item_id for item_id, _ in term_items] + [item_id for item_id, _ in speech_items]
 
     # If no work to do, complete immediately.
-    if not all_item_ids:
+    if not sf_conflict_items and not all_item_ids:
         logger.info("No conflicts or speech-style consolidation needed.")
         _save_glossary(work_dir, glossary)
         mark_stage_completed(work_dir, state, stage)
         # Write empty report.
-        _write_reconcile_report(work_dir, [], [])
+        _write_reconcile_report(work_dir, [], [], [])
         return glossary
 
     pending = set(iter_pending_items(state, stage, all_item_ids))
 
     # Load prompt templates.
+    sf_conflict_template = _load_prompt_template("glossary_reconcile_surface_form.txt")
     term_template = _load_prompt_template("glossary_reconcile_term.txt")
     speech_template = _load_prompt_template("glossary_reconcile_speech.txt")
 
@@ -1844,8 +2086,82 @@ def glossary_reconcile(
         return _llm_client
 
     # Track decisions for the report.
+    sf_conflict_decisions: list[dict] = []
     term_decisions: list[dict] = []
     speech_decisions: list[dict] = []
+
+    # --- Resolve surface-form conflicts (before entity-level) ---
+    for item_id, entity_id, sf in sf_conflict_items:
+        try:
+            variants = list(sf.english_variants)
+            alternatives_str = ", ".join(f'"{variant}"' for variant in variants)
+
+            prompt = sf_conflict_template.format(
+                source_language=source_lang,
+                target_language=target_lang,
+                source_term=sf.source,
+                reading=sf.reading or "(none)",
+                current_english=sf.english,
+                alternatives=alternatives_str,
+            )
+
+            messages = [{"role": "user", "content": prompt}]
+            client = _get_llm_client()
+            result = client.complete_json(
+                messages,
+                response_model=GlossaryReconcileResponse,
+                context_label=item_id,
+            )
+
+            # Apply chosen English to the specific surface form.
+            entity = _find_entity_by_id(glossary, entity_id)
+            old_english = sf.english
+            resolved_sf: SurfaceForm | None = None
+            if entity:
+                for entity_sf in entity.surface_forms:
+                    if entity_sf.source == sf.source:
+                        entity_sf.english = result.chosen_english
+                        entity_sf.english_variants = []
+                        resolved_sf = entity_sf
+                        break
+
+            _save_glossary(work_dir, glossary)
+
+            sf_conflict_decisions.append(
+                {
+                    "entity_id": entity_id,
+                    "source_form": sf.source,
+                    "old_english": old_english,
+                    "chosen_english": result.chosen_english,
+                    "reasoning": result.reasoning,
+                    "alternatives": [
+                        {
+                            "english": variant,
+                            "context_snippet": "Alternate English from glossary merge",
+                        }
+                        for variant in variants
+                    ],
+                }
+            )
+
+            logger.debug(
+                "Resolved surface-form conflict %s (%s): '%s' -> '%s'",
+                entity_id,
+                sf.source,
+                old_english,
+                result.chosen_english,
+            )
+        except LLMStructuredOutputError as exc:
+            logger.error("Structured output failed for %s: %s", item_id, exc)
+            _save_glossary(work_dir, glossary)
+            raise
+        except Exception as exc:
+            logger.error("Unexpected error for %s: %s", item_id, exc)
+            _save_glossary(work_dir, glossary)
+            raise
+
+        if on_progress:
+            on_progress(item_id)
 
     # --- Resolve entity conflicts ---
     for item_id, conflict in term_items:
@@ -2016,7 +2332,7 @@ def glossary_reconcile(
     _save_glossary(work_dir, glossary)
 
     # Write reconciliation report.
-    _write_reconcile_report(work_dir, term_decisions, speech_decisions)
+    _write_reconcile_report(work_dir, sf_conflict_decisions, term_decisions, speech_decisions)
 
     # Mark stage completed if all items done.
     remaining = list(iter_pending_items(state, stage, all_item_ids))
@@ -2024,7 +2340,9 @@ def glossary_reconcile(
         mark_stage_completed(work_dir, state, stage)
 
     logger.info(
-        "Glossary reconcile complete: %d term conflicts resolved, %d speech styles consolidated",
+        "Glossary reconcile complete: %d surface-form conflicts, "
+        "%d term conflicts, %d speech styles consolidated",
+        len(sf_conflict_decisions),
         len(term_decisions),
         len(speech_decisions),
     )
@@ -2034,16 +2352,31 @@ def glossary_reconcile(
 
 def _write_reconcile_report(
     work_dir: Path,
+    sf_conflict_decisions: list[dict],
     term_decisions: list[dict],
     speech_decisions: list[dict],
 ) -> None:
     """Write the reconciliation report as markdown."""
     lines = ["# Glossary Reconciliation Report", ""]
 
-    if not term_decisions and not speech_decisions:
+    if not sf_conflict_decisions and not term_decisions and not speech_decisions:
         lines.append("No conflicts to resolve.")
         atomic_write(work_dir / "glossary_reconcile_report.md", "\n".join(lines))
         return
+
+    if sf_conflict_decisions:
+        lines.append("## Surface-Form Conflicts Resolved")
+        lines.append("")
+        for dec in sf_conflict_decisions:
+            lines.append(f"### {dec.get('entity_id', 'unknown')} / {dec.get('source_form', '')}")
+            lines.append(f"- **Previous:** {dec['old_english']}")
+            lines.append(f"- **Chosen:** {dec['chosen_english']}")
+            lines.append(f"- **Reasoning:** {dec['reasoning']}")
+            if dec.get("alternatives"):
+                lines.append("- **Alternatives considered:**")
+                for alt in dec["alternatives"]:
+                    lines.append(f'  - "{alt["english"]}" ({alt["context_snippet"]})')
+            lines.append("")
 
     if term_decisions:
         lines.append("## Term Conflicts Resolved")

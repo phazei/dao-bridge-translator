@@ -18,6 +18,8 @@ import pytest
 
 from dao_bridge.config import AppConfig, GlossaryClusterConfig
 from dao_bridge.glossary import (
+    _cluster_meta_path,
+    _load_cluster_meta,
     _load_glossary,
     _save_glossary,
     glossary_cluster,
@@ -44,10 +46,17 @@ from dao_bridge.schemas import (
 from dao_bridge.state import (
     PipelineState,
     load_state,
+    mark_item_failed,
+    mark_item_started,
     mark_stage_completed,
     mark_stage_started,
 )
-from dao_bridge.workdir import atomic_write
+from dao_bridge.workdir import (
+    atomic_write,
+    glossary_build_path,
+    glossary_cluster_path,
+    glossary_path,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -629,8 +638,8 @@ class TestMergeEntities:
         # Occurrence counts should be summed.
         assert winner.surface_forms[0].occurrence_count == 5
 
-    def test_dedup_preserves_alternate_english_as_hint(self):
-        """Same source, different English: alternate is preserved as context hint."""
+    def test_dedup_preserves_alternate_english_as_variant(self):
+        """Same source, different English: alternate is preserved in english_variants."""
         winner = _make_entity(
             "c001",
             "character",
@@ -650,7 +659,7 @@ class TestMergeEntities:
         merge_entities(winner, loser)
         sf = winner.surface_forms[0]
         assert sf.english == "Abel"  # Winner's form kept.
-        assert any("alternate English: Aberu" in h for h in sf.context_hints)
+        assert "Aberu" in sf.english_variants
 
     def test_preferred_canonical_english(self):
         """preferred_canonical_english overrides winner's canonical."""
@@ -1082,6 +1091,7 @@ class TestGlossaryClusterIntegration:
         _mark_prior_stages_complete(work, state)
 
         # Create a glossary with two obvious duplicates.
+        # Written to glossary_build.json (cluster's input).
         glossary = Glossary(
             entities=[
                 _make_entity(
@@ -1112,7 +1122,7 @@ class TestGlossaryClusterIntegration:
                 ),
             ]
         )
-        _save_glossary(work, glossary)
+        _save_glossary(work, glossary, glossary_build_path(work))
 
         return work, config, state
 
@@ -1181,7 +1191,7 @@ class TestGlossaryClusterIntegration:
         state = load_state(work)
         _mark_prior_stages_complete(work, state)
 
-        # Glossary with no possible candidates.
+        # Glossary with no possible candidates — written to build output.
         glossary = Glossary(
             entities=[
                 _make_entity(
@@ -1202,12 +1212,14 @@ class TestGlossaryClusterIntegration:
                 ),
             ]
         )
-        _save_glossary(work, glossary)
+        _save_glossary(work, glossary, glossary_build_path(work))
 
         # No LLM client should be created when there are zero candidates.
         result = glossary_cluster(work, config, state)
 
         assert len(result.entities) == 2
+        # Cluster output should exist.
+        assert glossary_cluster_path(work).exists()
         # Report should exist.
         report = (work / "glossary_cluster_report.md").read_text(encoding="utf-8")
         assert "No duplicate entities found" in report
@@ -1240,8 +1252,8 @@ class TestGlossaryClusterIntegration:
         text = report_path.read_text(encoding="utf-8")
         assert "Merges performed: 1" in text
 
-    def test_state_tracking(self, tmp_path):
-        """Stage is marked completed in pipeline state."""
+    def test_state_tracking_iteration_level(self, tmp_path):
+        """Stage uses iteration-level item IDs (iter1, iter2, ...)."""
         work, config, state = self._setup(tmp_path)
 
         mock_response = GlossaryClusterResponse(
@@ -1264,6 +1276,8 @@ class TestGlossaryClusterIntegration:
             glossary_cluster(work, config, state)
 
         assert state.stages["glossary_cluster"].status == "completed"
+        # Iteration-level item should be recorded.
+        assert "glossary_cluster:iter1" in state.items
 
     def test_raises_when_build_not_completed(self, tmp_path):
         """glossary_cluster raises if glossary_build is not completed."""
@@ -1298,8 +1312,28 @@ class TestGlossaryClusterIntegration:
             # LLM should not be called on second run.
             instance.complete_json.assert_not_called()
 
-    def test_force_reruns(self, tmp_path):
-        """--force re-runs clustering even if already completed."""
+    # -- Stage file flow tests ---------------------------------------------------
+
+    def test_cluster_reads_from_build_output(self, tmp_path):
+        """Clustering loads from glossary_build.json, not glossary.json."""
+        work, config, state = self._setup(tmp_path)
+
+        # glossary.json should NOT exist — only glossary_build.json.
+        assert not glossary_path(work).exists()
+        assert glossary_build_path(work).exists()
+
+        mock_response = GlossaryClusterResponse(decisions=[])
+
+        with patch("dao_bridge.glossary.LLMClient") as MockClient:
+            instance = MockClient.return_value
+            instance.complete_json.return_value = mock_response
+            result = glossary_cluster(work, config, state)
+
+        # Should have loaded all 3 entities from build output.
+        assert len(result.entities) == 3
+
+    def test_cluster_writes_to_glossary_cluster_json(self, tmp_path):
+        """Output goes to glossary_cluster.json, not glossary.json."""
         work, config, state = self._setup(tmp_path)
 
         mock_response = GlossaryClusterResponse(
@@ -1320,47 +1354,272 @@ class TestGlossaryClusterIntegration:
             instance.complete_json.return_value = mock_response
             glossary_cluster(work, config, state)
 
-        # Force re-run: need to restore the glossary since first run merged.
-        glossary = Glossary(
-            entities=[
-                _make_entity(
-                    "character_000001",
-                    "character",
-                    "Abel",
-                    [
-                        {"source": "アベル", "english": "Abel"},
-                    ],
-                ),
-                _make_entity(
-                    "character_000002",
-                    "character",
-                    "Abel-chan",
-                    [
-                        {"source": "アベルちゃん", "english": "Abel-chan"},
-                    ],
-                ),
-                _make_entity(
-                    "place_000001",
-                    "place",
-                    "Lugnica",
-                    [
-                        {"source": "ルグニカ", "english": "Lugnica"},
-                    ],
+        # Cluster output exists.
+        assert glossary_cluster_path(work).exists()
+        cluster_glossary = _load_glossary(work, glossary_cluster_path(work))
+        assert len(cluster_glossary.entities) == 2  # Merged 3 -> 2.
+
+    def test_build_output_not_mutated_by_cluster(self, tmp_path):
+        """glossary_build.json is byte-identical before and after clustering."""
+        work, config, state = self._setup(tmp_path)
+
+        # Record build output bytes before clustering.
+        build_bytes_before = glossary_build_path(work).read_bytes()
+
+        mock_response = GlossaryClusterResponse(
+            decisions=[
+                GlossaryClusterDecision(
+                    entity_id_a="character_000001",
+                    entity_id_b="character_000002",
+                    same_entity=True,
+                    preferred_entity_id="character_000001",
+                    preferred_canonical_english="Abel",
+                    reasoning="Same character.",
                 ),
             ]
         )
-        _save_glossary(work, glossary)
 
+        with patch("dao_bridge.glossary.LLMClient") as MockClient:
+            instance = MockClient.return_value
+            instance.complete_json.return_value = mock_response
+            glossary_cluster(work, config, state)
+
+        # Build output must not have been mutated.
+        build_bytes_after = glossary_build_path(work).read_bytes()
+        assert build_bytes_before == build_bytes_after
+
+    def test_cluster_force_rereads_build_output(self, tmp_path):
+        """--force deletes cluster output, re-reads from glossary_build.json."""
+        work, config, state = self._setup(tmp_path)
+        original_count = len(_load_glossary(work, glossary_build_path(work)).entities)
+
+        mock_response = GlossaryClusterResponse(
+            decisions=[
+                GlossaryClusterDecision(
+                    entity_id_a="character_000001",
+                    entity_id_b="character_000002",
+                    same_entity=True,
+                    preferred_entity_id="character_000001",
+                    preferred_canonical_english="Abel",
+                    reasoning="Same character.",
+                ),
+            ]
+        )
+
+        # First run: merges 2 characters into 1.
+        with patch("dao_bridge.glossary.LLMClient") as MockClient:
+            instance = MockClient.return_value
+            instance.complete_json.return_value = mock_response
+            result = glossary_cluster(work, config, state)
+        assert len(result.entities) == original_count - 1
+
+        # Force re-run: should re-read from glossary_build.json.
         with patch("dao_bridge.glossary.LLMClient") as MockClient:
             instance = MockClient.return_value
             instance.complete_json.return_value = mock_response
             result = glossary_cluster(work, config, state, force=True)
             instance.complete_json.assert_called()
 
+        # Same merge result — started fresh from build output.
+        assert len(result.entities) == original_count - 1
+
+    def test_cluster_force_deletes_downstream(self, tmp_path):
+        """--force on cluster deletes glossary.json (reconcile output)."""
+        work, config, state = self._setup(tmp_path)
+
+        # Create a fake reconcile output at glossary.json.
+        glossary_path(work).write_text("{}", encoding="utf-8")
+        assert glossary_path(work).exists()
+
+        mock_response = GlossaryClusterResponse(decisions=[])
+
+        with patch("dao_bridge.glossary.LLMClient") as MockClient:
+            instance = MockClient.return_value
+            instance.complete_json.return_value = mock_response
+            glossary_cluster(work, config, state, force=True)
+
+        # Downstream reconcile output should have been deleted by --force.
+        # (It's not recreated by clustering.)
+        assert not glossary_path(work).exists()
+
+    def test_cluster_resume_loads_partial_output(self, tmp_path):
+        """On resume, clustering loads from glossary_cluster.json (partial merges)."""
+        work, config, state = self._setup(tmp_path)
+
+        # Simulate a partially-merged cluster output: manually merge
+        # one pair and write to glossary_cluster.json.
+        glossary = _load_glossary(work, glossary_build_path(work))
+        merge_entities(glossary.entities[0], glossary.entities[1])
+        glossary.entities.pop(1)
+        _save_glossary(work, glossary, glossary_cluster_path(work))
+
+        # Set up state as if iter1 failed mid-way.
+        mark_stage_started(work, state, "glossary_cluster")
+        mark_item_started(work, state, "glossary_cluster", "iter1")
+        mark_item_failed(work, state, "glossary_cluster", "iter1", "simulated failure")
+
+        # Resume — should load from glossary_cluster.json (2 entities),
+        # not glossary_build.json (3 entities).
+        with patch("dao_bridge.glossary.LLMClient") as MockClient:
+            instance = MockClient.return_value
+            instance.complete_json.return_value = GlossaryClusterResponse(decisions=[])
+            result = glossary_cluster(work, config, state)
+
+        # Should have 2 entities (from the partial cluster output).
         assert len(result.entities) == 2
 
-    def test_on_progress_called(self, tmp_path):
-        """on_progress callback is invoked for each batch."""
+    def test_cluster_clean_start_loads_build_output(self, tmp_path):
+        """When glossary_cluster.json doesn't exist, loads from glossary_build.json."""
+        work, config, state = self._setup(tmp_path)
+
+        # Ensure no cluster output exists.
+        assert not glossary_cluster_path(work).exists()
+
+        mock_response = GlossaryClusterResponse(decisions=[])
+
+        with patch("dao_bridge.glossary.LLMClient") as MockClient:
+            instance = MockClient.return_value
+            instance.complete_json.return_value = mock_response
+            result = glossary_cluster(work, config, state)
+
+        # Should have loaded all 3 entities from build output.
+        assert len(result.entities) == 3
+
+    def test_force_deletes_cluster_meta(self, tmp_path):
+        """--force clears the cluster meta sidecar."""
+        work, config, state = self._setup(tmp_path)
+
+        mock_response = GlossaryClusterResponse(
+            decisions=[
+                GlossaryClusterDecision(
+                    entity_id_a="character_000001",
+                    entity_id_b="character_000002",
+                    same_entity=True,
+                    preferred_entity_id="character_000001",
+                    preferred_canonical_english="Abel",
+                    reasoning="Same character.",
+                ),
+            ]
+        )
+
+        with patch("dao_bridge.glossary.LLMClient") as MockClient:
+            instance = MockClient.return_value
+            instance.complete_json.return_value = mock_response
+            glossary_cluster(work, config, state)
+
+        # Cluster meta should exist after first run.
+        assert _cluster_meta_path(work).exists()
+        meta = _load_cluster_meta(work)
+        assert len(meta.merge_log) == 1
+
+        # Force re-run should clear it.
+        with patch("dao_bridge.glossary.LLMClient") as MockClient:
+            instance = MockClient.return_value
+            instance.complete_json.return_value = mock_response
+            glossary_cluster(work, config, state, force=True)
+
+        # Meta should have been rebuilt fresh with just this run's data.
+        meta = _load_cluster_meta(work)
+        assert len(meta.merge_log) == 1  # From the re-run, not accumulated.
+        assert 1 in meta.completed_iterations
+
+    # -- Resume / retry-failed tests ------------------------------------------
+
+    def test_resume_after_iteration_failure(self, tmp_path):
+        """After iter1 failure, resume re-runs iter1 from fresh candidates."""
+        work, config, state = self._setup(tmp_path)
+
+        # Simulate a failed iter1: mark stage started, iter1 failed.
+        # No snapshot needed — build output is never mutated.
+        mark_stage_started(work, state, "glossary_cluster")
+        mark_item_started(work, state, "glossary_cluster", "iter1")
+        mark_item_failed(work, state, "glossary_cluster", "iter1", "simulated error")
+
+        # Now resume — iter1 should re-run, loading from glossary_build.json.
+        mock_response = GlossaryClusterResponse(
+            decisions=[
+                GlossaryClusterDecision(
+                    entity_id_a="character_000001",
+                    entity_id_b="character_000002",
+                    same_entity=True,
+                    preferred_entity_id="character_000001",
+                    preferred_canonical_english="Abel",
+                    reasoning="Same character.",
+                ),
+            ]
+        )
+
+        with patch("dao_bridge.glossary.LLMClient") as MockClient:
+            instance = MockClient.return_value
+            instance.complete_json.return_value = mock_response
+            result = glossary_cluster(work, config, state)
+
+        assert len(result.entities) == 2  # Merged 2 chars -> 1 + place.
+        assert state.stages["glossary_cluster"].status == "completed"
+
+    def test_retry_failed_reruns_failed_iteration(self, tmp_path):
+        """--retry-failed re-runs a failed iteration."""
+        work, config, state = self._setup(tmp_path)
+
+        # Complete a first run.
+        mock_response_merge = GlossaryClusterResponse(
+            decisions=[
+                GlossaryClusterDecision(
+                    entity_id_a="character_000001",
+                    entity_id_b="character_000002",
+                    same_entity=True,
+                    preferred_entity_id="character_000001",
+                    preferred_canonical_english="Abel",
+                    reasoning="Same character.",
+                ),
+            ]
+        )
+
+        with patch("dao_bridge.glossary.LLMClient") as MockClient:
+            instance = MockClient.return_value
+            instance.complete_json.return_value = mock_response_merge
+            glossary_cluster(work, config, state)
+
+        assert state.stages["glossary_cluster"].status == "completed"
+
+        # --retry-failed should re-open and process any failed items.
+        # Since all items completed successfully, this should be a no-op.
+        with patch("dao_bridge.glossary.LLMClient") as MockClient:
+            instance = MockClient.return_value
+            instance.complete_json.return_value = GlossaryClusterResponse(decisions=[])
+            result = glossary_cluster(work, config, state, retry_failed=True)
+
+        assert state.stages["glossary_cluster"].status == "completed"
+
+    def test_cluster_meta_persists_across_iterations(self, tmp_path):
+        """Cluster meta accumulates merge_log across completed iterations."""
+        work, config, state = self._setup(tmp_path)
+
+        mock_response = GlossaryClusterResponse(
+            decisions=[
+                GlossaryClusterDecision(
+                    entity_id_a="character_000001",
+                    entity_id_b="character_000002",
+                    same_entity=True,
+                    preferred_entity_id="character_000001",
+                    preferred_canonical_english="Abel",
+                    reasoning="Same character.",
+                ),
+            ]
+        )
+
+        with patch("dao_bridge.glossary.LLMClient") as MockClient:
+            instance = MockClient.return_value
+            instance.complete_json.return_value = mock_response
+            glossary_cluster(work, config, state)
+
+        meta = _load_cluster_meta(work)
+        assert 1 in meta.completed_iterations
+        assert len(meta.merge_log) == 1
+        assert meta.total_candidates_evaluated > 0
+
+    def test_on_progress_called_with_iteration_ids(self, tmp_path):
+        """on_progress receives iteration-level IDs (iter1, iter2, ...)."""
         work, config, state = self._setup(tmp_path)
 
         mock_response = GlossaryClusterResponse(
@@ -1390,3 +1649,491 @@ class TestGlossaryClusterIntegration:
             )
 
         assert len(progress_calls) > 0
+        # All progress IDs should be iteration-level.
+        for pid in progress_calls:
+            assert pid.startswith("iter")
+
+
+# ---------------------------------------------------------------------------
+# Issue 3: _remap_build_meta_conflicts
+# ---------------------------------------------------------------------------
+
+
+class TestRemapBuildMetaConflicts:
+    """Build-meta conflict records should follow surviving entity after merge."""
+
+    def test_remap_loser_to_winner(self):
+        """Loser's conflict record is remapped to winner's entity_id."""
+        from dao_bridge.glossary import _BuildMeta, _ConflictRecord, _remap_build_meta_conflicts
+
+        meta = _BuildMeta(
+            conflicts=[
+                _ConflictRecord(
+                    entity_id="c002",
+                    source_form="アベル",
+                    current_english="Aberu",
+                    alternatives=[
+                        {"english": "Abel", "context_snippet": "batch 2", "batch_id": "0001.b1"}
+                    ],
+                ),
+            ]
+        )
+        _remap_build_meta_conflicts(meta, loser_id="c002", winner_id="c001")
+
+        assert len(meta.conflicts) == 1
+        assert meta.conflicts[0].entity_id == "c001"
+        assert meta.conflicts[0].alternatives[0]["english"] == "Abel"
+
+    def test_merge_duplicate_records(self):
+        """When both winner and loser have conflict records, they are merged."""
+        from dao_bridge.glossary import _BuildMeta, _ConflictRecord, _remap_build_meta_conflicts
+
+        meta = _BuildMeta(
+            conflicts=[
+                _ConflictRecord(
+                    entity_id="c001",
+                    source_form="アベル",
+                    current_english="Abel",
+                    alternatives=[
+                        {"english": "Aberu", "context_snippet": "batch 1", "batch_id": "0000.b1"}
+                    ],
+                    category_variants=["character"],
+                ),
+                _ConflictRecord(
+                    entity_id="c002",
+                    source_form="アベル",
+                    current_english="Abel",
+                    alternatives=[
+                        {"english": "Abeel", "context_snippet": "batch 3", "batch_id": "0002.b1"}
+                    ],
+                    category_variants=["title"],
+                ),
+            ]
+        )
+        _remap_build_meta_conflicts(meta, loser_id="c002", winner_id="c001")
+
+        # Should be merged into one record.
+        assert len(meta.conflicts) == 1
+        record = meta.conflicts[0]
+        assert record.entity_id == "c001"
+        # Both alternatives should be present.
+        alt_english = {a["english"] for a in record.alternatives}
+        assert "Aberu" in alt_english
+        assert "Abeel" in alt_english
+        # Both category variants should be present.
+        assert "character" in record.category_variants
+        assert "title" in record.category_variants
+
+    def test_dedup_alternatives_on_merge(self):
+        """Duplicate alternatives (same english) are not duplicated."""
+        from dao_bridge.glossary import _BuildMeta, _ConflictRecord, _remap_build_meta_conflicts
+
+        meta = _BuildMeta(
+            conflicts=[
+                _ConflictRecord(
+                    entity_id="c001",
+                    source_form="アベル",
+                    current_english="Abel",
+                    alternatives=[
+                        {"english": "Aberu", "context_snippet": "batch 1", "batch_id": "0000.b1"}
+                    ],
+                ),
+                _ConflictRecord(
+                    entity_id="c002",
+                    source_form="アベル",
+                    current_english="Abel",
+                    alternatives=[
+                        {"english": "Aberu", "context_snippet": "batch 2", "batch_id": "0001.b1"}
+                    ],
+                ),
+            ]
+        )
+        _remap_build_meta_conflicts(meta, loser_id="c002", winner_id="c001")
+
+        assert len(meta.conflicts) == 1
+        # "Aberu" should appear only once.
+        assert len(meta.conflicts[0].alternatives) == 1
+
+    def test_no_op_when_loser_has_no_conflicts(self):
+        """If the loser has no conflict record, nothing changes."""
+        from dao_bridge.glossary import _BuildMeta, _ConflictRecord, _remap_build_meta_conflicts
+
+        meta = _BuildMeta(
+            conflicts=[
+                _ConflictRecord(
+                    entity_id="c001",
+                    source_form="アベル",
+                    current_english="Abel",
+                    alternatives=[],
+                ),
+            ]
+        )
+        _remap_build_meta_conflicts(meta, loser_id="c099", winner_id="c001")
+
+        assert len(meta.conflicts) == 1
+        assert meta.conflicts[0].entity_id == "c001"
+
+
+# ---------------------------------------------------------------------------
+# Issue 4: Batch-internal merge order dependency
+# ---------------------------------------------------------------------------
+
+
+class TestBatchInternalMergeOrder:
+    """Multiple merges in one LLM batch should chain correctly."""
+
+    def test_chained_merge_in_same_batch(self, tmp_path):
+        """LLM confirms A+B and B+C: both merges should succeed."""
+        work = _setup_work_dir(tmp_path)
+        config = _make_config(work)
+        state = load_state(work)
+        _mark_prior_stages_complete(work, state)
+
+        # Three entities: A (アベル), B (アベルちゃん), C (アベル様)
+        glossary = Glossary(
+            entities=[
+                _make_entity(
+                    "c001",
+                    "character",
+                    "Abel",
+                    [{"source": "アベル", "english": "Abel"}],
+                ),
+                _make_entity(
+                    "c002",
+                    "character",
+                    "Abel-chan",
+                    [{"source": "アベルちゃん", "english": "Abel-chan"}],
+                ),
+                _make_entity(
+                    "c003",
+                    "character",
+                    "Lord Abel",
+                    [{"source": "アベル様", "english": "Lord Abel"}],
+                ),
+            ]
+        )
+        _save_glossary(work, glossary, glossary_build_path(work))
+
+        # LLM confirms BOTH A+B and B+C in the same batch.
+        # Old code would remap once upfront; after A+B merge absorbs B,
+        # B+C would fail. New iterative code should remap B->A after
+        # the first merge, making B+C become A+C.
+        mock_response = GlossaryClusterResponse(
+            decisions=[
+                GlossaryClusterDecision(
+                    entity_id_a="c001",
+                    entity_id_b="c002",
+                    same_entity=True,
+                    preferred_entity_id="c001",
+                    preferred_canonical_english="Abel",
+                    reasoning="Same character with honorific.",
+                ),
+                GlossaryClusterDecision(
+                    entity_id_a="c002",
+                    entity_id_b="c003",
+                    same_entity=True,
+                    preferred_entity_id="c001",
+                    preferred_canonical_english="Abel",
+                    reasoning="Same character with honorific.",
+                ),
+            ]
+        )
+
+        with patch("dao_bridge.glossary.LLMClient") as MockClient:
+            instance = MockClient.return_value
+            instance.complete_json.return_value = mock_response
+            result = glossary_cluster(work, config, state)
+
+        # All three should be merged into one entity.
+        assert len(result.entities) == 1
+        abel = result.entities[0]
+        assert abel.entity_id == "c001"
+        sources = {sf.source for sf in abel.surface_forms}
+        assert "アベル" in sources
+        assert "アベルちゃん" in sources
+        assert "アベル様" in sources
+
+    def test_deep_chain_winner_selection(self, tmp_path):
+        """A+B, B+C, C+D in same batch: winner selection correct at depth >1.
+
+        LLM says D is preferred winner for the C+D pair.  After chains
+        A+B (B absorbed into A) and B+C (resolves to A+C, C absorbed
+        into A), the C+D decision resolves to A+D.  The LLM's
+        preferred_entity_id=D should resolve correctly and D should win
+        that merge despite A having absorbed two entities already.
+        """
+        work = _setup_work_dir(tmp_path)
+        config = _make_config(work)
+        state = load_state(work)
+        _mark_prior_stages_complete(work, state)
+
+        glossary = Glossary(
+            entities=[
+                _make_entity(
+                    "c001",
+                    "character",
+                    "Abel",
+                    [{"source": "アベル", "english": "Abel"}],
+                ),
+                _make_entity(
+                    "c002",
+                    "character",
+                    "Abel-chan",
+                    [{"source": "アベルちゃん", "english": "Abel-chan"}],
+                ),
+                _make_entity(
+                    "c003",
+                    "character",
+                    "Abel-sama",
+                    [{"source": "アベル様", "english": "Abel-sama"}],
+                ),
+                _make_entity(
+                    "c004",
+                    "character",
+                    "Vincent Volakia",
+                    [{"source": "ヴィンセント・ヴォラキア", "english": "Vincent Volakia"}],
+                ),
+            ]
+        )
+        _save_glossary(work, glossary, glossary_build_path(work))
+
+        # A+B: winner=A.  B+C: winner=A (B resolves to A).
+        # C+D: winner=D (LLM prefers D; C resolves to A, so it becomes A+D).
+        mock_response = GlossaryClusterResponse(
+            decisions=[
+                GlossaryClusterDecision(
+                    entity_id_a="c001",
+                    entity_id_b="c002",
+                    same_entity=True,
+                    preferred_entity_id="c001",
+                    preferred_canonical_english="Abel",
+                    reasoning="Same character with honorific.",
+                ),
+                GlossaryClusterDecision(
+                    entity_id_a="c002",
+                    entity_id_b="c003",
+                    same_entity=True,
+                    preferred_entity_id="c001",
+                    preferred_canonical_english="Abel",
+                    reasoning="Same character with honorific.",
+                ),
+                GlossaryClusterDecision(
+                    entity_id_a="c003",
+                    entity_id_b="c004",
+                    same_entity=True,
+                    preferred_entity_id="c004",
+                    preferred_canonical_english="Vincent Volakia",
+                    reasoning="True identity is Vincent.",
+                ),
+            ]
+        )
+
+        with patch("dao_bridge.glossary.LLMClient") as MockClient:
+            instance = MockClient.return_value
+            instance.complete_json.return_value = mock_response
+            result = glossary_cluster(work, config, state)
+
+        # All four should merge into one entity.
+        assert len(result.entities) == 1
+        survivor = result.entities[0]
+        # D (c004) was preferred for the last merge, so it should be the
+        # winner — meaning c004 is the surviving entity_id.
+        assert survivor.entity_id == "c004"
+        assert survivor.canonical_english == "Vincent Volakia"
+        # All surface forms present.
+        sources = {sf.source for sf in survivor.surface_forms}
+        assert "アベル" in sources
+        assert "アベルちゃん" in sources
+        assert "アベル様" in sources
+        assert "ヴィンセント・ヴォラキア" in sources
+
+    def test_preferred_entity_id_neither_side_falls_back(self, tmp_path):
+        """If preferred_entity_id resolves to neither entity, default winner is used."""
+        work = _setup_work_dir(tmp_path)
+        config = _make_config(work)
+        state = load_state(work)
+        _mark_prior_stages_complete(work, state)
+
+        glossary = Glossary(
+            entities=[
+                _make_entity(
+                    "c001",
+                    "character",
+                    "Abel",
+                    [{"source": "アベル", "english": "Abel"}],
+                ),
+                _make_entity(
+                    "c002",
+                    "character",
+                    "Abel-chan",
+                    [{"source": "アベルちゃん", "english": "Abel-chan"}],
+                ),
+            ]
+        )
+        _save_glossary(work, glossary, glossary_build_path(work))
+
+        # LLM returns a preferred_entity_id that doesn't match either entity.
+        mock_response = GlossaryClusterResponse(
+            decisions=[
+                GlossaryClusterDecision(
+                    entity_id_a="c001",
+                    entity_id_b="c002",
+                    same_entity=True,
+                    preferred_entity_id="c999",  # bogus ID
+                    preferred_canonical_english="Abel",
+                    reasoning="Same character.",
+                ),
+            ]
+        )
+
+        with patch("dao_bridge.glossary.LLMClient") as MockClient:
+            instance = MockClient.return_value
+            instance.complete_json.return_value = mock_response
+            result = glossary_cluster(work, config, state)
+
+        # Should still merge successfully using default winner (ea = c001).
+        assert len(result.entities) == 1
+        survivor = result.entities[0]
+        assert survivor.entity_id == "c001"
+        sources = {sf.source for sf in survivor.surface_forms}
+        assert "アベル" in sources
+        assert "アベルちゃん" in sources
+
+
+# ---------------------------------------------------------------------------
+# Issue 5: english_variants in merge
+# ---------------------------------------------------------------------------
+
+
+class TestEnglishVariantsMerge:
+    """Conflicting English on same source goes to english_variants, not context_hints."""
+
+    def test_english_variant_stored(self):
+        """Alternate English is stored in english_variants, not context_hints."""
+        winner = _make_entity(
+            "c001",
+            "character",
+            "Abel",
+            [{"source": "アベル", "english": "Abel"}],
+        )
+        loser = _make_entity(
+            "c002",
+            "character",
+            "Aberu",
+            [{"source": "アベル", "english": "Aberu"}],
+        )
+        merge_entities(winner, loser)
+        sf = winner.surface_forms[0]
+        assert "Aberu" in sf.english_variants
+        # Should NOT be in context_hints.
+        assert not any("alternate English" in h for h in sf.context_hints)
+
+    def test_english_variants_union_from_loser(self):
+        """Loser's existing english_variants are also carried over."""
+        winner = _make_entity(
+            "c001",
+            "character",
+            "Abel",
+            [{"source": "アベル", "english": "Abel"}],
+        )
+        loser = _make_entity(
+            "c002",
+            "character",
+            "Aberu",
+            [{"source": "アベル", "english": "Aberu", "english_variants": ["Abell"]}],
+        )
+        merge_entities(winner, loser)
+        sf = winner.surface_forms[0]
+        assert "Aberu" in sf.english_variants
+        assert "Abell" in sf.english_variants
+
+    def test_no_duplicate_variants(self):
+        """Same variant is not added twice."""
+        winner = _make_entity(
+            "c001",
+            "character",
+            "Abel",
+            [{"source": "アベル", "english": "Abel", "english_variants": ["Aberu"]}],
+        )
+        loser = _make_entity(
+            "c002",
+            "character",
+            "Aberu",
+            [{"source": "アベル", "english": "Aberu"}],
+        )
+        merge_entities(winner, loser)
+        sf = winner.surface_forms[0]
+        assert sf.english_variants.count("Aberu") == 1
+
+    def test_winner_english_not_added_as_variant(self):
+        """The winner's own English is not added to english_variants."""
+        winner = _make_entity(
+            "c001",
+            "character",
+            "Abel",
+            [{"source": "アベル", "english": "Abel"}],
+        )
+        loser = _make_entity(
+            "c002",
+            "character",
+            "Abel copy",
+            [{"source": "アベル", "english": "Abel", "english_variants": ["Aberu"]}],
+        )
+        merge_entities(winner, loser)
+        sf = winner.surface_forms[0]
+        # "Abel" should not appear in variants (it IS the english).
+        assert "Abel" not in sf.english_variants
+        # "Aberu" should be carried over from loser.
+        assert "Aberu" in sf.english_variants
+
+
+# ---------------------------------------------------------------------------
+# Issue 1+2: Cluster force resets downstream reconcile state
+# ---------------------------------------------------------------------------
+
+
+class TestClusterForceResetsDownstreamState:
+    """glossary_cluster --force should reset glossary_reconcile state."""
+
+    def test_cluster_force_resets_reconcile_stage_state(self, tmp_path):
+        """After cluster --force, reconcile stage should be pending."""
+        work = _setup_work_dir(tmp_path)
+        config = _make_config(work)
+        state = load_state(work)
+        _mark_prior_stages_complete(work, state)
+
+        # Set up build output.
+        glossary = Glossary(
+            entities=[
+                _make_entity(
+                    "c001",
+                    "character",
+                    "Abel",
+                    [{"source": "アベル", "english": "Abel"}],
+                ),
+            ]
+        )
+        _save_glossary(work, glossary, glossary_build_path(work))
+
+        # Simulate reconcile as completed.
+        from dao_bridge.state import mark_stage_started as _mss, mark_stage_completed as _msc
+
+        _mss(work, state, "glossary_cluster")
+        _msc(work, state, "glossary_cluster")
+        _mss(work, state, "glossary_reconcile")
+        _msc(work, state, "glossary_reconcile")
+        glossary_path(work).write_text("{}", encoding="utf-8")
+
+        assert state.stages["glossary_reconcile"].status == "completed"
+
+        # Now run cluster with --force.
+        mock_response = GlossaryClusterResponse(decisions=[])
+        with patch("dao_bridge.glossary.LLMClient") as MockClient:
+            instance = MockClient.return_value
+            instance.complete_json.return_value = mock_response
+            glossary_cluster(work, config, state, force=True)
+
+        # Reconcile state should be reset to pending.
+        assert state.stages["glossary_reconcile"].status == "pending"
+        # Reconcile output should be deleted.
+        assert not glossary_path(work).exists()

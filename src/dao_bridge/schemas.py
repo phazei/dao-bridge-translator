@@ -111,6 +111,9 @@ class SurfaceForm(BaseModel):
     source: str  # The source-language string, e.g. "アベル"
     reading: str | None = None  # From furigana, if available
     english: str  # English rendering for THIS specific form
+    english_variants: list[str] = Field(default_factory=list)
+    # Alternate English renderings discovered during clustering merges.
+    # Reconcile inspects these to resolve translation conflicts.
     context_hints: list[str] = Field(default_factory=list)
     notes: str | None = None
     first_seen_chunk: str | None = None

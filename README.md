@@ -3,10 +3,11 @@
 AI translation pipeline for EPUB novels using LLM APIs.
 
 Translates EPUB files through a multi-stage pipeline: extraction, cleaning,
-classification, chunking, glossary building, reconciliation, translation,
-assembly, and EPUB rebuild. Language-agnostic (source/target configured in
-`config.yaml`). Designed to work with any OpenAI-compatible API (local
-llama-server, vLLM, LM Studio, OpenAI, Claude, OpenRouter, etc.).
+classification, chunking, glossary building, glossary clustering,
+reconciliation, translation, assembly, and EPUB rebuild. Language-agnostic
+(source/target configured in `config.yaml`). Designed to work with any
+OpenAI-compatible API (local llama-server, vLLM, LM Studio, OpenAI, Claude,
+OpenRouter, etc.).
 
 ## Installation
 
@@ -53,19 +54,22 @@ dao-bridge chunk --work-dir ./work
 # 6. Build a per-book glossary from chunked text
 dao-bridge glossary-build --work-dir ./work
 
-# 7. Resolve within-book glossary conflicts
+# 7. Find and merge duplicate glossary entities
+dao-bridge glossary-cluster --work-dir ./work
+
+# 8. Resolve within-book glossary conflicts
 dao-bridge glossary-reconcile --work-dir ./work
 
-# 8. Export glossary for human review
+# 9. Export glossary for human review
 dao-bridge glossary-export --work-dir ./work
 
-# 9. Translate all chunks (LLM-powered)
+# 10. Translate all chunks (LLM-powered)
 dao-bridge translate --work-dir ./work
 
-# 10. Assemble translated chunks into per-spine markdown
+# 11. Assemble translated chunks into per-spine markdown
 dao-bridge assemble --work-dir ./work
 
-# 11. Build the output EPUB
+# 12. Build the output EPUB
 dao-bridge rebuild --work-dir ./work
 
 # Check pipeline status at any time
@@ -84,13 +88,14 @@ is passed. Add `--verbose` to any command for DEBUG-level console output.
 | `clean` | Convert raw XHTML to markdown in `clean/NNN.md` |
 | `classify` | Classify spine items (chapter, frontmatter, illustration, etc.) |
 | `chunk` | Chunk cleaned markdown into `chunks/NNN/NNN.MMM.json` |
-| `glossary-build` | Extract per-book glossary from chunked source text (spine-aligned batches) |
+| `glossary-build` | Extract per-book glossary entities from chunked source text (spine-aligned batches) |
+| `glossary-cluster` | Find and merge duplicate entities via LLM-confirmed heuristic matching |
 | `glossary-reconcile` | Resolve within-book glossary conflicts via LLM |
 | `glossary-export` | Export glossary as human-readable markdown |
 | `translate` | Translate all chunks using LLM (double-pass, QA) |
 | `assemble` | Reassemble translated chunks into `assembled/NNN.md` |
 | `rebuild` | Build output EPUB from assembled translations |
-| `run` | Chain all stages (extract through rebuild) |
+| `run` | Chain all stages (extract through rebuild, including cluster) |
 | `status` | Display pipeline stage completion status |
 
 The `classify`, `chunk`, `glossary-build`, and `assemble` commands support
@@ -98,6 +103,11 @@ The `classify`, `chunk`, `glossary-build`, and `assemble` commands support
 if already complete.  `glossary-build` also supports `--batch ID` to redo a
 specific sub-batch (e.g. `--batch 0003.b2`); `--batch` takes precedence over
 `--spine`.
+
+The `glossary-cluster` and `glossary-reconcile` commands support `--force` to
+re-run from scratch (deleting the stage's output and re-reading from the
+upstream stage's pristine output file) and `--retry-failed` to retry only
+failed iterations/items.
 
 The `translate` command supports `--spine N`, `--chunk ID`, `--from/--to` for
 range-based translation, and `--force` to retranslate completed chunks.
@@ -124,33 +134,61 @@ dao-bridge run --work-dir ./work --retry-failed
 ```
 
 `--retry-failed` is mutually exclusive with `--force`. It is supported on
-`classify`, `chunk`, `glossary-build`, `glossary-reconcile`, `translate`,
-`assemble`, and `run`.
+`classify`, `chunk`, `glossary-build`, `glossary-cluster`,
+`glossary-reconcile`, `translate`, `assemble`, and `run`.
 
 ### Glossary Flow
 
-The glossary stages extract and refine a per-book glossary of proper nouns,
-character names, and notable terms:
+The glossary uses an **entity-centric** model. Each `GlossaryEntity` owns one
+or more `SurfaceForm` entries (the different ways a name appears in the
+source text). Entities carry a canonical English rendering, category, summary,
+aliases, nicknames, speech-style notes, and context hints. The glossary is
+stored in `glossary.json` and progresses through four stages:
 
 1. **glossary-build** -- Groups chunks by spine item and packs each spine's
    chunks into sub-batches (item IDs like `0003.b2`).  Each sub-batch is sent
-   to the LLM for extraction.  Entries accumulate across batches; the glossary
-   is saved after each batch for crash-resumability.  Use `--spine N` or
-   `--batch ID` to redo specific items.  Conflicting English proposals and
-   corrections are logged for the reconcile stage.
+   to the LLM, which returns `ExtractedMention` objects.  Mentions are linked
+   to existing entities by exact surface-form match, shared reading + English,
+   or high Jaro-Winkler similarity (>= 0.95 auto-attach).  Unmatched mentions
+   create new entities.  The glossary is saved after each batch for
+   crash-resumability.  Use `--spine N` or `--batch ID` to redo specific
+   items.  Conflicting English proposals and corrections are logged for the
+   reconcile stage.
 
-2. **glossary-reconcile** -- Resolves within-book conflicts (differing English
-   translations, corrections) via LLM calls, and consolidates multiple
-   speech-style observations per character. Writes a decision report to
-   `glossary_reconcile_report.md`.
+2. **glossary-cluster** -- Reads from `glossary_build.json` and writes to
+   `glossary_cluster.json`.  Finds duplicate entities that build-time linking
+   missed.  Generates candidate entity pairs using deterministic heuristics
+   (Japanese substring containment, English containment, shared reading, alias
+   overlap, Jaro-Winkler similarity), then sends each batch to the LLM for
+   confirmation.  Confirmed pairs are merged (surface forms unioned, metadata
+   combined).  Iterates until no new candidates are found or the iteration cap
+   is reached.  Writes a merge report to `glossary_cluster_report.md`.
 
-3. **glossary-export** -- Renders the glossary as categorized markdown
+   The build output is never mutated by clustering.  Running
+   `glossary-cluster --force` deletes `glossary_cluster.json` and re-reads
+   from the pristine `glossary_build.json`.
+
+3. **glossary-reconcile** -- Reads from `glossary_cluster.json` and writes to
+   `glossary.json` (the final glossary consumed by translation and export).
+   Resolves within-book conflicts (differing English translations, corrections)
+   via LLM calls, and consolidates multiple speech-style observations per
+   character.  Writes a decision report to `glossary_reconcile_report.md`.
+   Running `--force` deletes `glossary.json` and re-reads from
+   `glossary_cluster.json`.
+
+4. **glossary-export** -- Renders the glossary as categorized markdown
    (`glossary.md`) for human review and editing before the translation stage.
 
-The intended workflow is: build -> reconcile -> export -> **human review and
-editing of glossary.json** -> translate. Human edits to `glossary.json` should
-set `"source": "user"` on modified entries to prevent the build stage from
-overwriting them.
+The intended workflow is: build -> cluster -> reconcile -> export -> **human
+review and editing of glossary.json** -> translate. Human edits to
+`glossary.json` should set `"source": "user"` on modified entities to prevent
+the build stage from overwriting them.
+
+> **Warning:** Re-running any upstream glossary stage (`glossary-build --force`,
+> `glossary-cluster --force`, or targeted `--spine`/`--batch` reruns) invalidates
+> and **deletes** `glossary.json`. Manual edits made directly to `glossary.json`
+> will be lost. A future `glossary_additions.json` mechanism is planned to allow
+> durable manual edits that survive pipeline reruns.
 
 **Master glossary features** (`glossary-crosscheck`, `glossary-promote`,
 `glossary-import-reference`) for multi-book series with consistent terminology
@@ -160,8 +198,9 @@ are planned for a future release.
 
 The `translate` command runs a multi-pass translation pipeline for each chunk:
 
-1. **Pass 1** -- Initial translation with glossary injection, overlap context
-   from the previous chunk, and rolling narrative summary for continuity.
+1. **Pass 1** -- Initial translation with glossary injection (all entity
+   surface forms are scanned against the source text), overlap context from
+   the previous chunk, and rolling narrative summary for continuity.
 2. **Pass 2** (optional) -- Revision pass comparing the draft against the
    original, with instructions to improve naturalness and accuracy.
 3. **QA** (optional) -- Programmatic length-ratio check plus LLM-based quality
@@ -225,8 +264,11 @@ work/
     0001.md
   summaries/           # Rolling translation summaries
     rolling_summary.json
-  glossary.json        # Per-book glossary (build -> reconcile -> user edit)
-  glossary.md          # Exported glossary for human review
+  glossary_build.json           # Build stage output (never mutated by later stages)
+  glossary_cluster.json         # Cluster stage output (never mutated by reconcile)
+  glossary.json                 # Final glossary (reconcile output -> user edit -> translate)
+  glossary.md                   # Exported glossary for human review
+  glossary_cluster_report.md    # Clustering merge decisions and reasoning
   glossary_reconcile_report.md  # Reconciliation decisions and reasoning
   logs/
     run.log            # Full debug log
@@ -264,7 +306,7 @@ by `dao-bridge init`. Key sections:
 
 - **models**: Per-task LLM endpoints (classify, glossary, translate, summarize)
 - **chunking**: Token targets, scene break patterns
-- **glossary**: Categories, master glossary path, crosscheck settings
+- **glossary**: Categories, cluster settings (iteration cap, similarity threshold, batch size), master glossary path, crosscheck settings
 - **translation_phase**: Double-pass, overlap, QA settings
 - **output**: EPUB output path, metadata options
 - **languages**: Source and target language codes

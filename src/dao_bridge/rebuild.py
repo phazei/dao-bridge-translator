@@ -707,8 +707,8 @@ def _do_rebuild(work_dir: Path, config: AppConfig, state: PipelineState) -> None
         glossary = load_glossary(work_dir, config)
     else:
         glossary = Glossary(
-            created_at="2000-01-01T00:00:00Z",
-            updated_at="2000-01-01T00:00:00Z",
+            created_at="2000-01-01T00:00:00Z",  # type: ignore[arg-type]
+            updated_at="2000-01-01T00:00:00Z",  # type: ignore[arg-type]
         )
 
     toc_modified = translate_toc(source_epub, manifest, glossary, llm_client, config)

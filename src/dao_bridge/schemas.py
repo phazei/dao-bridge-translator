@@ -98,27 +98,59 @@ class Chunk(BaseModel):
 GlossarySource = Literal["seed", "extracted", "user", "master"]
 
 
-class GlossaryEntry(BaseModel):
-    """A single glossary entry for term consistency."""
+class SurfaceForm(BaseModel):
+    """A source-language text form that refers to an entity.
 
-    source_term: str | None = None  # None for target-language-reference-only imports
-    reading: str | None = None  # from furigana
-    english: str
-    category: str  # validated against config.glossary.categories at load time
-    first_seen_chunk: str | None = None
-    aliases: list[str] = []
-    nicknames: dict[str, str] = {}  # {speaker_english_name: nickname_english}
-    speech_style: str | None = None  # prose description, characters only
+    Each surface form carries its own English rendering.  For example,
+    ``アベル → Abel`` and ``ヴィンセント・ヴォラキア皇帝 → Emperor Vincent
+    Volakia`` may both belong to the same :class:`GlossaryEntity`, but
+    they translate differently depending on which form appears in the
+    source text.
+    """
+
+    source: str  # The source-language string, e.g. "アベル"
+    reading: str | None = None  # From furigana, if available
+    english: str  # English rendering for THIS specific form
+    context_hints: list[str] = Field(default_factory=list)
     notes: str | None = None
-    source: GlossarySource
-    source_books: list[str] = []  # populated for master-glossary entries
+    first_seen_chunk: str | None = None
+    occurrence_count: int = 1
+
+
+class GlossaryEntity(BaseModel):
+    """A single entity in the glossary.
+
+    An entity owns a pool of :class:`SurfaceForm` objects — all the
+    source-language strings that refer to this person, place, item, or
+    concept.  The *canonical_english* is the primary name used in
+    reports and logs; individual surface forms carry their own per-form
+    English renderings for translation.
+    """
+
+    entity_id: str  # Stable slug, e.g. "character_000012"
+    category: str  # Validated against config.glossary.categories
+    canonical_english: str  # Primary English name, e.g. "Abel"
+    summary: str | None = None  # Accumulated understanding of this entity
+    surface_forms: list[SurfaceForm] = Field(default_factory=list)
+
+    # Carried from previous schema
+    aliases: list[str] = Field(default_factory=list)
+    nicknames: dict[str, str] = Field(default_factory=dict)
+    speech_style: str | None = None  # Prose description, characters only
+    notes: str | None = None
+    source: GlossarySource = "extracted"
+    source_books: list[str] = Field(default_factory=list)
+
+    # Temporal tracking
+    first_seen_chunk: str | None = None
+    latest_evidence_chunk: str | None = None
 
 
 class Glossary(BaseModel):
-    """Per-book or master glossary."""
+    """Per-book or master glossary (entity-centric, v2)."""
 
-    entries: list[GlossaryEntry] = []
-    version: int = 1
+    entities: list[GlossaryEntity] = Field(default_factory=list)
+    version: int = 2
     book_id: str | None = None  # None for master glossary
     book_metadata: dict = {}  # title, author, volume; per-book only
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
@@ -130,17 +162,23 @@ class Glossary(BaseModel):
 # ---------------------------------------------------------------------------
 
 
-class GlossaryExtractionEntry(BaseModel):
-    """A single entry from the glossary extraction LLM response."""
+class ExtractedMention(BaseModel):
+    """A raw mention observed by the extraction LLM in a chunk/batch.
 
-    source_term: str
-    reading: str | None = None
-    english_proposed: str
-    category: str
-    aliases: list[str] = []
-    nicknames: dict[str, str] = {}
-    speech_style: str | None = None
+    This is a temporary observation — build code decides whether it
+    attaches to an existing entity or creates a new one.
+    """
+
+    source: str  # Exact source-language term as written
+    reading: str | None = None  # Pronunciation from furigana, else null
+    english: str  # Proposed English rendering for this form
+    category: str  # One of the allowed categories
+    summary_update: str | None = None  # Concise sentence about what this entity appears to be
+    context_hint: str | None = None  # Low-confidence hint, e.g. "same person as アベル"
     notes: str | None = None
+    aliases: list[str] = Field(default_factory=list)
+    nicknames: dict[str, str] = Field(default_factory=dict)
+    speech_style: str | None = None
 
 
 class GlossaryCorrectionEntry(BaseModel):
@@ -155,8 +193,8 @@ class GlossaryCorrectionEntry(BaseModel):
 class GlossaryExtractionResponse(BaseModel):
     """Top-level LLM response for glossary extraction."""
 
-    entries: list[GlossaryExtractionEntry] = []
-    corrections: list[GlossaryCorrectionEntry] = []
+    mentions: list[ExtractedMention] = Field(default_factory=list)
+    corrections: list[GlossaryCorrectionEntry] = Field(default_factory=list)
 
 
 class GlossaryReconcileResponse(BaseModel):

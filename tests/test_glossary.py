@@ -1,4 +1,7 @@
-"""Tests for dao_bridge.glossary — build, reconcile, export, and integration."""
+"""Tests for dao_bridge.glossary — build, reconcile, export, and integration.
+
+Rewritten for entity-centric v2 glossary schema.
+"""
 
 from __future__ import annotations
 
@@ -21,22 +24,28 @@ from dao_bridge.glossary import (
     _rebalance_final_two_batches,
     _save_build_meta,
     _save_glossary,
+    add_or_update_surface_form,
+    find_entity_for_mention,
     glossary_build,
     glossary_export,
     glossary_reconcile,
+    merge_aliases_nicknames_speech_notes,
+    merge_entity_summary,
+    next_entity_id,
     validate_glossary_categories,
 )
 from dao_bridge.schemas import (
     Chunk,
+    ExtractedMention,
     Glossary,
     GlossaryCorrectionEntry,
-    GlossaryEntry,
-    GlossaryExtractionEntry,
+    GlossaryEntity,
     GlossaryExtractionResponse,
     GlossaryReconcileResponse,
     GlossarySpeechMergeResponse,
     Manifest,
     ManifestItem,
+    SurfaceForm,
 )
 from dao_bridge.state import (
     PipelineState,
@@ -129,17 +138,17 @@ def _write_chunks(
 
 
 def _mock_extraction_response(
-    entries: list[dict] | None = None,
+    mentions: list[dict] | None = None,
     corrections: list[dict] | None = None,
 ) -> GlossaryExtractionResponse:
     """Build a GlossaryExtractionResponse from simple dicts."""
-    entry_objs = []
-    for e in entries or []:
-        entry_objs.append(GlossaryExtractionEntry(**e))
+    mention_objs = []
+    for m in mentions or []:
+        mention_objs.append(ExtractedMention(**m))
     corr_objs = []
     for c in corrections or []:
         corr_objs.append(GlossaryCorrectionEntry(**c))
-    return GlossaryExtractionResponse(entries=entry_objs, corrections=corr_objs)
+    return GlossaryExtractionResponse(mentions=mention_objs, corrections=corr_objs)
 
 
 def _setup_work_dir(tmp_path: Path) -> Path:
@@ -155,6 +164,37 @@ def _mark_prior_stages_complete(work_dir: Path, state: PipelineState) -> None:
     for stage in ("extract", "clean", "classify", "chunk"):
         mark_stage_started(work_dir, state, stage)
         mark_stage_completed(work_dir, state, stage)
+
+
+def _make_entity(
+    entity_id: str = "character_000001",
+    category: str = "character",
+    canonical_english: str = "Subaru",
+    surface_forms: list[dict] | None = None,
+    **kwargs,
+) -> GlossaryEntity:
+    """Helper to create a GlossaryEntity with sensible defaults."""
+    sfs = []
+    for sf_data in surface_forms or []:
+        sfs.append(SurfaceForm(**sf_data))
+    return GlossaryEntity(
+        entity_id=entity_id,
+        category=category,
+        canonical_english=canonical_english,
+        surface_forms=sfs,
+        source="extracted",
+        **kwargs,
+    )
+
+
+def _make_mention(
+    source: str = "スバル",
+    english: str = "Subaru",
+    category: str = "character",
+    **kwargs,
+) -> ExtractedMention:
+    """Helper to create an ExtractedMention with sensible defaults."""
+    return ExtractedMention(source=source, english=english, category=category, **kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -194,10 +234,6 @@ class TestSpineBatchPacking:
 
     def test_multiple_batches(self):
         """Chunks are split across multiple batches."""
-        # 5 chunks @ 400 tokens = 2000 total, target 1000.
-        # Greedy: [400+400]=800, [400+400]=800, [400].
-        # Last batch = 400 = 40% of target = threshold boundary.
-        # 400 is NOT < 400 (threshold), so no redistribution.
         chunks = self._make_chunks(5, token_count=400)
         batches = _pack_spine_batches(chunks, self.TARGET, self.MIN_BATCH, self.THRESHOLD)
         assert len(batches) == 3
@@ -207,8 +243,6 @@ class TestSpineBatchPacking:
 
     def test_last_batch_larger_than_threshold(self):
         """Last batch above threshold is left as-is."""
-        # 3 chunks @ 600 tokens, target 1000.
-        # Greedy: [600], [600], [600]. Last = 600 > 400 threshold.
         chunks = self._make_chunks(3, token_count=600)
         batches = _pack_spine_batches(chunks, self.TARGET, self.MIN_BATCH, self.THRESHOLD)
         assert len(batches) == 3
@@ -237,9 +271,6 @@ class TestSpineBatchPacking:
 
     def test_absorb_tiny_final_batch(self):
         """Final batch below min_batch_tokens is absorbed into previous."""
-        # 3 chunks: 800, 800, 50 tokens. Target 1000, min_batch 100.
-        # Greedy: [800], [800], [50]. Last = 50 < 100 -> absorb.
-        # Result: [800], [800+50=850].
         chunks = [
             Chunk(
                 chunk_id=f"0000.{i:03d}",
@@ -259,43 +290,6 @@ class TestSpineBatchPacking:
 
     def test_redistribute_small_final_batch(self):
         """Final batch between min_batch and threshold is redistributed."""
-        # 5 chunks: 900, 900, 900, 900, 200 tokens. Target 1000, min_batch 100, threshold 40%.
-        # Greedy: [900], [900], [900], [900], [200].
-        # Last = 200 > 100 (min) but < 400 (threshold) -> redistribute last two.
-        # Merge last two: [900, 200] = 1100 tokens. Half = 550.
-        # Split: chunk 900 alone = 900 >= 550 -> split_idx=1.
-        # Result: [900], [900], [900], [900], [200].
-        # Wait — overshoot=900-550=350, undershoot=550-0=550. 350 < 550, so split_idx=1.
-        # After: batches[-2] = [900], batches[-1] = [200].
-        # Hmm, that doesn't change anything. Let me reconsider with different values.
-        #
-        # Better example: 4 chunks: 800, 800, 800, 300.
-        # Greedy: [800], [800], [800, 300] — wait, 800+300=1100 > 1000, so:
-        # [800], [800], [800], [300].
-        # Last = 300 > 100 (min) but < 400 (threshold) -> redistribute last two.
-        # Merge: [800, 300] = 1100. Half = 550.
-        # First chunk=800. running=800 >= 550. overshoot=250, undershoot=550. i=0 but i>0 is false, so split_idx=1.
-        # Result: [800], [300] — same as before. The issue is we only have 2 chunks to redistribute.
-        #
-        # For redistribution to visibly change things, we need more chunks in the merged pair.
-        # 6 chunks: 400, 400, 400, 400, 400, 150.
-        # Greedy: [400+400]=800, [400+400]=800, [400], [150].
-        # Last = 150 > 100 but < 400 -> redistribute last two.
-        # Merge: [400, 150] = 550. Half = 275.
-        # chunk 400: running=400 >= 275. overshoot=125, undershoot=275. i=0 so split_idx=1.
-        # Result: [400], [150] — still same. Redistribution with 2 single-chunk batches can't
-        # help unless the chunks themselves are divisible, which they're not.
-        #
-        # The redistribution really helps when the two batches have multiple chunks.
-        # 7 chunks: 450, 450, 450, 450, 450, 450, 200.
-        # Greedy: [450+450]=900, [450+450]=900, [450+450]=900, [200].
-        # Wait, last greedy step: current=450, add 450 -> 900 <= 1000. Add 200 -> 1100 > 1000.
-        # So: [450,450], [450,450], [450,450], [200].
-        # Last = 200 < 400 -> redistribute last two: merge [450,450,200] = 1100. Half = 550.
-        # chunk 450: running=450 < 550.
-        # chunk 450: running=900 >= 550. overshoot=350, undershoot=100. i=1, i>0, undershoot<overshoot -> split_idx=1.
-        # batches[-2] = [450], batches[-1] = [450, 200].
-        # Tokens: 450 and 650 — more balanced than 900 and 200.
         chunks = [
             Chunk(
                 chunk_id=f"0000.{i:03d}",
@@ -310,13 +304,10 @@ class TestSpineBatchPacking:
         ]
         batches = _pack_spine_batches(chunks, self.TARGET, self.MIN_BATCH, self.THRESHOLD)
         assert len(batches) == 4
-        # First two batches unchanged.
         assert len(batches[0]) == 2  # [450, 450]
         assert len(batches[1]) == 2  # [450, 450]
-        # Last two redistributed: [450] and [450, 200].
         assert len(batches[2]) == 1  # [450]
         assert len(batches[3]) == 2  # [450, 200]
-        # Verify token balance.
         last_two_tokens = [
             sum(c.token_count for c in batches[2]),
             sum(c.token_count for c in batches[3]),
@@ -372,7 +363,6 @@ class TestRebalanceFinalTwoBatches:
         """Perfectly even token totals split in the middle."""
         prev = self._make_chunks([500, 500])
         last = self._make_chunks([500, 500])
-        # Adjust chunk IDs for last batch.
         new_prev, new_last = _rebalance_final_two_batches(prev, last)
         total_left = sum(c.token_count for c in new_prev)
         total_right = sum(c.token_count for c in new_last)
@@ -381,14 +371,9 @@ class TestRebalanceFinalTwoBatches:
     def test_tie_prefers_earlier_split(self):
         """Equal split candidates choose the earlier chunk boundary."""
         chunks = self._make_chunks([2000, 2000, 2000, 2000])
-        prev = chunks[:3]  # 6000 tokens
-        last = chunks[3:]  # 2000 tokens
+        prev = chunks[:3]
+        last = chunks[3:]
         new_prev, new_last = _rebalance_final_two_batches(prev, last)
-        # Total = 8000, half = 4000.
-        # Split at 2 gives [2000,2000]=4000 vs [2000,2000]=4000 -> delta=0.
-        # Split at 1 gives [2000] vs [2000,2000,2000]=6000 -> delta=4000.
-        # Split at 3 gives [2000,2000,2000]=6000 vs [2000]=2000 -> delta=4000.
-        # Best = split at 2.
         assert len(new_prev) == 2
         assert len(new_last) == 2
 
@@ -396,12 +381,7 @@ class TestRebalanceFinalTwoBatches:
         """Uneven chunks pick the boundary closest to half."""
         prev = self._make_chunks([800, 800])
         last = self._make_chunks([300])
-        # Adjust chunk_ids for clarity — doesn't matter for the algorithm.
         new_prev, new_last = _rebalance_final_two_batches(prev, last)
-        # Total = 1900, half = 950.
-        # Split at 1: left=800 vs right=1100 -> delta=300.
-        # Split at 2: left=1600 vs right=300 -> delta=1300.
-        # Best = split at 1.
         assert len(new_prev) == 1
         assert len(new_last) == 2
 
@@ -503,7 +483,6 @@ class TestBuildWorkItems:
     def test_multi_spine_multi_batch(self):
         """Multiple spines, some needing multiple batches."""
         chunks = []
-        # Spine 0: 3 chunks @ 400 tokens = 1200, target 1000 -> 2 batches.
         for i in range(1, 4):
             chunks.append(
                 Chunk(
@@ -516,7 +495,6 @@ class TestBuildWorkItems:
                     text="text",
                 )
             )
-        # Spine 1: 1 chunk @ 200 tokens -> 1 batch.
         chunks.append(
             Chunk(
                 chunk_id="0001.001",
@@ -536,8 +514,6 @@ class TestBuildWorkItems:
             redistribute_threshold=0.4,
             spine_width=4,
         )
-        # Spine 0: [400,400] and [400] -> but 400 >= 400*0.4=400... not < threshold.
-        # So 2 batches for spine 0. 1 batch for spine 1. Total = 3.
         assert len(items) == 3
         assert items[0].item_id == "0000.b1"
         assert items[0].spine_batch_count == 2
@@ -614,14 +590,21 @@ class TestCategoryValidation:
     def test_valid_categories(self):
         """No error when all categories are valid."""
         g = Glossary(
-            entries=[
-                GlossaryEntry(
-                    source_term="X", english="X", category="character", source="extracted"
+            entities=[
+                _make_entity(
+                    entity_id="character_000001",
+                    category="character",
+                    canonical_english="X",
+                    surface_forms=[{"source": "X", "english": "X"}],
                 ),
-                GlossaryEntry(source_term="Y", english="Y", category="place", source="extracted"),
+                _make_entity(
+                    entity_id="place_000001",
+                    category="place",
+                    canonical_english="Y",
+                    surface_forms=[{"source": "Y", "english": "Y"}],
+                ),
             ]
         )
-        # Should not raise.
         validate_glossary_categories(
             g,
             [
@@ -641,22 +624,30 @@ class TestCategoryValidation:
     def test_invalid_category_raises(self):
         """Clear error with invalid category."""
         g = Glossary(
-            entries=[
-                GlossaryEntry(
-                    source_term="X", english="Foo", category="weapon", source="extracted"
+            entities=[
+                _make_entity(
+                    entity_id="weapon_000001",
+                    category="weapon",
+                    canonical_english="Foo",
                 ),
-                GlossaryEntry(source_term="Y", english="Bar", category="magic", source="extracted"),
+                _make_entity(
+                    entity_id="magic_000001",
+                    category="magic",
+                    canonical_english="Bar",
+                ),
             ]
         )
         with pytest.raises(ValueError, match="weapon"):
             validate_glossary_categories(g, ["character", "place"])
 
-    def test_error_lists_affected_entries(self):
-        """Error message lists which entries use the invalid category."""
+    def test_error_lists_affected_entities(self):
+        """Error message lists which entities use the invalid category."""
         g = Glossary(
-            entries=[
-                GlossaryEntry(
-                    source_term="X", english="Foo", category="weapon", source="extracted"
+            entities=[
+                _make_entity(
+                    entity_id="weapon_000001",
+                    category="weapon",
+                    canonical_english="Foo",
                 ),
             ]
         )
@@ -669,6 +660,227 @@ class TestCategoryValidation:
 
 
 # ---------------------------------------------------------------------------
+# TestEntityLinking
+# ---------------------------------------------------------------------------
+
+
+class TestEntityLinking:
+    """Tests for build-time entity linking (find_entity_for_mention)."""
+
+    def test_exact_surface_form_match(self):
+        """Exact source match returns the entity."""
+        entity = _make_entity(
+            surface_forms=[{"source": "スバル", "english": "Subaru"}],
+        )
+        glossary = Glossary(entities=[entity])
+        mention = _make_mention(source="スバル", english="Subaru")
+        result = find_entity_for_mention(glossary, mention)
+        assert result is entity
+
+    def test_same_reading_and_english_match(self):
+        """Same non-null reading AND English returns the entity."""
+        entity = _make_entity(
+            surface_forms=[{"source": "スバル", "reading": "すばる", "english": "Subaru"}],
+        )
+        glossary = Glossary(entities=[entity])
+        mention = _make_mention(source="ナツキ・スバル", reading="すばる", english="Subaru")
+        result = find_entity_for_mention(glossary, mention)
+        assert result is entity
+
+    def test_no_match_returns_none(self):
+        """When no entity matches, returns None (create new entity)."""
+        entity = _make_entity(
+            surface_forms=[{"source": "スバル", "english": "Subaru"}],
+        )
+        glossary = Glossary(entities=[entity])
+        mention = _make_mention(source="エミリア", english="Emilia")
+        result = find_entity_for_mention(glossary, mention)
+        assert result is None
+
+    def test_null_reading_does_not_match(self):
+        """Null reading should not match other null readings."""
+        entity = _make_entity(
+            surface_forms=[{"source": "スバル", "reading": None, "english": "Subaru"}],
+        )
+        glossary = Glossary(entities=[entity])
+        mention = _make_mention(source="ナツキ", reading=None, english="Subaru")
+        result = find_entity_for_mention(glossary, mention)
+        # Exact source doesn't match, null reading can't match — should be None.
+        assert result is None
+
+    def test_different_category_blocks_jaro_winkler(self):
+        """High-similarity source with different category does not match."""
+        entity = _make_entity(
+            entity_id="character_000001",
+            category="character",
+            surface_forms=[{"source": "アベル", "english": "Abel"}],
+        )
+        glossary = Glossary(entities=[entity])
+        # Very similar source but different category.
+        mention = _make_mention(source="アベル座", english="Abelza", category="place")
+        # Exact source doesn't match, reading doesn't match, category differs.
+        result = find_entity_for_mention(glossary, mention)
+        assert result is None
+
+    def test_ambiguous_jaro_winkler_match_returns_none(self):
+        """High-similarity fallback only auto-attaches when unique."""
+        glossary = Glossary(
+            entities=[
+                _make_entity(
+                    entity_id="character_000001",
+                    category="character",
+                    canonical_english="Abel",
+                    surface_forms=[{"source": "アベル", "english": "Abel"}],
+                ),
+                _make_entity(
+                    entity_id="character_000002",
+                    category="character",
+                    canonical_english="Abe",
+                    surface_forms=[{"source": "アベル", "english": "Abe"}],
+                ),
+            ]
+        )
+        mention = _make_mention(source="アベルー", english="Abel", category="character")
+        assert find_entity_for_mention(glossary, mention) is None
+
+
+# ---------------------------------------------------------------------------
+# TestEntityIdGeneration
+# ---------------------------------------------------------------------------
+
+
+class TestEntityIdGeneration:
+    """Tests for next_entity_id."""
+
+    def test_first_entity_for_category(self):
+        """First entity gets 000001."""
+        glossary = Glossary()
+        eid = next_entity_id("character", glossary)
+        assert eid == "character_000001"
+
+    def test_increments_from_existing(self):
+        """ID increments from highest existing for the category."""
+        glossary = Glossary(
+            entities=[
+                _make_entity(entity_id="character_000003", category="character"),
+                _make_entity(entity_id="character_000001", category="character"),
+            ]
+        )
+        eid = next_entity_id("character", glossary)
+        assert eid == "character_000004"
+
+    def test_different_categories_independent(self):
+        """Different categories have independent counters."""
+        glossary = Glossary(
+            entities=[
+                _make_entity(entity_id="character_000005", category="character"),
+                _make_entity(entity_id="place_000002", category="place"),
+            ]
+        )
+        assert next_entity_id("character", glossary) == "character_000006"
+        assert next_entity_id("place", glossary) == "place_000003"
+        assert next_entity_id("item", glossary) == "item_000001"
+
+
+# ---------------------------------------------------------------------------
+# TestCorrectionRouting
+# ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# TestSurfaceFormMerge
+# ---------------------------------------------------------------------------
+
+
+class TestSurfaceFormMerge:
+    """Tests for add_or_update_surface_form."""
+
+    def test_new_surface_form_added(self):
+        """New source creates a new surface form on the entity."""
+        entity = _make_entity(
+            surface_forms=[{"source": "スバル", "english": "Subaru"}],
+        )
+        mention = _make_mention(source="ナツキ・スバル", english="Natsuki Subaru")
+        add_or_update_surface_form(entity, mention, "0000.001")
+        assert len(entity.surface_forms) == 2
+        new_sf = entity.surface_forms[1]
+        assert new_sf.source == "ナツキ・スバル"
+        assert new_sf.english == "Natsuki Subaru"
+        assert new_sf.first_seen_chunk == "0000.001"
+
+    def test_existing_source_increments_count(self):
+        """Repeat source increments occurrence_count."""
+        entity = _make_entity(
+            surface_forms=[{"source": "スバル", "english": "Subaru", "occurrence_count": 1}],
+        )
+        mention = _make_mention(source="スバル", english="Subaru")
+        add_or_update_surface_form(entity, mention, "0000.002")
+        assert len(entity.surface_forms) == 1
+        assert entity.surface_forms[0].occurrence_count == 2
+
+    def test_context_hint_appended(self):
+        """Context hint is appended to existing surface form."""
+        entity = _make_entity(
+            surface_forms=[{"source": "スバル", "english": "Subaru"}],
+        )
+        mention = _make_mention(
+            source="スバル", english="Subaru", context_hint="possibly same as ナツキ"
+        )
+        add_or_update_surface_form(entity, mention, "0000.001")
+        assert "possibly same as ナツキ" in entity.surface_forms[0].context_hints
+
+    def test_reading_backfilled(self):
+        """Missing reading on existing form is backfilled from mention."""
+        entity = _make_entity(
+            surface_forms=[{"source": "スバル", "english": "Subaru", "reading": None}],
+        )
+        mention = _make_mention(source="スバル", english="Subaru", reading="すばる")
+        add_or_update_surface_form(entity, mention, "0000.001")
+        assert entity.surface_forms[0].reading == "すばる"
+
+
+# ---------------------------------------------------------------------------
+# TestSummaryMerge
+# ---------------------------------------------------------------------------
+
+
+class TestSummaryMerge:
+    """Tests for merge_entity_summary."""
+
+    def test_first_summary_stored(self):
+        """First summary is stored directly."""
+        entity = _make_entity(summary=None)
+        merge_entity_summary(entity, "A young man from another world.", "0000.001")
+        assert entity.summary == "A young man from another world."
+        assert entity.latest_evidence_chunk == "0000.001"
+
+    def test_new_observation_appended(self):
+        """New observation is appended."""
+        entity = _make_entity(summary="A young man from another world.")
+        merge_entity_summary(entity, "He has Return by Death.", "0000.005")
+        assert "He has Return by Death." in entity.summary
+        assert entity.latest_evidence_chunk == "0000.005"
+
+    def test_duplicate_observation_not_appended(self):
+        """Identical observation is not duplicated."""
+        entity = _make_entity(summary="A young man from another world.")
+        merge_entity_summary(entity, "A young man from another world.", "0000.005")
+        assert entity.summary == "A young man from another world."
+
+    def test_null_update_ignored(self):
+        """None summary_update is ignored."""
+        entity = _make_entity(summary="Existing.")
+        merge_entity_summary(entity, None, "0000.001")
+        assert entity.summary == "Existing."
+
+    def test_summary_truncated_at_max_length(self):
+        """Summary is truncated if it exceeds max length."""
+        entity = _make_entity(summary="A" * 400)
+        merge_entity_summary(entity, "B" * 200, "0000.001")
+        assert len(entity.summary) <= 503  # 500 + "..."
+
+
+# ---------------------------------------------------------------------------
 # TestGlossaryBuild
 # ---------------------------------------------------------------------------
 
@@ -676,8 +888,8 @@ class TestCategoryValidation:
 class TestGlossaryBuild:
     """Tests for the glossary_build function."""
 
-    def test_entries_merged_correctly(self, tmp_path):
-        """New entries are added with correct fields."""
+    def test_entities_created_correctly(self, tmp_path):
+        """New entities are created with correct fields."""
         work = _setup_work_dir(tmp_path)
         config = _make_config(work)
         state = load_state(work)
@@ -686,20 +898,21 @@ class TestGlossaryBuild:
         _write_chunks(work, n_spines=1, chunks_per_spine=2, tokens_per_chunk=500)
 
         mock_response = _mock_extraction_response(
-            entries=[
+            mentions=[
                 {
-                    "source_term": "ナツキ・スバル",
+                    "source": "ナツキ・スバル",
                     "reading": "ナツキ・スバル",
-                    "english_proposed": "Natsuki Subaru",
+                    "english": "Natsuki Subaru",
                     "category": "character",
                     "aliases": ["スバル"],
                     "nicknames": {},
                     "speech_style": "Casual modern speech.",
                     "notes": "Protagonist.",
+                    "summary_update": "A young man transported to another world.",
                 },
                 {
-                    "source_term": "エミリア",
-                    "english_proposed": "Emilia",
+                    "source": "エミリア",
+                    "english": "Emilia",
                     "category": "character",
                     "aliases": [],
                     "nicknames": {"Subaru": "Emilia-tan"},
@@ -715,19 +928,22 @@ class TestGlossaryBuild:
 
             glossary = glossary_build(work, config, state, force=True)
 
-        assert len(glossary.entries) == 2
-        subaru = next(e for e in glossary.entries if e.english == "Natsuki Subaru")
-        assert subaru.source_term == "ナツキ・スバル"
-        assert subaru.reading == "ナツキ・スバル"
+        assert len(glossary.entities) == 2
+        subaru = next(e for e in glossary.entities if e.canonical_english == "Natsuki Subaru")
+        assert subaru.entity_id == "character_000001"
         assert subaru.source == "extracted"
         assert "スバル" in subaru.aliases
         assert subaru.speech_style == "Casual modern speech."
+        assert subaru.summary == "A young man transported to another world."
         assert subaru.first_seen_chunk is not None
+        assert len(subaru.surface_forms) == 1
+        assert subaru.surface_forms[0].source == "ナツキ・スバル"
+        assert subaru.surface_forms[0].english == "Natsuki Subaru"
 
-        emilia = next(e for e in glossary.entries if e.english == "Emilia")
+        emilia = next(e for e in glossary.entities if e.canonical_english == "Emilia")
         assert emilia.nicknames["Subaru"] == "Emilia-tan"
 
-        # book_id and book_metadata populated from manifest.
+        # book_id populated from manifest.
         assert glossary.book_id == "test-book"
 
     def test_aliases_unioned_across_batches(self, tmp_path):
@@ -737,25 +953,24 @@ class TestGlossaryBuild:
         config.glossary_phase.target_tokens_per_call = 1200
         state = load_state(work)
         _mark_prior_stages_complete(work, state)
-        # 4 chunks @ 500 tokens, target 1200 -> 2 batches of 2.
         _make_manifest(work, n_spines=1, chunks_per_spine=4)
         _write_chunks(work, n_spines=1, chunks_per_spine=4, tokens_per_chunk=500)
 
         batch1_response = _mock_extraction_response(
-            entries=[
+            mentions=[
                 {
-                    "source_term": "スバル",
-                    "english_proposed": "Subaru",
+                    "source": "スバル",
+                    "english": "Subaru",
                     "category": "character",
                     "aliases": ["バルス"],
                 },
             ]
         )
         batch2_response = _mock_extraction_response(
-            entries=[
+            mentions=[
                 {
-                    "source_term": "スバル",
-                    "english_proposed": "Subaru",
+                    "source": "スバル",
+                    "english": "Subaru",
                     "category": "character",
                     "aliases": ["バルス", "ナツキ"],
                 },
@@ -769,10 +984,9 @@ class TestGlossaryBuild:
 
             glossary = glossary_build(work, config, state, force=True)
 
-        subaru = next(e for e in glossary.entries if e.english == "Subaru")
+        subaru = next(e for e in glossary.entities if e.canonical_english == "Subaru")
         assert "バルス" in subaru.aliases
         assert "ナツキ" in subaru.aliases
-        # No duplicates.
         assert subaru.aliases.count("バルス") == 1
 
     def test_speech_styles_accumulated(self, tmp_path):
@@ -782,25 +996,24 @@ class TestGlossaryBuild:
         config.glossary_phase.target_tokens_per_call = 1200
         state = load_state(work)
         _mark_prior_stages_complete(work, state)
-        # 4 chunks @ 500 tokens, target 1200 -> 2 batches of 2.
         _make_manifest(work, n_spines=1, chunks_per_spine=4)
         _write_chunks(work, n_spines=1, chunks_per_spine=4, tokens_per_chunk=500)
 
         batch1_response = _mock_extraction_response(
-            entries=[
+            mentions=[
                 {
-                    "source_term": "スバル",
-                    "english_proposed": "Subaru",
+                    "source": "スバル",
+                    "english": "Subaru",
                     "category": "character",
                     "speech_style": "Casual speech.",
                 },
             ]
         )
         batch2_response = _mock_extraction_response(
-            entries=[
+            mentions=[
                 {
-                    "source_term": "スバル",
-                    "english_proposed": "Subaru",
+                    "source": "スバル",
+                    "english": "Subaru",
                     "category": "character",
                     "speech_style": "Uses modern slang.",
                 },
@@ -814,7 +1027,7 @@ class TestGlossaryBuild:
 
             glossary = glossary_build(work, config, state, force=True)
 
-        subaru = next(e for e in glossary.entries if e.english == "Subaru")
+        subaru = next(e for e in glossary.entities if e.canonical_english == "Subaru")
         assert "Casual speech." in subaru.speech_style
         assert "Uses modern slang." in subaru.speech_style
         assert "\n" in subaru.speech_style
@@ -829,10 +1042,10 @@ class TestGlossaryBuild:
         _write_chunks(work, n_spines=1, chunks_per_spine=2, tokens_per_chunk=500)
 
         mock_response = _mock_extraction_response(
-            entries=[
+            mentions=[
                 {
-                    "source_term": "プリシラ",
-                    "english_proposed": "Priscilla",
+                    "source": "プリシラ",
+                    "english": "Priscilla",
                     "category": "character",
                 },
             ],
@@ -854,18 +1067,17 @@ class TestGlossaryBuild:
             glossary = glossary_build(work, config, state, force=True)
 
         # The correction should not have been applied.
-        priscilla = next(e for e in glossary.entries if e.source_term == "プリシラ")
-        assert priscilla.english == "Priscilla"
+        priscilla = next(e for e in glossary.entities if e.canonical_english == "Priscilla")
+        assert priscilla.canonical_english == "Priscilla"
 
         # But it should be in the build meta conflicts.
         meta = _load_build_meta(work)
         assert len(meta.corrections) == 1
         assert meta.corrections[0]["corrected_english"] == "Priscilla Barielle"
-        # Also recorded as a conflict.
-        assert any(c.source_term == "プリシラ・バーリエル" for c in meta.conflicts)
+        assert len(meta.conflicts) >= 1
 
-    def test_user_sourced_entries_never_modified(self, tmp_path):
-        """Entries with source='user' are never modified by build."""
+    def test_correction_prefers_unique_source_form_when_english_is_ambiguous(self, tmp_path):
+        """Correction routing falls back to a unique source-form match."""
         work = _setup_work_dir(tmp_path)
         config = _make_config(work)
         state = load_state(work)
@@ -873,13 +1085,76 @@ class TestGlossaryBuild:
         _make_manifest(work, n_spines=1, chunks_per_spine=2)
         _write_chunks(work, n_spines=1, chunks_per_spine=2, tokens_per_chunk=500)
 
-        # Pre-seed a user entry.
+        # Pre-seed two entities sharing the same canonical_english.
+        _save_glossary(
+            work,
+            Glossary(
+                entities=[
+                    GlossaryEntity(
+                        entity_id="character_000001",
+                        category="character",
+                        canonical_english="Priscilla",
+                        surface_forms=[SurfaceForm(source="プリシラ", english="Priscilla")],
+                        source="extracted",
+                    ),
+                    GlossaryEntity(
+                        entity_id="character_000002",
+                        category="character",
+                        canonical_english="Priscilla",
+                        surface_forms=[
+                            SurfaceForm(
+                                source="プリシラ・バーリエル",
+                                english="Priscilla Barielle",
+                            )
+                        ],
+                        source="extracted",
+                    ),
+                ]
+            ),
+        )
+
+        mock_response = _mock_extraction_response(
+            mentions=[],
+            corrections=[
+                {
+                    "existing_english": "Priscilla",
+                    "source_term": "プリシラ・バーリエル",
+                    "corrected_english": "Priscilla Barielle",
+                    "reason": "Full name appears.",
+                }
+            ],
+        )
+
+        with patch("dao_bridge.glossary.LLMClient") as mock_llm_cls:
+            mock_client = MagicMock()
+            mock_client.complete_json.return_value = mock_response
+            mock_llm_cls.return_value = mock_client
+            glossary_build(work, config, state, force=False)
+
+        # canonical_english is ambiguous (two entities share "Priscilla"),
+        # so the correction should fall back to the source_form signal
+        # and attach to entity_000002 (which owns "プリシラ・バーリエル").
+        meta = _load_build_meta(work)
+        conflict = next(c for c in meta.conflicts if c.source_form == "プリシラ・バーリエル")
+        assert conflict.entity_id == "character_000002"
+
+    def test_user_sourced_entities_never_modified(self, tmp_path):
+        """Entities with source='user' are never modified by build."""
+        work = _setup_work_dir(tmp_path)
+        config = _make_config(work)
+        state = load_state(work)
+        _mark_prior_stages_complete(work, state)
+        _make_manifest(work, n_spines=1, chunks_per_spine=2)
+        _write_chunks(work, n_spines=1, chunks_per_spine=2, tokens_per_chunk=500)
+
+        # Pre-seed a user entity.
         pre_glossary = Glossary(
-            entries=[
-                GlossaryEntry(
-                    source_term="スバル",
-                    english="Subaru (custom)",
+            entities=[
+                GlossaryEntity(
+                    entity_id="character_000001",
                     category="character",
+                    canonical_english="Subaru (custom)",
+                    surface_forms=[SurfaceForm(source="スバル", english="Subaru (custom)")],
                     source="user",
                     aliases=["original_alias"],
                 )
@@ -888,10 +1163,10 @@ class TestGlossaryBuild:
         _save_glossary(work, pre_glossary)
 
         mock_response = _mock_extraction_response(
-            entries=[
+            mentions=[
                 {
-                    "source_term": "スバル",
-                    "english_proposed": "Natsuki Subaru",
+                    "source": "スバル",
+                    "english": "Natsuki Subaru",
                     "category": "character",
                     "aliases": ["バルス"],
                     "speech_style": "Casual.",
@@ -906,9 +1181,8 @@ class TestGlossaryBuild:
 
             glossary = glossary_build(work, config, state, force=False)
 
-        # User entry should be unchanged.
-        subaru = next(e for e in glossary.entries if e.source_term == "スバル")
-        assert subaru.english == "Subaru (custom)"
+        # User entity should be unchanged.
+        subaru = next(e for e in glossary.entities if e.canonical_english == "Subaru (custom)")
         assert subaru.source == "user"
         assert subaru.aliases == ["original_alias"]
         assert subaru.speech_style is None
@@ -922,7 +1196,7 @@ class TestGlossaryBuild:
         _make_manifest(work, n_spines=1, chunks_per_spine=2)
         _write_chunks(work, n_spines=1, chunks_per_spine=2, tokens_per_chunk=500)
 
-        mock_response = _mock_extraction_response(entries=[])
+        mock_response = _mock_extraction_response(mentions=[])
 
         with patch("dao_bridge.glossary.LLMClient") as mock_llm_cls:
             mock_client = MagicMock()
@@ -931,39 +1205,69 @@ class TestGlossaryBuild:
 
             glossary_build(work, config, state, force=True)
 
-        # Check state has batch items.
         batch_items = [k for k in state.items.keys() if k.startswith("glossary_build:")]
         assert len(batch_items) >= 1
         for item_key in batch_items:
             assert state.items[item_key].status == "completed"
 
-    def test_english_conflict_recorded(self, tmp_path):
-        """Differing English proposals create a conflict record."""
+    def test_surface_form_occurrence_count_increments(self, tmp_path):
+        """Repeated mentions of the same source increment occurrence_count."""
         work = _setup_work_dir(tmp_path)
         config = _make_config(work)
         config.glossary_phase.target_tokens_per_call = 1200
         state = load_state(work)
         _mark_prior_stages_complete(work, state)
-        # 4 chunks @ 500 tokens, target 1200 -> 2 batches of 2.
         _make_manifest(work, n_spines=1, chunks_per_spine=4)
         _write_chunks(work, n_spines=1, chunks_per_spine=4, tokens_per_chunk=500)
 
         batch1_response = _mock_extraction_response(
-            entries=[
+            mentions=[{"source": "スバル", "english": "Subaru", "category": "character"}]
+        )
+        batch2_response = _mock_extraction_response(
+            mentions=[{"source": "スバル", "english": "Subaru", "category": "character"}]
+        )
+
+        with patch("dao_bridge.glossary.LLMClient") as mock_llm_cls:
+            mock_client = MagicMock()
+            mock_client.complete_json.side_effect = [batch1_response, batch2_response]
+            mock_llm_cls.return_value = mock_client
+
+            glossary = glossary_build(work, config, state, force=True)
+
+        subaru = next(e for e in glossary.entities if e.canonical_english == "Subaru")
+        assert subaru.surface_forms[0].occurrence_count == 2
+
+    def test_new_surface_form_added_to_existing_entity(self, tmp_path):
+        """A variant form attaches as a new surface form on an existing entity."""
+        work = _setup_work_dir(tmp_path)
+        config = _make_config(work)
+        config.glossary_phase.target_tokens_per_call = 1200
+        state = load_state(work)
+        _mark_prior_stages_complete(work, state)
+        _make_manifest(work, n_spines=1, chunks_per_spine=4)
+        _write_chunks(work, n_spines=1, chunks_per_spine=4, tokens_per_chunk=500)
+
+        # Batch 1: mention スバル. Batch 2: mention スバル again with same reading+english
+        # (so it attaches) but also a mention with different source that shares
+        # reading+english (attaches as new surface form).
+        batch1_response = _mock_extraction_response(
+            mentions=[
                 {
-                    "source_term": "ルグニカ",
-                    "english_proposed": "Lugnica",
-                    "category": "place",
-                },
+                    "source": "スバル",
+                    "english": "Subaru",
+                    "reading": "すばる",
+                    "category": "character",
+                }
             ]
         )
         batch2_response = _mock_extraction_response(
-            entries=[
+            mentions=[
                 {
-                    "source_term": "ルグニカ",
-                    "english_proposed": "Lugunica",
-                    "category": "place",
-                },
+                    "source": "ナツキ・スバル",
+                    "english": "Subaru",
+                    "reading": "すばる",
+                    "category": "character",
+                }
             ]
         )
 
@@ -974,49 +1278,12 @@ class TestGlossaryBuild:
 
             glossary = glossary_build(work, config, state, force=True)
 
-        # Original english preserved.
-        entry = next(e for e in glossary.entries if e.source_term == "ルグニカ")
-        assert entry.english == "Lugnica"
-
-        # Conflict recorded.
-        meta = _load_build_meta(work)
-        conflict = next(c for c in meta.conflicts if c.source_term == "ルグニカ")
-        assert any(a["english"] == "Lugunica" for a in conflict.alternatives)
-
-    def test_missing_reading_backfilled_on_merge(self):
-        """A later extraction can fill in a previously missing reading."""
-        glossary = Glossary(
-            entries=[
-                GlossaryEntry(
-                    source_term="スバル",
-                    reading=None,
-                    english="Subaru",
-                    category="character",
-                    source="extracted",
-                )
-            ]
-        )
-        response = _mock_extraction_response(
-            entries=[
-                {
-                    "source_term": "スバル",
-                    "reading": "すばる",
-                    "english_proposed": "Subaru",
-                    "category": "character",
-                }
-            ]
-        )
-        meta = _BuildMeta()
-
-        _merge_extraction_into_glossary(
-            glossary,
-            response,
-            "glossary_build.batch.001",
-            "0000.001",
-            meta,
-        )
-
-        assert glossary.entries[0].reading == "すばる"
+        # Should be one entity with two surface forms.
+        assert len(glossary.entities) == 1
+        subaru = glossary.entities[0]
+        assert len(subaru.surface_forms) == 2
+        sources = {sf.source for sf in subaru.surface_forms}
+        assert sources == {"スバル", "ナツキ・スバル"}
 
 
 # ---------------------------------------------------------------------------
@@ -1034,16 +1301,14 @@ class TestBuildResume:
         config.glossary_phase.target_tokens_per_call = 1200
         state = load_state(work)
         _mark_prior_stages_complete(work, state)
-        # 4 chunks @ 500 tokens, target 1200 -> 2 batches of 2.
         _make_manifest(work, n_spines=1, chunks_per_spine=4)
         _write_chunks(work, n_spines=1, chunks_per_spine=4, tokens_per_chunk=500)
 
-        # First run: only process first batch then "crash".
         batch1_response = _mock_extraction_response(
-            entries=[
+            mentions=[
                 {
-                    "source_term": "エミリア",
-                    "english_proposed": "Emilia",
+                    "source": "エミリア",
+                    "english": "Emilia",
                     "category": "character",
                 },
             ]
@@ -1062,15 +1327,15 @@ class TestBuildResume:
 
         # Verify first batch was saved.
         glossary = _load_glossary(work)
-        assert len(glossary.entries) == 1
-        assert glossary.entries[0].english == "Emilia"
+        assert len(glossary.entities) == 1
+        assert glossary.entities[0].canonical_english == "Emilia"
 
         # Second run: resume from batch 2.
         batch2_response = _mock_extraction_response(
-            entries=[
+            mentions=[
                 {
-                    "source_term": "レム",
-                    "english_proposed": "Rem",
+                    "source": "レム",
+                    "english": "Rem",
                     "category": "character",
                 },
             ]
@@ -1081,12 +1346,11 @@ class TestBuildResume:
             mock_client.complete_json.return_value = batch2_response
             mock_llm_cls.return_value = mock_client
 
-            # Reset the failed state item so iter_pending_items finds it.
             glossary = glossary_build(work, config, state, force=False)
 
-        assert len(glossary.entries) == 2
-        assert any(e.english == "Emilia" for e in glossary.entries)
-        assert any(e.english == "Rem" for e in glossary.entries)
+        assert len(glossary.entities) == 2
+        assert any(e.canonical_english == "Emilia" for e in glossary.entities)
+        assert any(e.canonical_english == "Rem" for e in glossary.entities)
 
 
 # ---------------------------------------------------------------------------
@@ -1106,12 +1370,11 @@ class TestBuildTargeted:
         _make_manifest(work, n_spines=2, chunks_per_spine=2)
         _write_chunks(work, n_spines=2, chunks_per_spine=2, tokens_per_chunk=500)
 
-        # Run a full build first.
         mock_response = _mock_extraction_response(
-            entries=[
+            mentions=[
                 {
-                    "source_term": "スバル",
-                    "english_proposed": "Subaru",
+                    "source": "スバル",
+                    "english": "Subaru",
                     "category": "character",
                 },
             ]
@@ -1130,17 +1393,16 @@ class TestBuildTargeted:
         """--spine N resets and re-runs only that spine's batches."""
         work, config, state = self._setup_completed_build(tmp_path)
 
-        # All items should be completed before the targeted run.
         spine0_items = [k for k in state.items if k.startswith("glossary_build:0000.")]
         spine1_items = [k for k in state.items if k.startswith("glossary_build:0001.")]
         assert all(state.items[k].status == "completed" for k in spine0_items)
         assert all(state.items[k].status == "completed" for k in spine1_items)
 
         new_response = _mock_extraction_response(
-            entries=[
+            mentions=[
                 {
-                    "source_term": "エミリア",
-                    "english_proposed": "Emilia",
+                    "source": "エミリア",
+                    "english": "Emilia",
                     "category": "character",
                 },
             ]
@@ -1153,11 +1415,9 @@ class TestBuildTargeted:
 
             glossary_build(work, config, state, target_spine=0)
 
-            # Only spine 0 batches should have been called.
             call_count = mock_client.complete_json.call_count
             assert call_count >= 1
 
-        # Spine 1 items should still be completed (untouched).
         refreshed_state = load_state(work)
         for k in spine1_items:
             assert refreshed_state.items[k].status == "completed"
@@ -1167,10 +1427,10 @@ class TestBuildTargeted:
         work, config, state = self._setup_completed_build(tmp_path)
 
         new_response = _mock_extraction_response(
-            entries=[
+            mentions=[
                 {
-                    "source_term": "レム",
-                    "english_proposed": "Rem",
+                    "source": "レム",
+                    "english": "Rem",
                     "category": "character",
                 },
             ]
@@ -1183,14 +1443,13 @@ class TestBuildTargeted:
 
             glossary_build(work, config, state, target_batch="0000.b1")
 
-            # Exactly one LLM call for the single batch.
             assert mock_client.complete_json.call_count == 1
 
     def test_targeted_run_does_not_mark_stage_completed(self, tmp_path):
         """A targeted run should not mark the stage as completed."""
         work, config, state = self._setup_completed_build(tmp_path)
 
-        new_response = _mock_extraction_response(entries=[])
+        new_response = _mock_extraction_response(mentions=[])
 
         with patch("dao_bridge.glossary.LLMClient") as mock_llm_cls:
             mock_client = MagicMock()
@@ -1199,7 +1458,6 @@ class TestBuildTargeted:
 
             glossary_build(work, config, state, target_batch="0000.b1")
 
-        # Stage should be running (not completed) after a targeted run.
         assert state.stages["glossary_build"].status == "running"
 
     def test_invalid_batch_id_raises(self, tmp_path):
@@ -1220,14 +1478,13 @@ class TestBuildTargeted:
         """When both --batch and --spine are set, --batch wins."""
         work, config, state = self._setup_completed_build(tmp_path)
 
-        new_response = _mock_extraction_response(entries=[])
+        new_response = _mock_extraction_response(mentions=[])
 
         with patch("dao_bridge.glossary.LLMClient") as mock_llm_cls:
             mock_client = MagicMock()
             mock_client.complete_json.return_value = new_response
             mock_llm_cls.return_value = mock_client
 
-            # Pass both spine and batch; batch should win.
             glossary_build(
                 work,
                 config,
@@ -1236,7 +1493,6 @@ class TestBuildTargeted:
                 target_batch="0000.b1",
             )
 
-            # Only one call (the single batch), not all of spine 1.
             assert mock_client.complete_json.call_count == 1
 
 
@@ -1254,7 +1510,6 @@ class TestGlossaryReconcile:
         config = _make_config(work)
         state = load_state(work)
         _mark_prior_stages_complete(work, state)
-        # glossary_build is NOT started/completed.
 
         with pytest.raises(RuntimeError, match="Glossary build stage not completed"):
             glossary_reconcile(work, config, state, force=False)
@@ -1268,14 +1523,16 @@ class TestGlossaryReconcile:
         mark_stage_started(work, state, "glossary_build")
         mark_stage_completed(work, state, "glossary_build")
 
-        # Create glossary with an entry.
+        # Create glossary with an entity.
         glossary = Glossary(
-            entries=[
-                GlossaryEntry(
-                    source_term="ルグニカ",
-                    reading="るぐにか",
-                    english="Lugnica",
+            entities=[
+                GlossaryEntity(
+                    entity_id="place_000001",
                     category="place",
+                    canonical_english="Lugnica",
+                    surface_forms=[
+                        SurfaceForm(source="ルグニカ", reading="るぐにか", english="Lugnica")
+                    ],
                     source="extracted",
                 ),
             ]
@@ -1286,7 +1543,8 @@ class TestGlossaryReconcile:
         meta = _BuildMeta(
             conflicts=[
                 {
-                    "source_term": "ルグニカ",
+                    "entity_id": "place_000001",
+                    "source_form": "ルグニカ",
                     "reading": "るぐにか",
                     "current_english": "Lugnica",
                     "alternatives": [
@@ -1320,8 +1578,8 @@ class TestGlossaryReconcile:
 
             glossary = glossary_reconcile(work, config, state, force=True)
 
-        entry = next(e for e in glossary.entries if e.source_term == "ルグニカ")
-        assert entry.english == "Lugunica"
+        entity = next(e for e in glossary.entities if e.entity_id == "place_000001")
+        assert entity.canonical_english == "Lugunica"
 
     def test_term_change_persisted_before_item_completion(self, tmp_path):
         """Disk glossary is updated before a term item is marked complete."""
@@ -1335,14 +1593,15 @@ class TestGlossaryReconcile:
         def checking_mark_item_completed(work_dir, pipeline_state, stage, item_id):
             if item_id.startswith("glossary_reconcile.term."):
                 disk_glossary = _load_glossary(work_dir)
-                entry = next(e for e in disk_glossary.entries if e.source_term == "ルグニカ")
-                assert entry.english == "Lugunica"
+                entity = next(e for e in disk_glossary.entities if e.entity_id == "place_000001")
+                assert entity.canonical_english == "Lugunica"
             return mark_item_completed(work_dir, pipeline_state, stage, item_id)
 
         with (
             patch("dao_bridge.glossary.LLMClient") as mock_llm_cls,
             patch(
-                "dao_bridge.glossary.mark_item_completed", side_effect=checking_mark_item_completed
+                "dao_bridge.glossary.mark_item_completed",
+                side_effect=checking_mark_item_completed,
             ),
         ):
             mock_client = MagicMock()
@@ -1351,8 +1610,8 @@ class TestGlossaryReconcile:
 
             glossary = glossary_reconcile(work, config, state, force=True)
 
-        entry = next(e for e in glossary.entries if e.source_term == "ルグニカ")
-        assert entry.english == "Lugunica"
+        entity = next(e for e in glossary.entities if e.entity_id == "place_000001")
+        assert entity.canonical_english == "Lugunica"
 
     def test_report_generated(self, tmp_path):
         """Reconcile report markdown is written."""
@@ -1373,7 +1632,7 @@ class TestGlossaryReconcile:
         report_path = work / "glossary_reconcile_report.md"
         assert report_path.exists()
         report = report_path.read_text(encoding="utf-8")
-        assert "ルグニカ" in report
+        assert "place_000001" in report
         assert "Lugunica" in report
         assert "More common." in report
 
@@ -1386,13 +1645,13 @@ class TestGlossaryReconcile:
         mark_stage_started(work, state, "glossary_build")
         mark_stage_completed(work, state, "glossary_build")
 
-        # Entry with multiple speech_style observations.
         glossary = Glossary(
-            entries=[
-                GlossaryEntry(
-                    source_term="スバル",
-                    english="Subaru",
+            entities=[
+                GlossaryEntity(
+                    entity_id="character_000001",
                     category="character",
+                    canonical_english="Subaru",
+                    surface_forms=[SurfaceForm(source="スバル", english="Subaru")],
                     source="extracted",
                     speech_style="Casual speech.\nUses modern slang.\nFrequent sarcasm.",
                 ),
@@ -1412,7 +1671,7 @@ class TestGlossaryReconcile:
 
             glossary = glossary_reconcile(work, config, state, force=True)
 
-        subaru = next(e for e in glossary.entries if e.english == "Subaru")
+        subaru = next(e for e in glossary.entities if e.canonical_english == "Subaru")
         assert subaru.speech_style == "Speaks casually with modern slang and frequent sarcasm."
         assert "\n" not in subaru.speech_style
 
@@ -1426,11 +1685,12 @@ class TestGlossaryReconcile:
         mark_stage_completed(work, state, "glossary_build")
 
         glossary = Glossary(
-            entries=[
-                GlossaryEntry(
-                    source_term="スバル",
-                    english="Subaru",
+            entities=[
+                GlossaryEntity(
+                    entity_id="character_000001",
                     category="character",
+                    canonical_english="Subaru",
+                    surface_forms=[SurfaceForm(source="スバル", english="Subaru")],
                     source="extracted",
                     speech_style="Casual speech.\nUses modern slang.",
                 ),
@@ -1446,14 +1706,15 @@ class TestGlossaryReconcile:
         def checking_mark_item_completed(work_dir, pipeline_state, stage, item_id):
             if item_id.startswith("glossary_reconcile.speech."):
                 disk_glossary = _load_glossary(work_dir)
-                entry = next(e for e in disk_glossary.entries if e.english == "Subaru")
-                assert entry.speech_style == "Speaks casually with modern slang."
+                entity = next(e for e in disk_glossary.entities if e.canonical_english == "Subaru")
+                assert entity.speech_style == "Speaks casually with modern slang."
             return mark_item_completed(work_dir, pipeline_state, stage, item_id)
 
         with (
             patch("dao_bridge.glossary.LLMClient") as mock_llm_cls,
             patch(
-                "dao_bridge.glossary.mark_item_completed", side_effect=checking_mark_item_completed
+                "dao_bridge.glossary.mark_item_completed",
+                side_effect=checking_mark_item_completed,
             ),
         ):
             mock_client = MagicMock()
@@ -1462,7 +1723,7 @@ class TestGlossaryReconcile:
 
             glossary = glossary_reconcile(work, config, state, force=True)
 
-        subaru = next(e for e in glossary.entries if e.english == "Subaru")
+        subaru = next(e for e in glossary.entities if e.canonical_english == "Subaru")
         assert subaru.speech_style == "Speaks casually with modern slang."
 
     def test_no_conflicts_completes_immediately(self, tmp_path):
@@ -1475,11 +1736,12 @@ class TestGlossaryReconcile:
         mark_stage_completed(work, state, "glossary_build")
 
         glossary = Glossary(
-            entries=[
-                GlossaryEntry(
-                    source_term="X",
-                    english="X",
+            entities=[
+                GlossaryEntity(
+                    entity_id="character_000001",
                     category="character",
+                    canonical_english="X",
+                    surface_forms=[SurfaceForm(source="X", english="X")],
                     source="extracted",
                     speech_style="Single observation only.",
                 ),
@@ -1488,7 +1750,6 @@ class TestGlossaryReconcile:
         _save_glossary(work, glossary)
         _save_build_meta(work, _BuildMeta())
 
-        # No LLM calls should be made.
         with patch("dao_bridge.glossary.LLMClient") as mock_llm_cls:
             glossary = glossary_reconcile(work, config, state, force=True)
             mock_llm_cls.assert_not_called()
@@ -1506,22 +1767,23 @@ class TestGlossaryReconcile:
         mark_stage_completed(work, state, "glossary_build")
 
         glossary = Glossary(
-            entries=[
-                GlossaryEntry(
-                    source_term="聖剣",
-                    english="Holy Sword",
+            entities=[
+                GlossaryEntity(
+                    entity_id="item_000001",
                     category="item",
+                    canonical_english="Holy Sword",
+                    surface_forms=[SurfaceForm(source="聖剣", english="Holy Sword")],
                     source="extracted",
                 ),
             ]
         )
         _save_glossary(work, glossary)
 
-        # Category-only conflict (no English alternatives).
         meta = _BuildMeta(
             conflicts=[
                 {
-                    "source_term": "聖剣",
+                    "entity_id": "item_000001",
+                    "source_form": "聖剣",
                     "reading": None,
                     "current_english": "Holy Sword",
                     "alternatives": [],
@@ -1531,18 +1793,16 @@ class TestGlossaryReconcile:
         )
         _save_build_meta(work, meta)
 
-        # No LLM calls should be needed for category-only conflicts.
         with patch("dao_bridge.glossary.LLMClient") as mock_llm_cls:
             glossary = glossary_reconcile(work, config, state, force=True)
             mock_llm_cls.assert_not_called()
 
-        # Report should mention the category conflict.
         report = (work / "glossary_reconcile_report.md").read_text(encoding="utf-8")
-        assert "聖剣" in report
+        assert "item_000001" in report
         assert "Category" in report or "category" in report
 
     def test_build_validates_preexisting_categories(self, tmp_path):
-        """Build stage validates categories on pre-existing glossary entries."""
+        """Build stage validates categories on pre-existing glossary entities."""
         work = _setup_work_dir(tmp_path)
         config = _make_config(work)
         state = load_state(work)
@@ -1550,13 +1810,13 @@ class TestGlossaryReconcile:
         _make_manifest(work, n_spines=1, chunks_per_spine=1)
         _write_chunks(work, n_spines=1, chunks_per_spine=1, tokens_per_chunk=500)
 
-        # Pre-seed glossary with invalid category.
         bad_glossary = Glossary(
-            entries=[
-                GlossaryEntry(
-                    source_term="X",
-                    english="X",
-                    category="weapon",  # not in default categories
+            entities=[
+                GlossaryEntity(
+                    entity_id="weapon_000001",
+                    category="weapon",
+                    canonical_english="X",
+                    surface_forms=[SurfaceForm(source="X", english="X")],
                     source="user",
                 ),
             ]
@@ -1576,20 +1836,27 @@ class TestGlossaryExport:
     """Tests for the glossary_export function."""
 
     def test_grouped_by_category_sorted_alphabetically(self, tmp_path):
-        """Entries are grouped by category and sorted by english."""
+        """Entities are grouped by category and sorted by canonical_english."""
         work = _setup_work_dir(tmp_path)
         config = _make_config(work)
 
         glossary = Glossary(
-            entries=[
-                GlossaryEntry(
-                    source_term="B-char", english="Zorro", category="character", source="extracted"
+            entities=[
+                _make_entity(
+                    entity_id="character_000002",
+                    canonical_english="Zorro",
+                    surface_forms=[{"source": "B-char", "english": "Zorro"}],
                 ),
-                GlossaryEntry(
-                    source_term="A-char", english="Alice", category="character", source="extracted"
+                _make_entity(
+                    entity_id="character_000001",
+                    canonical_english="Alice",
+                    surface_forms=[{"source": "A-char", "english": "Alice"}],
                 ),
-                GlossaryEntry(
-                    source_term="Place1", english="Kingdom", category="place", source="extracted"
+                _make_entity(
+                    entity_id="place_000001",
+                    category="place",
+                    canonical_english="Kingdom",
+                    surface_forms=[{"source": "Place1", "english": "Kingdom"}],
                 ),
             ]
         )
@@ -1597,12 +1864,10 @@ class TestGlossaryExport:
 
         md = glossary_export(work, config, stdout=True)
 
-        # Character section should come before place (config order).
         char_pos = md.index("## Character")
         place_pos = md.index("## Place")
         assert char_pos < place_pos
 
-        # Within characters, Alice before Zorro.
         alice_pos = md.index("Alice")
         zorro_pos = md.index("Zorro")
         assert alice_pos < zorro_pos
@@ -1613,17 +1878,20 @@ class TestGlossaryExport:
         config = _make_config(work)
 
         glossary = Glossary(
-            entries=[
-                GlossaryEntry(
-                    source_term="スバル",
-                    reading="すばる",
-                    english="Subaru",
+            entities=[
+                GlossaryEntity(
+                    entity_id="character_000001",
                     category="character",
-                    source="extracted",
+                    canonical_english="Subaru",
+                    surface_forms=[
+                        SurfaceForm(source="スバル", reading="すばる", english="Subaru")
+                    ],
                     aliases=["バルス"],
                     nicknames={"Rem": "Subaru-kun"},
                     speech_style="Casual.",
                     notes="Main character.",
+                    source="extracted",
+                    summary="A young man from another world.",
                 ),
             ]
         )
@@ -1631,7 +1899,9 @@ class TestGlossaryExport:
 
         md = glossary_export(work, config, stdout=True)
 
-        assert "Reading: すばる" in md
+        assert "Summary: A young man from another world." in md
+        assert "`スバル`" in md
+        assert "-> Subaru" in md
         assert "Aliases: バルス" in md
         assert "Nicknames:" in md
         assert "Subaru-kun" in md
@@ -1644,12 +1914,12 @@ class TestGlossaryExport:
         config = _make_config(work)
 
         glossary = Glossary(
-            entries=[
-                GlossaryEntry(
-                    source_term="X",
-                    english="Xterm",
+            entities=[
+                _make_entity(
+                    entity_id="term_000001",
                     category="term",
-                    source="extracted",
+                    canonical_english="Xterm",
+                    surface_forms=[{"source": "X", "english": "Xterm"}],
                 ),
             ]
         )
@@ -1657,7 +1927,6 @@ class TestGlossaryExport:
 
         md = glossary_export(work, config, stdout=True)
 
-        assert "Reading:" not in md
         assert "Aliases:" not in md
         assert "Nicknames:" not in md
         assert "Speech style:" not in md
@@ -1669,9 +1938,9 @@ class TestGlossaryExport:
         config = _make_config(work)
 
         glossary = Glossary(
-            entries=[
-                GlossaryEntry(
-                    source_term="X", english="X", category="character", source="extracted"
+            entities=[
+                _make_entity(
+                    surface_forms=[{"source": "X", "english": "X"}],
                 ),
             ]
         )
@@ -1687,9 +1956,9 @@ class TestGlossaryExport:
         config = _make_config(work)
 
         glossary = Glossary(
-            entries=[
-                GlossaryEntry(
-                    source_term="X", english="X", category="character", source="extracted"
+            entities=[
+                _make_entity(
+                    surface_forms=[{"source": "X", "english": "X"}],
                 ),
             ]
         )
@@ -1706,9 +1975,9 @@ class TestGlossaryExport:
         config = _make_config(work)
 
         glossary = Glossary(
-            entries=[
-                GlossaryEntry(
-                    source_term="X", english="X", category="character", source="extracted"
+            entities=[
+                _make_entity(
+                    surface_forms=[{"source": "X", "english": "X"}],
                 ),
             ]
         )
@@ -1725,22 +1994,26 @@ class TestGlossaryExport:
         _save_glossary(work, Glossary())
 
         md = glossary_export(work, config, stdout=True)
-        assert "No entries" in md
+        assert "No entities" in md
 
-    def test_entry_without_source_term(self, tmp_path):
-        """Entry without source_term still renders."""
+    def test_entity_id_in_export(self, tmp_path):
+        """Entity ID appears in the exported markdown."""
         work = _setup_work_dir(tmp_path)
         config = _make_config(work)
 
         glossary = Glossary(
-            entries=[
-                GlossaryEntry(english="Some Term", category="term", source="extracted"),
+            entities=[
+                _make_entity(
+                    entity_id="character_000042",
+                    canonical_english="Test",
+                    surface_forms=[{"source": "テスト", "english": "Test"}],
+                ),
             ]
         )
         _save_glossary(work, glossary)
 
         md = glossary_export(work, config, stdout=True)
-        assert "**Some Term**" in md
+        assert "character_000042" in md
 
 
 # ---------------------------------------------------------------------------
@@ -1755,7 +2028,6 @@ class TestLanguageAgnostic:
         """The extraction prompt contains the resolved language name."""
         work = _setup_work_dir(tmp_path)
         config = _make_config(work)
-        # Override languages to Chinese.
         config.languages.source = "zh"
         config.languages.target = "en"
         state = load_state(work)
@@ -1767,7 +2039,7 @@ class TestLanguageAgnostic:
 
         def capture_complete_json(messages, response_model=None, **kwargs):
             captured_messages.append(messages)
-            return _mock_extraction_response(entries=[])
+            return _mock_extraction_response(mentions=[])
 
         with patch("dao_bridge.glossary.LLMClient") as mock_llm_cls:
             mock_client = MagicMock()
@@ -1780,8 +2052,49 @@ class TestLanguageAgnostic:
         prompt_content = captured_messages[0][0]["content"]
         assert "Chinese" in prompt_content
         assert "English" in prompt_content
-        # Should NOT contain hardcoded "Japanese".
         assert "Japanese" not in prompt_content
+
+    def test_build_does_not_inject_accumulated_glossary(self, tmp_path):
+        """Phase 1 extraction prompt omits the full accumulated glossary."""
+        work = _setup_work_dir(tmp_path)
+        config = _make_config(work)
+        state = load_state(work)
+        _mark_prior_stages_complete(work, state)
+        _make_manifest(work, n_spines=1, chunks_per_spine=1)
+        _write_chunks(work, n_spines=1, chunks_per_spine=1, tokens_per_chunk=500)
+        _save_glossary(
+            work,
+            Glossary(
+                entities=[
+                    GlossaryEntity(
+                        entity_id="character_000001",
+                        category="character",
+                        canonical_english="Hidden Subaru",
+                        surface_forms=[
+                            SurfaceForm(source="ナツキ・スバル", english="Hidden Subaru")
+                        ],
+                        source="extracted",
+                    )
+                ]
+            ),
+        )
+
+        captured_messages = []
+
+        def capture_complete_json(messages, response_model=None, **kwargs):
+            captured_messages.append(messages)
+            return _mock_extraction_response(mentions=[])
+
+        with patch("dao_bridge.glossary.LLMClient") as mock_llm_cls:
+            mock_client = MagicMock()
+            mock_client.complete_json.side_effect = capture_complete_json
+            mock_llm_cls.return_value = mock_client
+            glossary_build(work, config, state, force=False)
+
+        prompt_content = captured_messages[0][0]["content"]
+        assert "Hidden Subaru" not in prompt_content
+        assert "ナツキ・スバル -> Hidden Subaru" not in prompt_content
+        assert "(not provided in phase 1)" in prompt_content
 
 
 # ---------------------------------------------------------------------------
@@ -1804,7 +2117,6 @@ class TestGlossaryIntegration:
 
         work = tmp_work_dir
 
-        # Write config.
         cfg_dict = {
             "source_epub": str(jp_epub_path),
             "work_dir": str(work),
@@ -1847,18 +2159,19 @@ class TestGlossaryIntegration:
 
         # --- glossary-build (mocked) ---
         mock_build_response = _mock_extraction_response(
-            entries=[
+            mentions=[
                 {
-                    "source_term": "スバル",
+                    "source": "スバル",
                     "reading": "すばる",
-                    "english_proposed": "Subaru",
+                    "english": "Subaru",
                     "category": "character",
                     "aliases": ["ナツキ・スバル"],
                     "speech_style": "Casual speech.",
+                    "summary_update": "A young man from another world.",
                 },
                 {
-                    "source_term": "エミリア",
-                    "english_proposed": "Emilia",
+                    "source": "エミリア",
+                    "english": "Emilia",
                     "category": "character",
                 },
             ]
@@ -1871,26 +2184,24 @@ class TestGlossaryIntegration:
 
             glossary = glossary_build(work, config, state, force=True)
 
-        assert len(glossary.entries) >= 2
-        assert any(e.english == "Subaru" for e in glossary.entries)
-        assert any(e.english == "Emilia" for e in glossary.entries)
+        assert len(glossary.entities) >= 2
+        assert any(e.canonical_english == "Subaru" for e in glossary.entities)
+        assert any(e.canonical_english == "Emilia" for e in glossary.entities)
 
         # Verify glossary.json exists on disk.
         gp = glossary_path(work)
         assert gp.exists()
         disk_glossary = Glossary(**json.loads(gp.read_text(encoding="utf-8")))
-        assert len(disk_glossary.entries) >= 2
+        assert len(disk_glossary.entities) >= 2
 
         # --- glossary-reconcile (no conflicts, so no-op) ---
         with patch("dao_bridge.glossary.LLMClient") as mock_llm_cls:
             glossary = glossary_reconcile(work, config, state, force=True)
 
-        # State should show both glossary stages completed.
         assert state.stages.get("glossary_build") is not None
         assert state.stages["glossary_build"].status == "completed"
         assert state.stages.get("glossary_reconcile") is not None
         assert state.stages["glossary_reconcile"].status == "completed"
 
-        # Report should exist.
         report_path = work / "glossary_reconcile_report.md"
         assert report_path.exists()

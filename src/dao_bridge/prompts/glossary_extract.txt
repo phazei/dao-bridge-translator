@@ -1,15 +1,17 @@
-You are extracting a glossary of proper nouns and notable terms from a novel written in {source_language} for translation into {target_language}.
+You are extracting notable terms and proper nouns from a novel written in {source_language} for translation into {target_language}.
 
-Extract all proper nouns and notable terms from the text below. For each entry provide:
+For each notable mention you find, provide:
 
-- source_term: the term as written in {source_language}
+- source: the exact term as written in the {source_language} text
 - reading: pronunciation if discernible from furigana markup (text in {{base|reading}} format). Null if none.
-- english_proposed: your proposed {target_language} translation or transliteration
+- english: your proposed {target_language} rendering for THIS specific surface form
 - category: one of the categories listed below
+- summary_update: one concise sentence about what this entity appears to be in this passage. Null if obvious.
+- context_hint: optional low-confidence hint about entity identity (e.g. "appears to be the same person as アベル"). Null if no cross-reference is apparent.
+- notes: brief usage notes. Null if obvious.
 - aliases: alternate forms, abbreviations, or partial names for the same entity
 - nicknames: for characters, a mapping of {{speaker_name: nickname_used_by_that_speaker}}
-- speech_style: for characters only, a single plain-text sentence describing how they speak (e.g. register, verbal tics, dialect, self-reference, etc.). Must be a string, not an object. Null for non-characters.
-- notes: brief context (role, significance). Null if obvious.
+- speech_style: for characters only, a single plain-text sentence describing how they speak (e.g. register, verbal tics, dialect, self-reference). Must be a string, not an object. Null for non-characters.
 
 Categories:
 {categories}
@@ -17,14 +19,22 @@ Categories:
 Category descriptions:
 {category_hints}
 
-If you notice that a previously extracted term should be corrected (e.g. a full name appears where only a partial name was known, or a more accurate translation becomes apparent), add it to the "corrections" array instead of duplicating the entry.
+DO NOT extract:
+- Standalone pronouns (オレ, 俺, 私, 貴様, お前, あたし, ワタクシ) unless used as a unique title or name
+- Generic honorific suffixes (さん, 様, ちゃん, 君) by themselves
+- Common nouns or descriptions unless used as a stable named identifier in the text
+- Speech tics or verbal habits as standalone glossary terms (these belong in speech_style on the character)
+- Generic titles alone (皇帝, 王, 兵士, 勇者) unless the text uses them as a unique persistent identifier for a specific character
+- First-person/second-person pronoun usage patterns (these are speech_style observations, not glossary terms)
 
-=== EXISTING GLOSSARY (accumulated from prior sections) ===
+If you notice that a previously extracted term should be corrected (e.g. a full name appears where only a partial name was known, or a more accurate translation becomes apparent), add it to the "corrections" array.
+
+=== CONTEXT (advisory, may be empty) ===
 {existing_glossary}
 
 === TEXT TO ANALYZE ===
 {chunk_batch}
 
 Return JSON with exactly two arrays:
-- "entries": new or updated glossary entries found in this text
+- "mentions": notable terms found in this text, each with the fields described above
 - "corrections": corrections to previously extracted terms, each with "existing_english", "source_term", "corrected_english", and "reason"

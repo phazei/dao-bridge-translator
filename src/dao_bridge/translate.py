@@ -37,7 +37,7 @@ from dao_bridge.llm_client import LLMClient, LLMStructuredOutputError
 from dao_bridge.schemas import (
     Chunk,
     Glossary,
-    GlossaryEntry,
+    GlossaryEntity,
     Manifest,
     ManifestItem,
     TranslatedChunk,
@@ -160,8 +160,34 @@ def _strip_analysis(text: str) -> str:
 # ---------------------------------------------------------------------------
 
 
+def find_relevant_entities(chunk_text: str, glossary: Glossary) -> list[GlossaryEntity]:
+    """Return entities that have at least one surface form present in *chunk_text*.
+
+    Each entity appears at most once, even if multiple surface forms match.
+
+    Parameters
+    ----------
+    chunk_text:
+        Source text of the current chunk.
+    glossary:
+        The per-book glossary.
+
+    Returns
+    -------
+    list[GlossaryEntity]
+        Entities with at least one matching surface form.
+    """
+    relevant: list[GlossaryEntity] = []
+    for entity in glossary.entities:
+        for sf in entity.surface_forms:
+            if sf.source and sf.source in chunk_text:
+                relevant.append(entity)
+                break  # One match is enough; don't duplicate
+    return relevant
+
+
 def render_glossary(glossary: Glossary, chunk_text: str, mode: str) -> str:
-    """Render glossary entries for prompt injection.
+    """Render glossary entities for prompt injection.
 
     Parameters
     ----------
@@ -170,8 +196,8 @@ def render_glossary(glossary: Glossary, chunk_text: str, mode: str) -> str:
     chunk_text:
         Source text of the current chunk (used for "relevant" filtering).
     mode:
-        ``"relevant"`` — include only entries whose ``source_term`` appears
-        in *chunk_text*.  ``"all"`` — include every entry.
+        ``"relevant"`` — include only entities with a surface form that
+        appears in *chunk_text*.  ``"all"`` — include every entity.
 
     Returns
     -------
@@ -179,42 +205,45 @@ def render_glossary(glossary: Glossary, chunk_text: str, mode: str) -> str:
         Formatted glossary block ready for insertion into a system prompt.
     """
     if mode == "relevant":
-        entries = [e for e in glossary.entries if e.source_term and e.source_term in chunk_text]
+        entities = find_relevant_entities(chunk_text, glossary)
     else:
-        entries = list(glossary.entries)
+        entities = list(glossary.entities)
 
-    if not entries:
+    if not entities:
         return ""
 
     # Group by category.
-    groups: dict[str, list[GlossaryEntry]] = {}
-    for entry in entries:
-        cat = entry.category.capitalize()
-        groups.setdefault(cat, []).append(entry)
+    groups: dict[str, list[GlossaryEntity]] = {}
+    for entity in entities:
+        cat = entity.category.capitalize()
+        groups.setdefault(cat, []).append(entity)
 
     lines = ["\nGLOSSARY (terms in this section)"]
 
-    for category, group_entries in groups.items():
+    for category, group_entities in groups.items():
         lines.append("")
         lines.append(f"{category}:")
-        for e in group_entries:
-            # Main line: source_term [english] — notes
-            parts = []
-            if e.source_term:
-                parts.append(e.source_term)
-            parts_str = parts[0] if parts else ""
-            line = f"- {parts_str} [{e.english}]"
-            if e.notes:
-                line += f" — {e.notes}"
-            lines.append(line)
+        for entity in group_entities:
+            # Header: canonical English name.
+            header = f"- [{entity.canonical_english}]"
+            if entity.summary:
+                header += f" — {entity.summary}"
+            elif entity.notes:
+                header += f" — {entity.notes}"
+            lines.append(header)
+
+            # Surface forms with per-form English renderings.
+            for sf in entity.surface_forms:
+                lines.append(f"  {sf.source} -> {sf.english}")
 
             # Character-specific fields.
             if category.lower() == "character":
-                if e.speech_style:
-                    lines.append(f"  Speech: {e.speech_style}")
-                if e.nicknames:
+                if entity.speech_style:
+                    lines.append(f"  Speech: {entity.speech_style}")
+                if entity.nicknames:
                     nick_parts = [
-                        f'{speaker} calls them "{nick}"' for speaker, nick in e.nicknames.items()
+                        f'{speaker} calls them "{nick}"'
+                        for speaker, nick in entity.nicknames.items()
                     ]
                     lines.append(f"  Nicknames: {'; '.join(nick_parts)}.")
 

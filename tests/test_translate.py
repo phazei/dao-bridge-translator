@@ -19,9 +19,10 @@ from dao_bridge.llm_client import CompletionResult, LLMStructuredOutputError
 from dao_bridge.schemas import (
     Chunk,
     Glossary,
-    GlossaryEntry,
+    GlossaryEntity,
     Manifest,
     ManifestItem,
+    SurfaceForm,
     TranslatedChunk,
 )
 from dao_bridge.state import (
@@ -92,26 +93,28 @@ def _make_chunk(
     )
 
 
-def _make_glossary(entries: list[GlossaryEntry] | None = None) -> Glossary:
-    if entries is None:
-        entries = [
-            GlossaryEntry(
-                source_term="ナツキ・スバル",
-                english="Natsuki Subaru",
+def _make_glossary(entities: list[GlossaryEntity] | None = None) -> Glossary:
+    if entities is None:
+        entities = [
+            GlossaryEntity(
+                entity_id="character_000001",
                 category="character",
+                canonical_english="Natsuki Subaru",
+                surface_forms=[SurfaceForm(source="ナツキ・スバル", english="Natsuki Subaru")],
                 speech_style="Speaks casually, modern slang.",
                 nicknames={"Ram": "Barusu"},
                 source="extracted",
             ),
-            GlossaryEntry(
-                source_term="グァラル",
-                english="Guaral",
+            GlossaryEntity(
+                entity_id="place_000001",
                 category="place",
+                canonical_english="Guaral",
+                surface_forms=[SurfaceForm(source="グァラル", english="Guaral")],
                 notes="fortress city in Vollachia",
                 source="extracted",
             ),
         ]
-    return Glossary(entries=entries)
+    return Glossary(entities=entities)
 
 
 def _make_translated_chunk(
@@ -343,17 +346,18 @@ class TestRenderGlossary:
         assert "Character:" in result
         assert "Place:" in result
 
-    def test_entry_without_source_term_excluded_from_relevant(self):
-        """Entries with source_term=None are excluded in relevant mode."""
-        entries = [
-            GlossaryEntry(
-                source_term=None,
-                english="Test Term",
+    def test_entity_without_surface_forms_excluded_from_relevant(self):
+        """Entities with no surface forms are excluded in relevant mode."""
+        entities = [
+            GlossaryEntity(
+                entity_id="term_000001",
                 category="term",
+                canonical_english="Test Term",
+                surface_forms=[],
                 source="seed",
             ),
         ]
-        glossary = _make_glossary(entries)
+        glossary = _make_glossary(entities)
         result = render_glossary(glossary, "anything", "relevant")
 
         assert result == ""

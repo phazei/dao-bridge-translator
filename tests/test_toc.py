@@ -12,8 +12,9 @@ from lxml import etree
 
 from dao_bridge.schemas import (
     Glossary,
-    GlossaryEntry,
+    GlossaryEntity,
     Manifest,
+    SurfaceForm,
     TocTranslationResponse,
 )
 from dao_bridge.toc import (
@@ -266,10 +267,14 @@ def _make_config(**overrides):
     return AppConfig(**defaults)
 
 
-def _make_glossary(entries=None):
-    """Build a minimal Glossary."""
+def _make_glossary(entries=None, entities=None):
+    """Build a minimal Glossary.
+
+    Accepts *entities* (list of GlossaryEntity) directly, or *entries*
+    for backward-compat test helpers that build entity dicts.
+    """
     return Glossary(
-        entries=entries or [],
+        entities=entities or entries or [],
         created_at="2025-01-01T00:00:00Z",
         updated_at="2025-01-01T00:00:00Z",
     )
@@ -452,11 +457,12 @@ class TestTranslateTitles:
         mock_client.complete_json.return_value = TocTranslationResponse(titles=["Chapter 1"])
         config = _make_config()
         glossary = _make_glossary(
-            entries=[
-                GlossaryEntry(
-                    source_term="スバル",
-                    english="Subaru",
+            entities=[
+                GlossaryEntity(
+                    entity_id="character_000001",
                     category="character",
+                    canonical_english="Subaru",
+                    surface_forms=[SurfaceForm(source="スバル", english="Subaru")],
                     source="extracted",
                 ),
             ]
@@ -805,15 +811,27 @@ class TestUpdateOpfMetadata:
 class TestRenderGlossaryForToc:
     def test_characters_and_places_included(self):
         glossary = _make_glossary(
-            entries=[
-                GlossaryEntry(
-                    source_term="スバル", english="Subaru", category="character", source="extracted"
+            entities=[
+                GlossaryEntity(
+                    entity_id="character_000001",
+                    category="character",
+                    canonical_english="Subaru",
+                    surface_forms=[SurfaceForm(source="スバル", english="Subaru")],
+                    source="extracted",
                 ),
-                GlossaryEntry(
-                    source_term="ルグニカ", english="Lugunica", category="place", source="extracted"
+                GlossaryEntity(
+                    entity_id="place_000001",
+                    category="place",
+                    canonical_english="Lugunica",
+                    surface_forms=[SurfaceForm(source="ルグニカ", english="Lugunica")],
+                    source="extracted",
                 ),
-                GlossaryEntry(
-                    source_term="マナ", english="mana", category="concept", source="extracted"
+                GlossaryEntity(
+                    entity_id="concept_000001",
+                    category="concept",
+                    canonical_english="mana",
+                    surface_forms=[SurfaceForm(source="マナ", english="mana")],
+                    source="extracted",
                 ),
             ]
         )
@@ -832,14 +850,22 @@ class TestRenderGlossaryForToc:
         assert "no glossary" in result.lower()
 
     def test_no_categories_includes_all(self):
-        """When categories is None or empty, all entries are included."""
+        """When categories is None or empty, all entities are included."""
         glossary = _make_glossary(
-            entries=[
-                GlossaryEntry(
-                    source_term="スバル", english="Subaru", category="character", source="extracted"
+            entities=[
+                GlossaryEntity(
+                    entity_id="character_000001",
+                    category="character",
+                    canonical_english="Subaru",
+                    surface_forms=[SurfaceForm(source="スバル", english="Subaru")],
+                    source="extracted",
                 ),
-                GlossaryEntry(
-                    source_term="マナ", english="mana", category="concept", source="extracted"
+                GlossaryEntity(
+                    entity_id="concept_000001",
+                    category="concept",
+                    canonical_english="mana",
+                    surface_forms=[SurfaceForm(source="マナ", english="mana")],
+                    source="extracted",
                 ),
             ]
         )
@@ -854,12 +880,20 @@ class TestRenderGlossaryForToc:
     def test_custom_categories(self):
         """Custom categories list controls which entries appear."""
         glossary = _make_glossary(
-            entries=[
-                GlossaryEntry(
-                    source_term="スバル", english="Subaru", category="character", source="extracted"
+            entities=[
+                GlossaryEntity(
+                    entity_id="character_000001",
+                    category="character",
+                    canonical_english="Subaru",
+                    surface_forms=[SurfaceForm(source="スバル", english="Subaru")],
+                    source="extracted",
                 ),
-                GlossaryEntry(
-                    source_term="マナ", english="mana", category="concept", source="extracted"
+                GlossaryEntity(
+                    entity_id="concept_000001",
+                    category="concept",
+                    canonical_english="mana",
+                    surface_forms=[SurfaceForm(source="マナ", english="mana")],
+                    source="extracted",
                 ),
             ]
         )

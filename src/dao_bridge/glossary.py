@@ -1,16 +1,19 @@
-"""Glossary extraction, reconciliation, and export.
+"""Glossary extraction, reconciliation, and export (entity-centric v2).
 
-Three-stage glossary pipeline:
+Four-stage glossary pipeline:
 
-1. **Build** — extracts proper nouns and character information from chunked
-   source text via batched LLM calls.  Accumulates a per-book glossary,
-   saving after each batch for resumability.
-2. **Reconcile** — resolves within-book conflicts (differing English
-   proposals, corrections from the LLM, category mismatches) and
-   consolidates multiple speech-style observations per character.
-3. **Export** — renders the glossary as human-readable markdown for review.
+1. **Build** — extracts mentions (proper nouns, characters, places, etc.)
+   from chunked source text via batched LLM calls.  Links each mention to
+   an existing entity or creates a new one.  Accumulates a per-book
+   glossary, saving after each batch for resumability.
+2. **Cluster** *(PR 2)* — finds duplicate entities that build-time linking
+   missed and merges them with LLM confirmation.
+3. **Reconcile** — resolves within-book conflicts (differing English
+   proposals, corrections, category mismatches) and consolidates multiple
+   speech-style observations per character entity.
+4. **Export** — renders the glossary as human-readable markdown for review.
 
-The ``source`` field on each :class:`~dao_bridge.schemas.GlossaryEntry`
+The ``source`` field on each :class:`~dao_bridge.schemas.GlossaryEntity`
 distinguishes provenance:
 
 - ``"extracted"`` — found by the LLM during build.
@@ -36,12 +39,15 @@ from dao_bridge.config import AppConfig, resolve_language_name
 from dao_bridge.llm_client import LLMClient, LLMStructuredOutputError
 from dao_bridge.schemas import (
     Chunk,
+    ExtractedMention,
     Glossary,
-    GlossaryEntry,
+    GlossaryEntity,
     GlossaryExtractionResponse,
     GlossaryReconcileResponse,
     GlossarySpeechMergeResponse,
+    SurfaceForm,
 )
+from dao_bridge.similarity import string_similarity
 from dao_bridge.state import (
     PipelineState,
     is_stage_completed,
@@ -76,6 +82,17 @@ _BUILD_META_FILENAME = "_glossary_build_meta.json"
 # the reconcile stage consolidates them.
 _SPEECH_STYLE_DELIMITER = "\n"
 
+# Maximum character length for entity summaries before truncation.
+_MAX_SUMMARY_LENGTH = 500
+
+# Auto-attach threshold for Jaro-Winkler string similarity.
+_SIMILARITY_AUTO_ATTACH = 0.95
+
+# PR 1 intentionally does not inject the accumulated glossary into
+# extraction prompts; build-time linking and later clustering handle
+# deduplication instead.
+_EXTRACTION_GLOSSARY_PLACEHOLDER = "(not provided in phase 1)"
+
 # ---------------------------------------------------------------------------
 # Build metadata sidecar (internal, not part of the public glossary format)
 # ---------------------------------------------------------------------------
@@ -84,7 +101,8 @@ _SPEECH_STYLE_DELIMITER = "\n"
 class _ConflictRecord(BaseModel):
     """A single term conflict detected during the build stage."""
 
-    source_term: str
+    entity_id: str
+    source_form: str
     reading: str | None = None
     current_english: str
     alternatives: list[dict] = Field(default_factory=list)
@@ -130,24 +148,24 @@ def _load_prompt_template(name: str) -> str:
 
 
 def validate_glossary_categories(glossary: Glossary, categories: list[str]) -> None:
-    """Validate that every entry's category is in the allowed list.
+    """Validate that every entity's category is in the allowed list.
 
     Raises
     ------
     ValueError
-        With a clear message listing each invalid category and the entries
+        With a clear message listing each invalid category and the entities
         that use it.
     """
     valid = set(categories)
     invalid: dict[str, list[str]] = defaultdict(list)
-    for entry in glossary.entries:
-        if entry.category not in valid:
-            label = entry.english or entry.source_term or "(unknown)"
-            invalid[entry.category].append(label)
+    for entity in glossary.entities:
+        if entity.category not in valid:
+            label = entity.canonical_english or entity.entity_id
+            invalid[entity.category].append(label)
     if invalid:
         lines = []
-        for cat, entries in sorted(invalid.items()):
-            lines.append(f"  '{cat}': used by {', '.join(entries)}")
+        for cat, entities in sorted(invalid.items()):
+            lines.append(f"  '{cat}': used by {', '.join(entities)}")
         raise ValueError(
             f"Invalid glossary categories found (allowed: {', '.join(categories)}):\n"
             + "\n".join(lines)
@@ -370,69 +388,355 @@ def _pack_spine_batches(
 
 
 # ---------------------------------------------------------------------------
-# Glossary rendering (for prompt injection)
+# Entity ID generation
+# ---------------------------------------------------------------------------
+
+
+def next_entity_id(category: str, glossary: Glossary) -> str:
+    """Generate the next sequential entity ID for *category*.
+
+    Format: ``"{category}_{NNNNNN}"`` where ``NNNNNN`` is zero-padded to 6
+    digits.  Scans existing entities to find the highest existing number
+    for the given category prefix.
+
+    Parameters
+    ----------
+    category:
+        Entity category, e.g. ``"character"``.
+    glossary:
+        Current glossary (used to find highest existing ID).
+
+    Returns
+    -------
+    str
+        New entity ID, e.g. ``"character_000001"``.
+    """
+    prefix = f"{category}_"
+    max_num = 0
+    for entity in glossary.entities:
+        if entity.entity_id.startswith(prefix):
+            try:
+                num = int(entity.entity_id[len(prefix) :])
+                if num > max_num:
+                    max_num = num
+            except ValueError:
+                continue
+    return f"{prefix}{max_num + 1:06d}"
+
+
+# ---------------------------------------------------------------------------
+# Build-time entity linking
+# ---------------------------------------------------------------------------
+
+
+def find_entity_for_mention(
+    glossary: Glossary,
+    mention: ExtractedMention,
+) -> GlossaryEntity | None:
+    """Find an existing entity that a mention should attach to.
+
+    Implements the candidate retrieval order from the spec:
+
+    1. Exact surface-form source match (highest confidence)
+    2. Same non-null reading AND same proposed English
+    3. Jaro-Winkler >= 0.95 on source AND same category
+
+    Returns ``None`` if no safe match is found — the caller should
+    create a new entity.
+
+    Parameters
+    ----------
+    glossary:
+        Current glossary.
+    mention:
+        The extracted mention to link.
+
+    Returns
+    -------
+    GlossaryEntity | None
+        The matched entity, or ``None`` if no safe match.
+    """
+    # 1. Exact surface-form source match.
+    for entity in glossary.entities:
+        for sf in entity.surface_forms:
+            if sf.source == mention.source:
+                return entity
+
+    # 2. Same non-null reading AND same proposed English.
+    if mention.reading:
+        for entity in glossary.entities:
+            for sf in entity.surface_forms:
+                if sf.reading and sf.reading == mention.reading and sf.english == mention.english:
+                    return entity
+
+    # 3. High Jaro-Winkler on source + same category — but only if
+    #    the match is unambiguous (exactly one candidate).
+    candidates: list[GlossaryEntity] = []
+    for entity in glossary.entities:
+        if entity.category != mention.category:
+            continue
+        for sf in entity.surface_forms:
+            if string_similarity(sf.source, mention.source) >= _SIMILARITY_AUTO_ATTACH:
+                candidates.append(entity)
+                break  # One matching form per entity is enough
+
+    if len(candidates) == 1:
+        return candidates[0]
+
+    # 0 candidates: no match.  2+ candidates: ambiguous — create a new
+    # entity and let clustering resolve it later.
+    return None
+
+
+def _find_entity_by_id(glossary: Glossary, entity_id: str) -> GlossaryEntity | None:
+    """Find an entity by its entity_id."""
+    for entity in glossary.entities:
+        if entity.entity_id == entity_id:
+            return entity
+    return None
+
+
+def _find_entity_by_canonical_english(
+    glossary: Glossary, canonical_english: str
+) -> GlossaryEntity | None:
+    """Find an entity by canonical English name (case-sensitive)."""
+    for entity in glossary.entities:
+        if entity.canonical_english == canonical_english:
+            return entity
+    return None
+
+
+def _find_entity_for_correction(
+    glossary: Glossary,
+    existing_english: str,
+    source_form: str,
+) -> GlossaryEntity | None:
+    """Find the most likely correction target entity.
+
+    Prefer canonical-English matches for the common case, but fall back
+    to matching the correction's source form against surface forms so we
+    do not depend on canonical English being unique or unchanged.
+
+    Both signals require a *unique* match — if multiple entities share
+    the same canonical English or the same surface form source, the
+    signal is ambiguous and we skip it rather than picking the first.
+    """
+    english_matches = [
+        entity for entity in glossary.entities if entity.canonical_english == existing_english
+    ]
+    if len(english_matches) == 1:
+        return english_matches[0]
+
+    source_matches: list[GlossaryEntity] = []
+    for entity in glossary.entities:
+        for sf in entity.surface_forms:
+            if sf.source == source_form:
+                source_matches.append(entity)
+                break
+
+    if len(source_matches) == 1:
+        return source_matches[0]
+
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Surface form and entity merge helpers
+# ---------------------------------------------------------------------------
+
+
+def add_or_update_surface_form(
+    entity: GlossaryEntity,
+    mention: ExtractedMention,
+    chunk_id: str,
+) -> None:
+    """Add a new surface form or update an existing one on *entity*.
+
+    If a surface form with the same ``source`` already exists, increments
+    its ``occurrence_count`` and appends any new context hint.  Otherwise,
+    creates a new :class:`SurfaceForm`.
+
+    Parameters
+    ----------
+    entity:
+        The entity to update.
+    mention:
+        The extracted mention providing the surface form data.
+    chunk_id:
+        ID of the chunk where the mention was found.
+    """
+    for sf in entity.surface_forms:
+        if sf.source == mention.source:
+            sf.occurrence_count += 1
+            # Backfill reading.
+            if not sf.reading and mention.reading:
+                sf.reading = mention.reading
+            # Append context hint if new.
+            if mention.context_hint and mention.context_hint not in sf.context_hints:
+                sf.context_hints.append(mention.context_hint)
+            # Merge notes.
+            if mention.notes and mention.notes != sf.notes:
+                if sf.notes:
+                    if mention.notes not in sf.notes:
+                        sf.notes = sf.notes + " " + mention.notes
+                else:
+                    sf.notes = mention.notes
+            return
+
+    # New surface form.
+    entity.surface_forms.append(
+        SurfaceForm(
+            source=mention.source,
+            reading=mention.reading,
+            english=mention.english,
+            context_hints=[mention.context_hint] if mention.context_hint else [],
+            notes=mention.notes,
+            first_seen_chunk=chunk_id,
+            occurrence_count=1,
+        )
+    )
+
+
+def merge_entity_summary(
+    entity: GlossaryEntity,
+    summary_update: str | None,
+    chunk_id: str,
+) -> None:
+    """Merge a summary observation into an entity.
+
+    Simple concatenation with deduplication and max-length truncation.
+
+    Parameters
+    ----------
+    entity:
+        The entity to update.
+    summary_update:
+        New summary observation, or ``None``.
+    chunk_id:
+        ID of the chunk providing the observation.
+    """
+    if not summary_update:
+        return
+    entity.latest_evidence_chunk = chunk_id
+    if not entity.summary:
+        entity.summary = summary_update
+    elif summary_update not in entity.summary:
+        merged = entity.summary + " " + summary_update
+        if len(merged) > _MAX_SUMMARY_LENGTH:
+            merged = merged[:_MAX_SUMMARY_LENGTH].rsplit(" ", 1)[0] + "..."
+        entity.summary = merged
+
+
+def merge_aliases_nicknames_speech_notes(
+    entity: GlossaryEntity,
+    mention: ExtractedMention,
+) -> None:
+    """Merge aliases, nicknames, speech_style, and notes from a mention.
+
+    Parameters
+    ----------
+    entity:
+        The entity to update.
+    mention:
+        The extracted mention providing the data.
+    """
+    # Union aliases.
+    alias_set = set(entity.aliases)
+    for alias in mention.aliases:
+        if alias not in alias_set:
+            entity.aliases.append(alias)
+            alias_set.add(alias)
+
+    # Merge nicknames (existing wins on key conflict).
+    for speaker, nick in mention.nicknames.items():
+        if speaker not in entity.nicknames:
+            entity.nicknames[speaker] = nick
+
+    # Accumulate speech_style observations.
+    if mention.speech_style:
+        if entity.speech_style:
+            existing_observations = entity.speech_style.split(_SPEECH_STYLE_DELIMITER)
+            if mention.speech_style not in existing_observations:
+                entity.speech_style = (
+                    entity.speech_style + _SPEECH_STYLE_DELIMITER + mention.speech_style
+                )
+        else:
+            entity.speech_style = mention.speech_style
+
+    # Concatenate notes if new info.
+    if mention.notes and mention.notes != entity.notes:
+        if entity.notes:
+            if mention.notes not in entity.notes:
+                entity.notes = entity.notes + " " + mention.notes
+        else:
+            entity.notes = mention.notes
+
+
+# ---------------------------------------------------------------------------
+# Glossary rendering (for prompt injection during build)
 # ---------------------------------------------------------------------------
 
 
 def _render_existing_glossary(glossary: Glossary, max_tokens: int) -> str:
     """Render the current glossary compactly for prompt injection.
 
-    Groups entries by category, one line per entry.  If the total exceeds
-    *max_tokens*, truncates to the most recently added entries with a note.
+    Groups entities by category, one line per surface form.  If the total
+    exceeds *max_tokens*, truncates to the most recently added entities
+    with a note.
     """
-    if not glossary.entries:
+    if not glossary.entities:
         return "(no entries yet)"
 
     # Group by category.
-    by_category: dict[str, list[GlossaryEntry]] = defaultdict(list)
-    for entry in glossary.entries:
-        by_category[entry.category].append(entry)
+    by_category: dict[str, list[GlossaryEntity]] = defaultdict(list)
+    for entity in glossary.entities:
+        by_category[entity.category].append(entity)
 
     lines: list[str] = []
     for cat in sorted(by_category.keys()):
         lines.append(f"[{cat}]")
-        for e in by_category[cat]:
-            parts = [f"{e.source_term or '?'} -> {e.english}"]
-            if e.reading:
-                parts.append(f"reading: {e.reading}")
-            if e.aliases:
-                parts.append(f"aliases: {', '.join(e.aliases)}")
-            lines.append("  " + " | ".join(parts))
+        for entity in by_category[cat]:
+            for sf in entity.surface_forms:
+                parts = [f"{sf.source} -> {sf.english}"]
+                if sf.reading:
+                    parts.append(f"reading: {sf.reading}")
+                lines.append("  " + " | ".join(parts))
 
     rendered = "\n".join(lines)
 
     # Check token count and truncate if needed.
     token_count = count_tokens(rendered)
     if token_count > max_tokens:
-        # Truncate: keep the tail (most recently added) entries.
-        # Rebuild from the end of the entry list.
-        truncated_entries = list(reversed(glossary.entries))
-        kept: list[GlossaryEntry] = []
+        # Truncate: keep the tail (most recently added) entities.
+        all_forms: list[tuple[str, SurfaceForm]] = []
+        for entity in glossary.entities:
+            for sf in entity.surface_forms:
+                all_forms.append((entity.category, sf))
+
+        truncated_forms = list(reversed(all_forms))
+        kept: list[tuple[str, SurfaceForm]] = []
         running_tokens = 0
-        for entry in truncated_entries:
-            line = f"  {entry.source_term or '?'} -> {entry.english}"
+        for cat, sf in truncated_forms:
+            line = f"  {sf.source} -> {sf.english}"
             line_tokens = count_tokens(line)
-            if running_tokens + line_tokens > max_tokens - 50:  # reserve space for header
+            if running_tokens + line_tokens > max_tokens - 50:
                 break
-            kept.append(entry)
+            kept.append((cat, sf))
             running_tokens += line_tokens
 
         kept.reverse()
-        by_cat_truncated: dict[str, list[GlossaryEntry]] = defaultdict(list)
-        for e in kept:
-            by_cat_truncated[e.category].append(e)
+        by_cat_truncated: dict[str, list[SurfaceForm]] = defaultdict(list)
+        for cat, sf in kept:
+            by_cat_truncated[cat].append(sf)
 
-        trunc_lines = [
-            f"(truncated — showing {len(kept)} of {len(glossary.entries)} entries, most recent)"
-        ]
+        total_forms = sum(len(e.surface_forms) for e in glossary.entities)
+        trunc_lines = [f"(truncated — showing {len(kept)} of {total_forms} forms, most recent)"]
         for cat in sorted(by_cat_truncated.keys()):
             trunc_lines.append(f"[{cat}]")
-            for e in by_cat_truncated[cat]:
-                parts = [f"{e.source_term or '?'} -> {e.english}"]
-                if e.reading:
-                    parts.append(f"reading: {e.reading}")
-                if e.aliases:
-                    parts.append(f"aliases: {', '.join(e.aliases)}")
+            for sf in by_cat_truncated[cat]:
+                parts = [f"{sf.source} -> {sf.english}"]
+                if sf.reading:
+                    parts.append(f"reading: {sf.reading}")
                 trunc_lines.append("  " + " | ".join(parts))
 
         rendered = "\n".join(trunc_lines)
@@ -488,10 +792,10 @@ def load_glossary(work_dir: Path, config: AppConfig) -> Glossary:
     Raises
     ------
     ValueError
-        If any glossary entry has a category not in ``config.glossary.categories``.
+        If any glossary entity has a category not in ``config.glossary.categories``.
     """
     glossary = _load_glossary(work_dir)
-    if glossary.entries:
+    if glossary.entities:
         validate_glossary_categories(glossary, config.glossary.categories)
     return glossary
 
@@ -507,12 +811,109 @@ def _save_glossary(work_dir: Path, glossary: Glossary) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _find_entry_by_source_term(glossary: Glossary, source_term: str) -> GlossaryEntry | None:
-    """Find an existing entry by source_term (case-sensitive)."""
-    for entry in glossary.entries:
-        if entry.source_term == source_term:
-            return entry
-    return None
+def _merge_mention_into_glossary(
+    glossary: Glossary,
+    mention: ExtractedMention,
+    batch_id: str,
+    chunk_id: str,
+    meta: _BuildMeta,
+) -> None:
+    """Merge a single extracted mention into the glossary.
+
+    - If the mention links to an existing entity: add/update surface form,
+      merge summary, merge aliases/nicknames/speech/notes.  Record conflicts
+      if English or category differs.
+    - If no match: create a new entity with one surface form.
+    - ``source="user"`` entities are never modified.
+
+    Parameters
+    ----------
+    glossary:
+        The glossary to mutate.
+    mention:
+        A single extracted mention from the LLM.
+    batch_id:
+        Identifier for the current batch (for conflict tracking).
+    chunk_id:
+        ID of the first chunk in the batch.
+    meta:
+        Build metadata sidecar (mutated with conflict info).
+    """
+    entity = find_entity_for_mention(glossary, mention)
+
+    if entity is None:
+        # New entity.
+        sf = SurfaceForm(
+            source=mention.source,
+            reading=mention.reading,
+            english=mention.english,
+            context_hints=[mention.context_hint] if mention.context_hint else [],
+            notes=mention.notes,
+            first_seen_chunk=chunk_id,
+            occurrence_count=1,
+        )
+        new_entity = GlossaryEntity(
+            entity_id=next_entity_id(mention.category, glossary),
+            category=mention.category,
+            canonical_english=mention.english,
+            summary=mention.summary_update,
+            surface_forms=[sf],
+            aliases=list(mention.aliases),
+            nicknames=dict(mention.nicknames),
+            speech_style=mention.speech_style,
+            notes=mention.notes,
+            source="extracted",
+            first_seen_chunk=chunk_id,
+            latest_evidence_chunk=chunk_id,
+        )
+        glossary.entities.append(new_entity)
+        return
+
+    # Existing entity — never modify user-sourced entities.
+    if entity.source == "user":
+        logger.debug("Skipping user-sourced entity: %s", entity.canonical_english)
+        return
+
+    # Add or update the surface form on the entity.
+    add_or_update_surface_form(entity, mention, chunk_id)
+
+    # Merge summary.
+    merge_entity_summary(entity, mention.summary_update, chunk_id)
+
+    # Merge aliases, nicknames, speech_style, notes.
+    merge_aliases_nicknames_speech_notes(entity, mention)
+
+    # Update temporal tracking.
+    entity.latest_evidence_chunk = chunk_id
+
+    # Check for English-form conflict (mention's English vs entity's canonical).
+    if mention.english != entity.canonical_english:
+        # Only record a conflict if the English differs from ALL existing
+        # surface forms — if a surface form with this English already exists,
+        # it's just a different surface form, not a conflict.
+        existing_english_set = {sf.english for sf in entity.surface_forms}
+        if mention.english not in existing_english_set:
+            _record_conflict(
+                meta,
+                entity_id=entity.entity_id,
+                source_form=mention.source,
+                reading=mention.reading,
+                current_english=entity.canonical_english,
+                proposed_english=mention.english,
+                batch_id=batch_id,
+                context_snippet=f"Batch {batch_id}",
+            )
+
+    # Check for category conflict.
+    if mention.category != entity.category:
+        _record_category_conflict(
+            meta,
+            entity_id=entity.entity_id,
+            source_form=mention.source,
+            reading=mention.reading,
+            current_english=entity.canonical_english,
+            category=mention.category,
+        )
 
 
 def _merge_extraction_into_glossary(
@@ -522,99 +923,25 @@ def _merge_extraction_into_glossary(
     first_chunk_id: str,
     meta: _BuildMeta,
 ) -> None:
-    """Merge extracted entries into the glossary, logging conflicts.
+    """Merge all extracted mentions and corrections into the glossary.
 
-    - New source_term: add with ``source="extracted"``.
-    - Existing source_term: union aliases, merge nicknames, accumulate
-      speech_style.  Differing English proposals go to the conflict list.
-    - ``source="user"`` entries: never modified.
-    - Corrections are logged to the meta sidecar, not applied.
+    Parameters
+    ----------
+    glossary:
+        The glossary to mutate.
+    response:
+        The LLM extraction response containing mentions and corrections.
+    batch_id:
+        Identifier for the current batch.
+    first_chunk_id:
+        ID of the first chunk in the batch.
+    meta:
+        Build metadata sidecar (mutated with conflict info).
     """
-    for ext_entry in response.entries:
-        existing = _find_entry_by_source_term(glossary, ext_entry.source_term)
+    for mention in response.mentions:
+        _merge_mention_into_glossary(glossary, mention, batch_id, first_chunk_id, meta)
 
-        if existing is None:
-            # New entry.
-            glossary.entries.append(
-                GlossaryEntry(
-                    source_term=ext_entry.source_term,
-                    reading=ext_entry.reading,
-                    english=ext_entry.english_proposed,
-                    category=ext_entry.category,
-                    first_seen_chunk=first_chunk_id,
-                    aliases=list(ext_entry.aliases),
-                    nicknames=dict(ext_entry.nicknames),
-                    speech_style=ext_entry.speech_style,
-                    notes=ext_entry.notes,
-                    source="extracted",
-                )
-            )
-            continue
-
-        # Existing entry — never modify user-sourced entries.
-        if existing.source == "user":
-            logger.debug("Skipping user-sourced entry: %s", existing.english)
-            continue
-
-        # Backfill reading if an earlier extraction did not have one.
-        if not existing.reading and ext_entry.reading:
-            existing.reading = ext_entry.reading
-
-        # Union aliases.
-        alias_set = set(existing.aliases)
-        for alias in ext_entry.aliases:
-            if alias not in alias_set:
-                existing.aliases.append(alias)
-                alias_set.add(alias)
-
-        # Merge nicknames (existing wins on key conflict).
-        for speaker, nick in ext_entry.nicknames.items():
-            if speaker not in existing.nicknames:
-                existing.nicknames[speaker] = nick
-
-        # Accumulate speech_style observations.
-        if ext_entry.speech_style:
-            if existing.speech_style:
-                # Only add if not already present (dedup identical sentences).
-                existing_observations = existing.speech_style.split(_SPEECH_STYLE_DELIMITER)
-                if ext_entry.speech_style not in existing_observations:
-                    existing.speech_style = (
-                        existing.speech_style + _SPEECH_STYLE_DELIMITER + ext_entry.speech_style
-                    )
-            else:
-                existing.speech_style = ext_entry.speech_style
-
-        # Concatenate notes if new info.
-        if ext_entry.notes and ext_entry.notes != existing.notes:
-            if existing.notes:
-                if ext_entry.notes not in existing.notes:
-                    existing.notes = existing.notes + " " + ext_entry.notes
-            else:
-                existing.notes = ext_entry.notes
-
-        # Check for English-form conflict.
-        if ext_entry.english_proposed != existing.english:
-            _record_conflict(
-                meta,
-                source_term=ext_entry.source_term,
-                reading=ext_entry.reading or existing.reading,
-                current_english=existing.english,
-                proposed_english=ext_entry.english_proposed,
-                batch_id=batch_id,
-                context_snippet=f"Batch {batch_id}",
-            )
-
-        # Check for category conflict.
-        if ext_entry.category != existing.category:
-            _record_category_conflict(
-                meta,
-                source_term=ext_entry.source_term,
-                reading=ext_entry.reading or existing.reading,
-                current_english=existing.english,
-                category=ext_entry.category,
-            )
-
-    # Log corrections (not applied).
+    # Log corrections (not applied directly — recorded as conflicts for reconcile).
     for corr in response.corrections:
         meta.corrections.append(
             {
@@ -625,10 +952,14 @@ def _merge_extraction_into_glossary(
                 "batch_id": batch_id,
             }
         )
-        # Also record as a conflict for reconcile to handle.
+        # Find the entity that owns this correction target.
+        target_entity = _find_entity_for_correction(
+            glossary, corr.existing_english, corr.source_term
+        )
         _record_conflict(
             meta,
-            source_term=corr.source_term,
+            entity_id=target_entity.entity_id if target_entity else f"unknown:{corr.source_term}",
+            source_form=corr.source_term,
             reading=None,
             current_english=corr.existing_english,
             proposed_english=corr.corrected_english,
@@ -640,7 +971,8 @@ def _merge_extraction_into_glossary(
 def _record_conflict(
     meta: _BuildMeta,
     *,
-    source_term: str,
+    entity_id: str,
+    source_form: str,
     reading: str | None,
     current_english: str,
     proposed_english: str,
@@ -649,7 +981,7 @@ def _record_conflict(
 ) -> None:
     """Record or append to an existing conflict in the build metadata."""
     for conflict in meta.conflicts:
-        if conflict.source_term == source_term:
+        if conflict.entity_id == entity_id:
             # Append alternative if not already present.
             existing_proposals = {a["english"] for a in conflict.alternatives}
             if proposed_english not in existing_proposals:
@@ -664,7 +996,8 @@ def _record_conflict(
 
     meta.conflicts.append(
         _ConflictRecord(
-            source_term=source_term,
+            entity_id=entity_id,
+            source_form=source_form,
             reading=reading,
             current_english=current_english,
             alternatives=[
@@ -681,21 +1014,23 @@ def _record_conflict(
 def _record_category_conflict(
     meta: _BuildMeta,
     *,
-    source_term: str,
+    entity_id: str,
+    source_form: str,
     reading: str | None,
     current_english: str,
     category: str,
 ) -> None:
-    """Record a category variant for a term."""
+    """Record a category variant for an entity."""
     for conflict in meta.conflicts:
-        if conflict.source_term == source_term:
+        if conflict.entity_id == entity_id:
             if category not in conflict.category_variants:
                 conflict.category_variants.append(category)
             return
 
     meta.conflicts.append(
         _ConflictRecord(
-            source_term=source_term,
+            entity_id=entity_id,
+            source_form=source_form,
             reading=reading,
             current_english=current_english,
             category_variants=[category],
@@ -902,8 +1237,8 @@ def glossary_build(
     glossary.book_metadata = manifest.metadata
     meta = _load_build_meta(work_dir)
 
-    # Validate categories on any pre-existing entries (e.g. user-seeded).
-    if glossary.entries:
+    # Validate categories on any pre-existing entities (e.g. user-seeded).
+    if glossary.entities:
         validate_glossary_categories(glossary, config.glossary.categories)
 
     # Resolve language names.
@@ -955,18 +1290,13 @@ def glossary_build(
                 chunk_texts.append(f"--- chunk {c.chunk_id} ---\n{c.text}")
             chunk_batch_str = "\n\n".join(chunk_texts)
 
-            # Render existing glossary (limit to half target_tokens).
-            existing_glossary_str = _render_existing_glossary(
-                glossary, max_tokens=target_tokens // 2
-            )
-
             # Render prompt.
             prompt = template.format(
                 source_language=source_lang,
                 target_language=target_lang,
                 categories=categories_str,
                 category_hints=category_hints_str,
-                existing_glossary=existing_glossary_str,
+                existing_glossary=_EXTRACTION_GLOSSARY_PLACEHOLDER,
                 chunk_batch=chunk_batch_str,
             )
 
@@ -989,10 +1319,10 @@ def glossary_build(
             mark_item_completed(work_dir, state, stage, batch.item_id)
 
             logger.debug(
-                "Item %s (%s): extracted %d entries, %d corrections",
+                "Item %s (%s): extracted %d mentions, %d corrections",
                 batch.item_id,
                 batch.chunk_range_label,
-                len(response.entries),
+                len(response.mentions),
                 len(response.corrections),
             )
 
@@ -1036,8 +1366,8 @@ def glossary_build(
             mark_stage_completed(work_dir, state, stage)
 
     logger.info(
-        "Glossary build complete: %d entries, %d conflicts",
-        len(glossary.entries),
+        "Glossary build complete: %d entities, %d conflicts",
+        len(glossary.entities),
         len(meta.conflicts),
     )
 
@@ -1060,8 +1390,8 @@ def glossary_reconcile(
 ) -> Glossary:
     """Resolve within-book glossary conflicts from the build stage.
 
-    For each term conflict, calls the LLM to choose the best English
-    form.  For characters with multiple accumulated speech-style
+    For each entity conflict, calls the LLM to choose the best English
+    form.  For character entities with multiple accumulated speech-style
     observations, consolidates them into a single coherent description.
 
     Writes a reconciliation report to
@@ -1123,19 +1453,19 @@ def glossary_reconcile(
     target_lang = resolve_language_name(config.languages.target)
 
     # Build work items.
-    # 1. Term conflicts (English form or category mismatches).
+    # 1. Entity conflicts (English form or category mismatches).
     term_items: list[tuple[str, _ConflictRecord]] = []
     for conflict in meta.conflicts:
         if conflict.alternatives or conflict.category_variants:
-            item_id = f"glossary_reconcile.term.{conflict.source_term}"
+            item_id = f"glossary_reconcile.term.{conflict.entity_id}"
             term_items.append((item_id, conflict))
 
-    # 2. Speech-style consolidation.
-    speech_items: list[tuple[str, GlossaryEntry]] = []
-    for entry in glossary.entries:
-        if entry.speech_style and _SPEECH_STYLE_DELIMITER in entry.speech_style:
-            item_id = f"glossary_reconcile.speech.{entry.english}"
-            speech_items.append((item_id, entry))
+    # 2. Speech-style consolidation (per entity).
+    speech_items: list[tuple[str, GlossaryEntity]] = []
+    for entity in glossary.entities:
+        if entity.speech_style and _SPEECH_STYLE_DELIMITER in entity.speech_style:
+            item_id = f"glossary_reconcile.speech.{entity.entity_id}"
+            speech_items.append((item_id, entity))
 
     all_item_ids = [item_id for item_id, _ in term_items] + [item_id for item_id, _ in speech_items]
 
@@ -1167,7 +1497,7 @@ def glossary_reconcile(
     term_decisions: list[dict] = []
     speech_decisions: list[dict] = []
 
-    # --- Resolve term conflicts ---
+    # --- Resolve entity conflicts ---
     for item_id, conflict in term_items:
         if item_id not in pending:
             if on_progress:
@@ -1187,7 +1517,7 @@ def glossary_reconcile(
                 prompt = term_template.format(
                     source_language=source_lang,
                     target_language=target_lang,
-                    source_term=conflict.source_term,
+                    source_term=conflict.source_form,
                     reading=conflict.reading or "(none)",
                     current_english=conflict.current_english,
                     alternatives=alternatives_str,
@@ -1202,16 +1532,17 @@ def glossary_reconcile(
                 )
 
                 # Apply the winner.
-                entry = _find_entry_by_source_term(glossary, conflict.source_term)
-                old_english = entry.english if entry else conflict.current_english
-                if entry:
-                    entry.english = result.chosen_english
+                entity = _find_entity_by_id(glossary, conflict.entity_id)
+                old_english = entity.canonical_english if entity else conflict.current_english
+                if entity:
+                    entity.canonical_english = result.chosen_english
 
                 _save_glossary(work_dir, glossary)
 
                 term_decisions.append(
                     {
-                        "source_term": conflict.source_term,
+                        "entity_id": conflict.entity_id,
+                        "source_form": conflict.source_form,
                         "old_english": old_english,
                         "chosen_english": result.chosen_english,
                         "reasoning": result.reasoning,
@@ -1221,19 +1552,25 @@ def glossary_reconcile(
                 )
 
                 logger.debug(
-                    "Resolved %s: '%s' -> '%s'",
-                    conflict.source_term,
+                    "Resolved %s (%s): '%s' -> '%s'",
+                    conflict.entity_id,
+                    conflict.source_form,
                     old_english,
                     result.chosen_english,
                 )
             else:
                 # Category-only conflict — log for the report, no LLM call.
-                entry = _find_entry_by_source_term(glossary, conflict.source_term)
+                entity = _find_entity_by_id(glossary, conflict.entity_id)
                 term_decisions.append(
                     {
-                        "source_term": conflict.source_term,
-                        "old_english": entry.english if entry else conflict.current_english,
-                        "chosen_english": entry.english if entry else conflict.current_english,
+                        "entity_id": conflict.entity_id,
+                        "source_form": conflict.source_form,
+                        "old_english": (
+                            entity.canonical_english if entity else conflict.current_english
+                        ),
+                        "chosen_english": (
+                            entity.canonical_english if entity else conflict.current_english
+                        ),
                         "reasoning": (
                             "Category conflict only — kept existing category; review manually."
                         ),
@@ -1244,7 +1581,7 @@ def glossary_reconcile(
 
                 logger.debug(
                     "Category conflict for %s: variants %s — flagged for review",
-                    conflict.source_term,
+                    conflict.entity_id,
                     conflict.category_variants,
                 )
 
@@ -1265,7 +1602,7 @@ def glossary_reconcile(
             on_progress(item_id)
 
     # --- Consolidate speech styles ---
-    for item_id, entry in speech_items:
+    for item_id, entity in speech_items:
         if item_id not in pending:
             if on_progress:
                 on_progress(item_id)
@@ -1274,12 +1611,12 @@ def glossary_reconcile(
         mark_item_started(work_dir, state, stage, item_id)
 
         try:
-            observations = entry.speech_style.split(_SPEECH_STYLE_DELIMITER)
+            observations = entity.speech_style.split(_SPEECH_STYLE_DELIMITER)
             observations_str = "\n".join(f"- {obs.strip()}" for obs in observations if obs.strip())
 
             prompt = speech_template.format(
                 source_language=source_lang,
-                character_name=entry.english,
+                character_name=entity.canonical_english,
                 observations=observations_str,
             )
 
@@ -1291,20 +1628,25 @@ def glossary_reconcile(
                 context_label=item_id,
             )
 
-            entry.speech_style = result.consolidated_speech_style
+            entity.speech_style = result.consolidated_speech_style
 
             _save_glossary(work_dir, glossary)
 
             speech_decisions.append(
                 {
-                    "character": entry.english,
+                    "entity_id": entity.entity_id,
+                    "character": entity.canonical_english,
                     "old_observations": observations,
                     "consolidated": result.consolidated_speech_style,
                 }
             )
 
             mark_item_completed(work_dir, state, stage, item_id)
-            logger.debug("Consolidated speech style for %s", entry.english)
+            logger.debug(
+                "Consolidated speech style for %s (%s)",
+                entity.canonical_english,
+                entity.entity_id,
+            )
 
         except LLMStructuredOutputError as exc:
             logger.error("Structured output failed for speech style %s: %s", item_id, exc)
@@ -1357,7 +1699,7 @@ def _write_reconcile_report(
         lines.append("## Term Conflicts Resolved")
         lines.append("")
         for dec in term_decisions:
-            lines.append(f"### {dec['source_term']}")
+            lines.append(f"### {dec.get('entity_id', 'unknown')} ({dec.get('source_form', '')})")
             lines.append(f"- **Previous:** {dec['old_english']}")
             lines.append(f"- **Chosen:** {dec['chosen_english']}")
             lines.append(f"- **Reasoning:** {dec['reasoning']}")
@@ -1373,7 +1715,7 @@ def _write_reconcile_report(
         lines.append("## Speech Style Consolidations")
         lines.append("")
         for dec in speech_decisions:
-            lines.append(f"### {dec['character']}")
+            lines.append(f"### {dec['character']} ({dec.get('entity_id', '')})")
             lines.append("- **Original observations:**")
             for obs in dec["old_observations"]:
                 if obs.strip():
@@ -1419,17 +1761,17 @@ def glossary_export(
     # Validate categories.
     validate_glossary_categories(glossary, config.glossary.categories)
 
-    if not glossary.entries:
-        md = "# Glossary\n\nNo entries.\n"
+    if not glossary.entities:
+        md = "# Glossary\n\nNo entities.\n"
         if not stdout:
             dest = output_path or (work_dir / "glossary.md")
             atomic_write(dest, md)
         return md
 
-    # Group by category, sort alphabetically by english within each group.
-    by_category: dict[str, list[GlossaryEntry]] = defaultdict(list)
-    for entry in glossary.entries:
-        by_category[entry.category].append(entry)
+    # Group by category, sort alphabetically by canonical_english within each group.
+    by_category: dict[str, list[GlossaryEntity]] = defaultdict(list)
+    for entity in glossary.entities:
+        by_category[entity.category].append(entity)
 
     # Order categories by config order, then any remaining alphabetically.
     category_order = list(config.glossary.categories)
@@ -1439,29 +1781,39 @@ def glossary_export(
     lines = ["# Glossary", ""]
 
     for cat in ordered_cats:
-        entries = sorted(by_category[cat], key=lambda e: e.english.lower())
+        entities = sorted(by_category[cat], key=lambda e: e.canonical_english.lower())
         lines.append(f"## {cat.replace('_', ' ').title()}")
         lines.append("")
 
-        for entry in entries:
-            # Header line.
-            if entry.source_term:
-                lines.append(f"**{entry.english}** ({entry.source_term})")
-            else:
-                lines.append(f"**{entry.english}**")
+        for entity in entities:
+            lines.append(f"### {entity.canonical_english} (`{entity.entity_id}`)")
+            lines.append("")
+
+            # Summary.
+            if entity.summary:
+                lines.append(f"Summary: {entity.summary}")
+                lines.append("")
+
+            # Surface forms.
+            if entity.surface_forms:
+                lines.append("Surface forms:")
+                for sf in entity.surface_forms:
+                    hint_str = ""
+                    if sf.context_hints:
+                        hint_str = f" (hints: {'; '.join(sf.context_hints)})"
+                    lines.append(f"- `{sf.source}` -> {sf.english}{hint_str}")
+                lines.append("")
 
             # Optional fields.
-            if entry.reading:
-                lines.append(f"- Reading: {entry.reading}")
-            if entry.aliases:
-                lines.append(f"- Aliases: {', '.join(entry.aliases)}")
-            if entry.nicknames:
-                nick_parts = [f"{speaker} -> {nick}" for speaker, nick in entry.nicknames.items()]
+            if entity.aliases:
+                lines.append(f"- Aliases: {', '.join(entity.aliases)}")
+            if entity.nicknames:
+                nick_parts = [f"{speaker} -> {nick}" for speaker, nick in entity.nicknames.items()]
                 lines.append(f"- Nicknames: {'; '.join(nick_parts)}")
-            if entry.speech_style:
-                lines.append(f"- Speech style: {entry.speech_style}")
-            if entry.notes:
-                lines.append(f"- Notes: {entry.notes}")
+            if entity.speech_style:
+                lines.append(f"- Speech style: {entity.speech_style}")
+            if entity.notes:
+                lines.append(f"- Notes: {entity.notes}")
 
             lines.append("")
 

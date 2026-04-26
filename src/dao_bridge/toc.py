@@ -203,22 +203,18 @@ def _render_glossary_for_toc(glossary: Glossary, categories: list[str] | None = 
         Per-book glossary.
     categories:
         Category names to include.  If ``None`` or empty, includes all
-        entries (caller should resolve the fallback from config before
+        entities (caller should resolve the fallback from config before
         calling).
     """
-    if not glossary.entries:
+    if not glossary.entities:
         return "(no glossary available)"
     include = set(categories) if categories else None
     lines: list[str] = []
-    for entry in glossary.entries:
-        if include is not None and entry.category not in include:
+    for entity in glossary.entities:
+        if include is not None and entity.category not in include:
             continue
-        src = entry.source_term or ""
-        eng = entry.english
-        if src:
-            lines.append(f"  {src} -> {eng}")
-        else:
-            lines.append(f"  {eng}")
+        for sf in entity.surface_forms:
+            lines.append(f"  {sf.source} -> {sf.english}")
     return "\n".join(lines) if lines else "(no relevant glossary entries)"
 
 

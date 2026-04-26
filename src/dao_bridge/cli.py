@@ -829,7 +829,7 @@ def glossary_build_cmd(
         verbose=ctx.obj["verbose"],
     )
 
-    click.echo(f"Glossary build complete: {len(glossary.entries)} entries extracted.")
+    click.echo(f"Glossary build complete: {len(glossary.entities)} entities extracted.")
 
 
 # ---------------------------------------------------------------------------
@@ -883,7 +883,7 @@ def glossary_reconcile_cmd(
             on_progress=lambda _: progress.advance(task),
         )
 
-    click.echo(f"Glossary reconcile complete: {len(glossary.entries)} entries.")
+    click.echo(f"Glossary reconcile complete: {len(glossary.entities)} entities.")
     click.echo(f"Report: {work / 'glossary_reconcile_report.md'}")
 
 
@@ -1191,7 +1191,7 @@ def run(ctx: click.Context, work_dir: str, force: bool, retry_failed: bool) -> N
             retry_failed=retry_failed,
             verbose=ctx.obj["verbose"],
         )
-        click.echo(f"  {len(glossary.entries)} entries extracted")
+        click.echo(f"  {len(glossary.entities)} entities extracted")
 
     _run_stage("glossary-build", _glossary_build)
 
@@ -1200,7 +1200,7 @@ def run(ctx: click.Context, work_dir: str, force: bool, retry_failed: bool) -> N
         from dao_bridge.glossary import glossary_reconcile
 
         glossary = glossary_reconcile(work, config, state, force=force, retry_failed=retry_failed)
-        click.echo(f"  {len(glossary.entries)} entries (reconciled)")
+        click.echo(f"  {len(glossary.entities)} entities (reconciled)")
 
     _run_stage("glossary-reconcile", _glossary_reconcile)
 

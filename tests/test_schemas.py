@@ -7,10 +7,13 @@ from pydantic import ValidationError
 
 from dao_bridge.schemas import (
     Chunk,
+    ExtractedMention,
     Glossary,
-    GlossaryEntry,
+    GlossaryEntity,
+    GlossaryExtractionResponse,
     Manifest,
     ManifestItem,
+    SurfaceForm,
     TranslatedChunk,
 )
 
@@ -153,92 +156,236 @@ class TestChunk:
 
 
 # ---------------------------------------------------------------------------
-# GlossaryEntry / Glossary
+# SurfaceForm
 # ---------------------------------------------------------------------------
 
 
-class TestGlossaryEntry:
-    def test_minimal_entry(self):
-        e = GlossaryEntry(english="Subaru", category="character", source="extracted")
-        assert e.source_term is None
+class TestSurfaceForm:
+    def test_minimal(self):
+        sf = SurfaceForm(source="スバル", english="Subaru")
+        assert sf.reading is None
+        assert sf.context_hints == []
+        assert sf.notes is None
+        assert sf.first_seen_chunk is None
+        assert sf.occurrence_count == 1
+
+    def test_full(self):
+        sf = SurfaceForm(
+            source="ヴィンセント",
+            reading="ゔぃんせんと",
+            english="Vincent",
+            context_hints=["same person as アベル"],
+            notes="Unmasked name",
+            first_seen_chunk="0003.001",
+            occurrence_count=5,
+        )
+        assert sf.reading == "ゔぃんせんと"
+        assert sf.context_hints == ["same person as アベル"]
+        assert sf.occurrence_count == 5
+
+    def test_round_trip(self):
+        sf = SurfaceForm(
+            source="アベル",
+            english="Abel",
+            context_hints=["hint1", "hint2"],
+            occurrence_count=3,
+        )
+        data = sf.model_dump()
+        restored = SurfaceForm(**data)
+        assert restored.source == "アベル"
+        assert restored.context_hints == ["hint1", "hint2"]
+
+
+# ---------------------------------------------------------------------------
+# GlossaryEntity
+# ---------------------------------------------------------------------------
+
+
+class TestGlossaryEntity:
+    def test_minimal(self):
+        e = GlossaryEntity(
+            entity_id="character_000001",
+            category="character",
+            canonical_english="Subaru",
+        )
+        assert e.surface_forms == []
         assert e.aliases == []
         assert e.nicknames == {}
+        assert e.speech_style is None
+        assert e.source == "extracted"
+        assert e.summary is None
 
-    def test_full_entry(self):
-        e = GlossaryEntry(
-            source_term="スバル",
-            reading="すばる",
-            english="Subaru",
+    def test_full(self):
+        e = GlossaryEntity(
+            entity_id="character_000001",
             category="character",
-            first_seen_chunk="001.001",
+            canonical_english="Subaru",
+            summary="A young man from another world.",
+            surface_forms=[SurfaceForm(source="スバル", english="Subaru")],
             aliases=["Natsuki Subaru"],
             nicknames={"Rem": "Subaru-kun"},
             speech_style="Casual, uses slang",
             notes="Main character",
             source="seed",
             source_books=["isbn-9784041234567"],
+            first_seen_chunk="001.001",
+            latest_evidence_chunk="005.003",
         )
-        assert e.source_term == "スバル"
+        assert e.canonical_english == "Subaru"
         assert e.nicknames["Rem"] == "Subaru-kun"
         assert e.source_books == ["isbn-9784041234567"]
+        assert e.latest_evidence_chunk == "005.003"
 
     def test_invalid_source_literal(self):
         with pytest.raises(ValidationError):
-            GlossaryEntry(english="X", category="character", source="invalid")
+            GlossaryEntity(
+                entity_id="x",
+                category="character",
+                canonical_english="X",
+                source="invalid",
+            )
 
     def test_round_trip(self):
-        e = GlossaryEntry(
-            source_term="エミリア",
-            english="Emilia",
+        e = GlossaryEntity(
+            entity_id="character_000001",
             category="character",
+            canonical_english="Emilia",
+            surface_forms=[
+                SurfaceForm(source="エミリア", english="Emilia"),
+                SurfaceForm(source="エミリアたん", english="Emilia-tan"),
+            ],
             source="extracted",
             notes="Half-elf",
             source_books=["rezero-vol5", "rezero-vol6"],
         )
         data = e.model_dump()
-        restored = GlossaryEntry(**data)
-        assert restored.source_term == "エミリア"
-        assert restored.notes == "Half-elf"
+        restored = GlossaryEntity(**data)
+        assert restored.canonical_english == "Emilia"
+        assert len(restored.surface_forms) == 2
+        assert restored.surface_forms[1].source == "エミリアたん"
         assert restored.source_books == ["rezero-vol5", "rezero-vol6"]
+
+
+# ---------------------------------------------------------------------------
+# Glossary
+# ---------------------------------------------------------------------------
 
 
 class TestGlossary:
     def test_empty_glossary(self):
         g = Glossary()
-        assert g.entries == []
-        assert g.version == 1
+        assert g.entities == []
+        assert g.version == 2
         assert g.book_id is None
 
-    def test_glossary_with_entries(self):
+    def test_glossary_with_entities(self):
         g = Glossary(
-            entries=[
-                GlossaryEntry(english="Subaru", category="character", source="seed"),
-                GlossaryEntry(
-                    source_term="ルグニカ", english="Lugunica", category="place", source="extracted"
+            entities=[
+                GlossaryEntity(
+                    entity_id="character_000001",
+                    category="character",
+                    canonical_english="Subaru",
+                    source="seed",
+                ),
+                GlossaryEntity(
+                    entity_id="place_000001",
+                    category="place",
+                    canonical_english="Lugunica",
+                    surface_forms=[SurfaceForm(source="ルグニカ", english="Lugunica")],
+                    source="extracted",
                 ),
             ],
             book_id="rezero-5",
             book_metadata={"title": "Re:Zero Vol 5"},
         )
-        assert len(g.entries) == 2
+        assert len(g.entities) == 2
         assert g.book_id == "rezero-5"
 
     def test_round_trip_json(self):
         now = datetime.now(timezone.utc)
         g = Glossary(
-            entries=[
-                GlossaryEntry(english="Test", category="term", source="user"),
+            entities=[
+                GlossaryEntity(
+                    entity_id="term_000001",
+                    category="term",
+                    canonical_english="Test",
+                    source="user",
+                ),
             ],
-            version=3,
+            version=2,
             book_id="test-book",
             created_at=now,
             updated_at=now,
         )
         data = g.model_dump(mode="json")
         restored = Glossary(**data)
-        assert restored.version == 3
-        assert len(restored.entries) == 1
+        assert restored.version == 2
+        assert len(restored.entities) == 1
         assert restored.book_id == "test-book"
+
+
+# ---------------------------------------------------------------------------
+# ExtractedMention
+# ---------------------------------------------------------------------------
+
+
+class TestExtractedMention:
+    def test_minimal(self):
+        m = ExtractedMention(source="スバル", english="Subaru", category="character")
+        assert m.reading is None
+        assert m.summary_update is None
+        assert m.context_hint is None
+        assert m.aliases == []
+        assert m.nicknames == {}
+
+    def test_full(self):
+        m = ExtractedMention(
+            source="ヴィンセント・ヴォラキア",
+            reading="ゔぃんせんと・ゔぉらきあ",
+            english="Vincent Volakia",
+            category="character",
+            summary_update="The emperor of Volakia.",
+            context_hint="same person as アベル",
+            notes="Full name revealed.",
+            aliases=["ヴィンセント"],
+            nicknames={"Abel": "Your Majesty"},
+            speech_style="Calm and authoritative.",
+        )
+        assert m.context_hint == "same person as アベル"
+        assert m.summary_update == "The emperor of Volakia."
+
+    def test_round_trip(self):
+        m = ExtractedMention(
+            source="テスト",
+            english="Test",
+            category="term",
+            context_hint="a hint",
+        )
+        data = m.model_dump()
+        restored = ExtractedMention(**data)
+        assert restored.source == "テスト"
+        assert restored.context_hint == "a hint"
+
+
+# ---------------------------------------------------------------------------
+# GlossaryExtractionResponse
+# ---------------------------------------------------------------------------
+
+
+class TestGlossaryExtractionResponse:
+    def test_empty(self):
+        r = GlossaryExtractionResponse()
+        assert r.mentions == []
+        assert r.corrections == []
+
+    def test_with_mentions(self):
+        r = GlossaryExtractionResponse(
+            mentions=[
+                ExtractedMention(source="スバル", english="Subaru", category="character"),
+            ]
+        )
+        assert len(r.mentions) == 1
+        assert r.mentions[0].source == "スバル"
 
 
 # ---------------------------------------------------------------------------

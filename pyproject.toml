@@ -32,6 +32,7 @@ dependencies = [
     "pyyaml>=6.0",
     "tiktoken>=0.6",
     "rich>=13.0",
+    "jellyfish>=1.0",
 ]
 
 [project.optional-dependencies]

@@ -16,7 +16,7 @@ from pathlib import Path
 
 from lxml import etree
 
-from dao_bridge.config import AppConfig
+from dao_bridge.config import AppConfig, resolve_language_name
 from dao_bridge.llm_client import LLMClient
 from dao_bridge.schemas import Glossary, Manifest, TocTranslationResponse
 from dao_bridge.workdir import find_opf_zip_path, read_zip_entry, resolve_zip_path
@@ -214,7 +214,7 @@ def _render_glossary_for_toc(glossary: Glossary, categories: list[str] | None = 
         if include is not None and entity.category not in include:
             continue
         for sf in entity.surface_forms:
-            lines.append(f"  {sf.source} -> {sf.english}")
+            lines.append(f"  {sf.source} -> {sf.translation}")
     return "\n".join(lines) if lines else "(no relevant glossary entries)"
 
 
@@ -249,8 +249,6 @@ def translate_titles(
     """
     if not titles:
         return []
-
-    from dao_bridge.config import resolve_language_name
 
     source_lang = resolve_language_name(config.languages.source)
     target_lang = resolve_language_name(config.languages.target)
@@ -517,11 +515,15 @@ def update_opf_metadata(opf_content: str, config: AppConfig) -> str:
         lang_el.text = config.languages.target
 
     # --- Update title ---
+    title_suffix = config.output.title_suffix
+    if title_suffix is None:
+        target_name = resolve_language_name(config.languages.target)
+        title_suffix = f" ({target_name} Translation)"
     for title_el in tree.iter(f"{{{_NS_DC}}}title"):
         if title_el.text:
-            title_el.text = title_el.text + config.output.title_suffix
+            title_el.text = title_el.text + title_suffix
         else:
-            title_el.text = config.output.title_suffix.strip()
+            title_el.text = title_suffix.strip()
         break  # Only modify the first <dc:title>.
 
     # --- Add translation note ---

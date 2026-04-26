@@ -164,7 +164,7 @@ class TestChunk:
 
 class TestSurfaceForm:
     def test_minimal(self):
-        sf = SurfaceForm(source="スバル", english="Subaru")
+        sf = SurfaceForm(source="スバル", translation="Subaru")
         assert sf.reading is None
         assert sf.context_hints == []
         assert sf.notes is None
@@ -175,7 +175,7 @@ class TestSurfaceForm:
         sf = SurfaceForm(
             source="ヴィンセント",
             reading="ゔぃんせんと",
-            english="Vincent",
+            translation="Vincent",
             context_hints=["same person as アベル"],
             notes="Unmasked name",
             first_seen_chunk="0003.001",
@@ -188,7 +188,7 @@ class TestSurfaceForm:
     def test_round_trip(self):
         sf = SurfaceForm(
             source="アベル",
-            english="Abel",
+            translation="Abel",
             context_hints=["hint1", "hint2"],
             occurrence_count=3,
         )
@@ -208,7 +208,7 @@ class TestGlossaryEntity:
         e = GlossaryEntity(
             entity_id="character_000001",
             category="character",
-            canonical_english="Subaru",
+            canonical_name="Subaru",
         )
         assert e.surface_forms == []
         assert e.aliases == []
@@ -221,9 +221,9 @@ class TestGlossaryEntity:
         e = GlossaryEntity(
             entity_id="character_000001",
             category="character",
-            canonical_english="Subaru",
+            canonical_name="Subaru",
             summary="A young man from another world.",
-            surface_forms=[SurfaceForm(source="スバル", english="Subaru")],
+            surface_forms=[SurfaceForm(source="スバル", translation="Subaru")],
             aliases=["Natsuki Subaru"],
             nicknames={"Rem": "Subaru-kun"},
             speech_style="Casual, uses slang",
@@ -233,7 +233,7 @@ class TestGlossaryEntity:
             first_seen_chunk="001.001",
             latest_evidence_chunk="005.003",
         )
-        assert e.canonical_english == "Subaru"
+        assert e.canonical_name == "Subaru"
         assert e.nicknames["Rem"] == "Subaru-kun"
         assert e.source_books == ["isbn-9784041234567"]
         assert e.latest_evidence_chunk == "005.003"
@@ -243,7 +243,7 @@ class TestGlossaryEntity:
             GlossaryEntity(
                 entity_id="x",
                 category="character",
-                canonical_english="X",
+                canonical_name="X",
                 source="invalid",
             )
 
@@ -251,10 +251,10 @@ class TestGlossaryEntity:
         e = GlossaryEntity(
             entity_id="character_000001",
             category="character",
-            canonical_english="Emilia",
+            canonical_name="Emilia",
             surface_forms=[
-                SurfaceForm(source="エミリア", english="Emilia"),
-                SurfaceForm(source="エミリアたん", english="Emilia-tan"),
+                SurfaceForm(source="エミリア", translation="Emilia"),
+                SurfaceForm(source="エミリアたん", translation="Emilia-tan"),
             ],
             source="extracted",
             notes="Half-elf",
@@ -262,7 +262,7 @@ class TestGlossaryEntity:
         )
         data = e.model_dump()
         restored = GlossaryEntity(**data)
-        assert restored.canonical_english == "Emilia"
+        assert restored.canonical_name == "Emilia"
         assert len(restored.surface_forms) == 2
         assert restored.surface_forms[1].source == "エミリアたん"
         assert restored.source_books == ["rezero-vol5", "rezero-vol6"]
@@ -286,14 +286,14 @@ class TestGlossary:
                 GlossaryEntity(
                     entity_id="character_000001",
                     category="character",
-                    canonical_english="Subaru",
+                    canonical_name="Subaru",
                     source="seed",
                 ),
                 GlossaryEntity(
                     entity_id="place_000001",
                     category="place",
-                    canonical_english="Lugunica",
-                    surface_forms=[SurfaceForm(source="ルグニカ", english="Lugunica")],
+                    canonical_name="Lugunica",
+                    surface_forms=[SurfaceForm(source="ルグニカ", translation="Lugunica")],
                     source="extracted",
                 ),
             ],
@@ -310,7 +310,7 @@ class TestGlossary:
                 GlossaryEntity(
                     entity_id="term_000001",
                     category="term",
-                    canonical_english="Test",
+                    canonical_name="Test",
                     source="user",
                 ),
             ],
@@ -333,7 +333,7 @@ class TestGlossary:
 
 class TestExtractedMention:
     def test_minimal(self):
-        m = ExtractedMention(source="スバル", english="Subaru", category="character")
+        m = ExtractedMention(source="スバル", translation="Subaru", category="character")
         assert m.reading is None
         assert m.summary_update is None
         assert m.context_hint is None
@@ -344,7 +344,7 @@ class TestExtractedMention:
         m = ExtractedMention(
             source="ヴィンセント・ヴォラキア",
             reading="ゔぃんせんと・ゔぉらきあ",
-            english="Vincent Volakia",
+            translation="Vincent Volakia",
             category="character",
             summary_update="The emperor of Volakia.",
             context_hint="same person as アベル",
@@ -359,7 +359,7 @@ class TestExtractedMention:
     def test_round_trip(self):
         m = ExtractedMention(
             source="テスト",
-            english="Test",
+            translation="Test",
             category="term",
             context_hint="a hint",
         )
@@ -383,7 +383,7 @@ class TestGlossaryExtractionResponse:
     def test_with_mentions(self):
         r = GlossaryExtractionResponse(
             mentions=[
-                ExtractedMention(source="スバル", english="Subaru", category="character"),
+                ExtractedMention(source="スバル", translation="Subaru", category="character"),
             ]
         )
         assert len(r.mentions) == 1
@@ -402,7 +402,7 @@ class TestGlossaryClusterDecision:
             entity_id_b="c002",
             same_entity=True,
             preferred_entity_id="c001",
-            preferred_canonical_english="Abel",
+            preferred_canonical_name="Abel",
             reasoning="Same character.",
         )
         assert d.same_entity is True
@@ -417,7 +417,7 @@ class TestGlossaryClusterDecision:
         )
         assert d.same_entity is False
         assert d.preferred_entity_id is None
-        assert d.preferred_canonical_english is None
+        assert d.preferred_canonical_name is None
 
     def test_round_trip_json(self):
         d = GlossaryClusterDecision(
@@ -425,13 +425,13 @@ class TestGlossaryClusterDecision:
             entity_id_b="c002",
             same_entity=True,
             preferred_entity_id="c001",
-            preferred_canonical_english="Abel",
+            preferred_canonical_name="Abel",
             reasoning="Same character with honorific suffix.",
         )
         data = d.model_dump(mode="json")
         restored = GlossaryClusterDecision(**data)
         assert restored.entity_id_a == "c001"
-        assert restored.preferred_canonical_english == "Abel"
+        assert restored.preferred_canonical_name == "Abel"
 
 
 class TestGlossaryClusterResponse:
@@ -447,7 +447,7 @@ class TestGlossaryClusterResponse:
                     entity_id_b="c002",
                     same_entity=True,
                     preferred_entity_id="c001",
-                    preferred_canonical_english="Abel",
+                    preferred_canonical_name="Abel",
                     reasoning="Same character.",
                 ),
             ]

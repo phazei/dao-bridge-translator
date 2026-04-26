@@ -4,7 +4,7 @@ For each notable mention you find, provide:
 
 - source: the exact term as written in the {source_language} text
 - reading: pronunciation if discernible from furigana markup (text in {{base|reading}} format). Null if none.
-- english: your proposed {target_language} rendering for THIS specific surface form
+- translation: your proposed {target_language} rendering for THIS specific surface form
 - category: one of the categories listed below
 - summary_update: one concise sentence about what this entity appears to be in this passage. Null if obvious.
 - context_hint: optional low-confidence hint about entity identity (e.g. "appears to be the same person as アベル"). Null if no cross-reference is apparent.
@@ -37,4 +37,4 @@ If you notice that a previously extracted term should be corrected (e.g. a full 
 
 Return JSON with exactly two arrays:
 - "mentions": notable terms found in this text, each with the fields described above
-- "corrections": corrections to previously extracted terms, each with "existing_english", "source_term", "corrected_english", and "reason"
+- "corrections": corrections to previously extracted terms, each with "existing_translation", "source_term", "corrected_translation", and "reason"

@@ -39,10 +39,10 @@ def _ordered_pair(id_a: str, id_b: str) -> CandidatePair:
     return (id_a, id_b) if id_a < id_b else (id_b, id_a)
 
 
-# -- 1. Japanese substring containment --------------------------------------
+# -- 1. Source-language substring containment --------------------------------
 
 
-def _jp_substring_candidates(glossary: Glossary) -> set[CandidatePair]:
+def _source_substring_candidates(glossary: Glossary) -> set[CandidatePair]:
     """Surface form source substring containment (both directions).
 
     Catches e.g. ``アベル`` <-> ``アベルちゃん``.
@@ -75,11 +75,11 @@ def _has_source_substring_overlap(ea: GlossaryEntity, eb: GlossaryEntity) -> boo
     return False
 
 
-# -- 2. English containment -------------------------------------------------
+# -- 2. Translation containment ---------------------------------------------
 
 
-def _english_containment_candidates(glossary: Glossary) -> set[CandidatePair]:
-    """Canonical English or surface-form English containment.
+def _translation_containment_candidates(glossary: Glossary) -> set[CandidatePair]:
+    """Canonical name or surface-form translation containment.
 
     Catches e.g. ``Vincent Volakia`` <-> ``Emperor Vincent Volakia``.
     """
@@ -88,24 +88,24 @@ def _english_containment_candidates(glossary: Glossary) -> set[CandidatePair]:
     for i, ea in enumerate(entities):
         for j in range(i + 1, len(entities)):
             eb = entities[j]
-            if _has_english_containment(ea, eb):
+            if _has_translation_containment(ea, eb):
                 pairs.add(_ordered_pair(ea.entity_id, eb.entity_id))
     return pairs
 
 
-def _all_english_forms(entity: GlossaryEntity) -> list[str]:
-    """Collect all English strings from canonical + surface forms."""
-    forms = [entity.canonical_english]
+def _all_translation_forms(entity: GlossaryEntity) -> list[str]:
+    """Collect all translation strings from canonical name + surface forms."""
+    forms = [entity.canonical_name]
     for sf in entity.surface_forms:
-        if sf.english and sf.english != entity.canonical_english:
-            forms.append(sf.english)
+        if sf.translation and sf.translation != entity.canonical_name:
+            forms.append(sf.translation)
     return forms
 
 
-def _has_english_containment(ea: GlossaryEntity, eb: GlossaryEntity) -> bool:
-    """Return True if any English form of *ea* contains/is contained by *eb*'s."""
-    forms_a = _all_english_forms(ea)
-    forms_b = _all_english_forms(eb)
+def _has_translation_containment(ea: GlossaryEntity, eb: GlossaryEntity) -> bool:
+    """Return True if any translation form of *ea* contains/is contained by *eb*'s."""
+    forms_a = _all_translation_forms(ea)
+    forms_b = _all_translation_forms(eb)
     for eng_a in forms_a:
         la = eng_a.lower()
         if len(la) <= 1:
@@ -179,7 +179,7 @@ def _jw_similarity_candidates(
     glossary: Glossary,
     threshold: float = 0.75,
 ) -> set[CandidatePair]:
-    """Bi-directional Jaro-Winkler on source forms and English names.
+    """Bi-directional Jaro-Winkler on source forms and translation names.
 
     Catches romanisation inconsistencies (``Petelgeuse`` vs ``Petelgeous``)
     and honorific variants.
@@ -195,7 +195,7 @@ def _jw_similarity_candidates(
 
 
 def _jw_any_match(ea: GlossaryEntity, eb: GlossaryEntity, threshold: float) -> bool:
-    """Return True if any source-form or English pair exceeds *threshold*."""
+    """Return True if any source-form or translation pair exceeds *threshold*."""
     # Source-form pairs.
     for sf_a in ea.surface_forms:
         if not sf_a.source:
@@ -206,14 +206,14 @@ def _jw_any_match(ea: GlossaryEntity, eb: GlossaryEntity, threshold: float) -> b
             if string_similarity(sf_a.source, sf_b.source) >= threshold:
                 return True
 
-    # English pairs (canonical + surface form).
-    for eng_a in _all_english_forms(ea):
-        if not eng_a:
+    # Translation pairs (canonical name + surface form translations).
+    for tl_a in _all_translation_forms(ea):
+        if not tl_a:
             continue
-        for eng_b in _all_english_forms(eb):
-            if not eng_b:
+        for tl_b in _all_translation_forms(eb):
+            if not tl_b:
                 continue
-            if string_similarity(eng_a, eng_b) >= threshold:
+            if string_similarity(tl_a, tl_b) >= threshold:
                 return True
 
     return False
@@ -236,8 +236,8 @@ def generate_cluster_candidates(
     evidence.
     """
     candidates: set[CandidatePair] = set()
-    candidates |= _jp_substring_candidates(glossary)
-    candidates |= _english_containment_candidates(glossary)
+    candidates |= _source_substring_candidates(glossary)
+    candidates |= _translation_containment_candidates(glossary)
     candidates |= _shared_reading_candidates(glossary)
     candidates |= _alias_overlap_candidates(glossary)
     candidates |= _jw_similarity_candidates(glossary, threshold=config.jw_threshold)
@@ -262,13 +262,13 @@ def render_entity_for_cluster_prompt(entity: GlossaryEntity) -> str:
     lines: list[str] = []
     lines.append(f"Entity ID: {entity.entity_id}")
     lines.append(f"Category: {entity.category}")
-    lines.append(f"Canonical English: {entity.canonical_english}")
+    lines.append(f"Canonical name: {entity.canonical_name}")
     if entity.summary:
         lines.append(f"Summary: {entity.summary}")
     if entity.surface_forms:
         lines.append("Surface forms:")
         for sf in entity.surface_forms:
-            parts = f"  - {sf.source} -> {sf.english}"
+            parts = f"  - {sf.source} -> {sf.translation}"
             if sf.reading:
                 parts += f" (reading: {sf.reading})"
             if sf.context_hints:
@@ -294,7 +294,7 @@ def render_entity_for_cluster_prompt(entity: GlossaryEntity) -> str:
 def merge_entities(
     winner: GlossaryEntity,
     loser: GlossaryEntity,
-    preferred_canonical_english: str | None = None,
+    preferred_canonical_name: str | None = None,
 ) -> None:
     """Merge *loser* into *winner* in place.
 
@@ -306,13 +306,13 @@ def merge_entities(
         The surviving entity (mutated in place).
     loser:
         The entity being absorbed.
-    preferred_canonical_english:
-        If provided, override *winner*'s ``canonical_english``.  Typically
+    preferred_canonical_name:
+        If provided, override *winner*'s ``canonical_name``.  Typically
         comes from the LLM clustering decision.
     """
-    # Canonical English.
-    if preferred_canonical_english:
-        winner.canonical_english = preferred_canonical_english
+    # Canonical name.
+    if preferred_canonical_name:
+        winner.canonical_name = preferred_canonical_name
 
     # Union surface forms — dedup by normalised source.
     _merge_surface_forms(winner, loser)
@@ -383,9 +383,9 @@ def merge_entities(
 def _merge_surface_forms(winner: GlossaryEntity, loser: GlossaryEntity) -> None:
     """Union surface forms from *loser* into *winner*, deduplicating by source.
 
-    When two forms share the same ``source`` string but differ in English
-    rendering, the winner's form is kept but the alternate English is
-    preserved as a context hint so the information is not silently lost.
+    When two forms share the same ``source`` string but differ in translation,
+    the winner's form is kept but the alternate translation is preserved as
+    a variant so the information is not silently lost.
     """
     existing_sources: dict[str, SurfaceForm] = {}
     for sf in winner.surface_forms:
@@ -406,16 +406,16 @@ def _merge_surface_forms(winner: GlossaryEntity, loser: GlossaryEntity) -> None:
                 if hint and hint not in existing.context_hints:
                     existing.context_hints.append(hint)
 
-            # If English differs, preserve the alternate as a proper variant
+            # If translation differs, preserve the alternate as a proper variant
             # so reconcile can inspect and resolve translation conflicts.
-            if sf_loser.english != existing.english:
-                if sf_loser.english not in existing.english_variants:
-                    existing.english_variants.append(sf_loser.english)
+            if sf_loser.translation != existing.translation:
+                if sf_loser.translation not in existing.translation_variants:
+                    existing.translation_variants.append(sf_loser.translation)
 
-            # Union any existing english_variants from the loser.
-            for variant in sf_loser.english_variants:
-                if variant not in existing.english_variants and variant != existing.english:
-                    existing.english_variants.append(variant)
+            # Union any existing translation_variants from the loser.
+            for variant in sf_loser.translation_variants:
+                if variant not in existing.translation_variants and variant != existing.translation:
+                    existing.translation_variants.append(variant)
 
             # Merge notes.
             if sf_loser.notes:
@@ -455,7 +455,7 @@ def remap_entity_id(
     Parameters
     ----------
     decisions:
-        List of ``(entity_id_a, entity_id_b, preferred_canonical_english)``
+        List of ``(entity_id_a, entity_id_b, preferred_canonical_name)``
         tuples from LLM decisions.
     id_map:
         Mapping from *absorbed* entity IDs to their surviving counterpart.
@@ -466,13 +466,13 @@ def remap_entity_id(
         Filtered and remapped decisions.
     """
     result: list[tuple[str, str, str | None]] = []
-    for eid_a, eid_b, pref_english in decisions:
+    for eid_a, eid_b, pref_name in decisions:
         resolved_a = _resolve_id(eid_a, id_map)
         resolved_b = _resolve_id(eid_b, id_map)
         if resolved_a == resolved_b:
             # Both resolve to same entity — skip (already merged).
             continue
-        result.append((resolved_a, resolved_b, pref_english))
+        result.append((resolved_a, resolved_b, pref_name))
     return result
 
 
@@ -524,10 +524,10 @@ def write_cluster_report(
         lines.append("## Merges")
         lines.append("")
         for entry in merge_log:
-            lines.append(f"### {entry['winner_english']} <- {entry['loser_english']}")
+            lines.append(f"### {entry['winner_name']} <- {entry['loser_name']}")
             lines.append(f"- **Winner:** `{entry['winner_id']}`")
             lines.append(f"- **Absorbed:** `{entry['loser_id']}`")
-            lines.append(f"- **Result canonical English:** {entry['result_english']}")
+            lines.append(f"- **Result canonical name:** {entry['result_name']}")
             lines.append(f"- **Reasoning:** {entry['reasoning']}")
             if entry.get("surface_forms_added"):
                 lines.append("- **Surface forms added:**")

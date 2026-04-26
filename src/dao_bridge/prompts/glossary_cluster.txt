@@ -11,7 +11,7 @@ For each pair, decide whether the two entities are **the same identity** — mea
 
 If they ARE the same entity, also indicate:
 - Which entity_id should be kept (the "preferred" one)
-- Which canonical English name is best for the merged entity
+- Which canonical name is best for the merged entity
 
 If they are NOT the same entity, set same_entity to false and leave preferred fields null.
 
@@ -24,5 +24,5 @@ Return JSON with exactly one array:
   - "entity_id_b": second entity's ID (as given above)
   - "same_entity": true or false
   - "preferred_entity_id": the ID to keep (null if not same entity)
-  - "preferred_canonical_english": the best canonical English name for the merged entity (null if not same entity)
+  - "preferred_canonical_name": the best canonical name for the merged entity (null if not same entity)
   - "reasoning": brief explanation of your decision

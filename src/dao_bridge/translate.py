@@ -224,17 +224,17 @@ def render_glossary(glossary: Glossary, chunk_text: str, mode: str) -> str:
         lines.append("")
         lines.append(f"{category}:")
         for entity in group_entities:
-            # Header: canonical English name.
-            header = f"- [{entity.canonical_english}]"
+            # Header: canonical name.
+            header = f"- [{entity.canonical_name}]"
             if entity.summary:
                 header += f" — {entity.summary}"
             elif entity.notes:
                 header += f" — {entity.notes}"
             lines.append(header)
 
-            # Surface forms with per-form English renderings.
+            # Surface forms with per-form translations.
             for sf in entity.surface_forms:
-                lines.append(f"  {sf.source} -> {sf.english}")
+                lines.append(f"  {sf.source} -> {sf.translation}")
 
             # Character-specific fields.
             if category.lower() == "character":

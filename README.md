@@ -141,19 +141,19 @@ dao-bridge run --work-dir ./work --retry-failed
 
 The glossary uses an **entity-centric** model. Each `GlossaryEntity` owns one
 or more `SurfaceForm` entries (the different ways a name appears in the
-source text). Entities carry a canonical English rendering, category, summary,
-aliases, nicknames, speech-style notes, and context hints. The glossary is
-stored in `glossary.json` and progresses through four stages:
+source text). Entities carry a canonical name, category, summary, aliases,
+nicknames, speech-style notes, and context hints. The glossary is stored in
+`glossary.json` and progresses through four stages:
 
 1. **glossary-build** -- Groups chunks by spine item and packs each spine's
    chunks into sub-batches (item IDs like `0003.b2`).  Each sub-batch is sent
    to the LLM, which returns `ExtractedMention` objects.  Mentions are linked
-   to existing entities by exact surface-form match, shared reading + English,
-   or high Jaro-Winkler similarity (>= 0.95 auto-attach).  Unmatched mentions
-   create new entities.  The glossary is saved after each batch for
-   crash-resumability.  Use `--spine N` or `--batch ID` to redo specific
-   items.  Conflicting English proposals and corrections are logged for the
-   reconcile stage.
+   to existing entities by exact surface-form match, shared reading +
+   translation, or high Jaro-Winkler similarity (>= 0.95 auto-attach).
+   Unmatched mentions create new entities.  The glossary is saved after each
+   batch for crash-resumability.  Use `--spine N` or `--batch ID` to redo
+   specific items.  Conflicting translation proposals and corrections are
+   logged for the reconcile stage.
 
 2. **glossary-cluster** -- Reads from `glossary_build.json` and writes to
    `glossary_cluster.json`.  Finds duplicate entities that build-time linking
@@ -318,7 +318,7 @@ The `output` section controls the rebuilt EPUB:
 
 ```yaml
 output:
-    epub_path: ./book.en.epub           # Output file path (relative to work dir parent)
+    epub_path: ./book.en.epub           # Output file path (relative to the work dir)
     title_suffix: ' (English Translation)'  # Appended to the book title
     new_identifier: false               # Generate new UUID for dc:identifier
     css: original                       # 'original' (keep source CSS) or 'default' (inject fallback)

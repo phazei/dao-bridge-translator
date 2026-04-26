@@ -171,7 +171,7 @@ def _mark_prior_stages_complete(work_dir: Path, state: PipelineState) -> None:
 def _make_entity(
     entity_id: str = "character_000001",
     category: str = "character",
-    canonical_english: str = "Subaru",
+    canonical_name: str = "Subaru",
     surface_forms: list[dict] | None = None,
     **kwargs,
 ) -> GlossaryEntity:
@@ -182,7 +182,7 @@ def _make_entity(
     return GlossaryEntity(
         entity_id=entity_id,
         category=category,
-        canonical_english=canonical_english,
+        canonical_name=canonical_name,
         surface_forms=sfs,
         source="extracted",
         **kwargs,
@@ -191,12 +191,12 @@ def _make_entity(
 
 def _make_mention(
     source: str = "スバル",
-    english: str = "Subaru",
+    translation: str = "Subaru",
     category: str = "character",
     **kwargs,
 ) -> ExtractedMention:
     """Helper to create an ExtractedMention with sensible defaults."""
-    return ExtractedMention(source=source, english=english, category=category, **kwargs)
+    return ExtractedMention(source=source, translation=translation, category=category, **kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -596,14 +596,14 @@ class TestCategoryValidation:
                 _make_entity(
                     entity_id="character_000001",
                     category="character",
-                    canonical_english="X",
-                    surface_forms=[{"source": "X", "english": "X"}],
+                    canonical_name="X",
+                    surface_forms=[{"source": "X", "translation": "X"}],
                 ),
                 _make_entity(
                     entity_id="place_000001",
                     category="place",
-                    canonical_english="Y",
-                    surface_forms=[{"source": "Y", "english": "Y"}],
+                    canonical_name="Y",
+                    surface_forms=[{"source": "Y", "translation": "Y"}],
                 ),
             ]
         )
@@ -630,12 +630,12 @@ class TestCategoryValidation:
                 _make_entity(
                     entity_id="weapon_000001",
                     category="weapon",
-                    canonical_english="Foo",
+                    canonical_name="Foo",
                 ),
                 _make_entity(
                     entity_id="magic_000001",
                     category="magic",
-                    canonical_english="Bar",
+                    canonical_name="Bar",
                 ),
             ]
         )
@@ -649,7 +649,7 @@ class TestCategoryValidation:
                 _make_entity(
                     entity_id="weapon_000001",
                     category="weapon",
-                    canonical_english="Foo",
+                    canonical_name="Foo",
                 ),
             ]
         )
@@ -672,40 +672,40 @@ class TestEntityLinking:
     def test_exact_surface_form_match(self):
         """Exact source match returns the entity."""
         entity = _make_entity(
-            surface_forms=[{"source": "スバル", "english": "Subaru"}],
+            surface_forms=[{"source": "スバル", "translation": "Subaru"}],
         )
         glossary = Glossary(entities=[entity])
-        mention = _make_mention(source="スバル", english="Subaru")
+        mention = _make_mention(source="スバル", translation="Subaru")
         result = find_entity_for_mention(glossary, mention)
         assert result is entity
 
-    def test_same_reading_and_english_match(self):
-        """Same non-null reading AND English returns the entity."""
+    def test_same_reading_and_translation_match(self):
+        """Same non-null reading AND translation returns the entity."""
         entity = _make_entity(
-            surface_forms=[{"source": "スバル", "reading": "すばる", "english": "Subaru"}],
+            surface_forms=[{"source": "スバル", "reading": "すばる", "translation": "Subaru"}],
         )
         glossary = Glossary(entities=[entity])
-        mention = _make_mention(source="ナツキ・スバル", reading="すばる", english="Subaru")
+        mention = _make_mention(source="ナツキ・スバル", reading="すばる", translation="Subaru")
         result = find_entity_for_mention(glossary, mention)
         assert result is entity
 
     def test_no_match_returns_none(self):
         """When no entity matches, returns None (create new entity)."""
         entity = _make_entity(
-            surface_forms=[{"source": "スバル", "english": "Subaru"}],
+            surface_forms=[{"source": "スバル", "translation": "Subaru"}],
         )
         glossary = Glossary(entities=[entity])
-        mention = _make_mention(source="エミリア", english="Emilia")
+        mention = _make_mention(source="エミリア", translation="Emilia")
         result = find_entity_for_mention(glossary, mention)
         assert result is None
 
     def test_null_reading_does_not_match(self):
         """Null reading should not match other null readings."""
         entity = _make_entity(
-            surface_forms=[{"source": "スバル", "reading": None, "english": "Subaru"}],
+            surface_forms=[{"source": "スバル", "reading": None, "translation": "Subaru"}],
         )
         glossary = Glossary(entities=[entity])
-        mention = _make_mention(source="ナツキ", reading=None, english="Subaru")
+        mention = _make_mention(source="ナツキ", reading=None, translation="Subaru")
         result = find_entity_for_mention(glossary, mention)
         # Exact source doesn't match, null reading can't match — should be None.
         assert result is None
@@ -715,11 +715,11 @@ class TestEntityLinking:
         entity = _make_entity(
             entity_id="character_000001",
             category="character",
-            surface_forms=[{"source": "アベル", "english": "Abel"}],
+            surface_forms=[{"source": "アベル", "translation": "Abel"}],
         )
         glossary = Glossary(entities=[entity])
         # Very similar source but different category.
-        mention = _make_mention(source="アベル座", english="Abelza", category="place")
+        mention = _make_mention(source="アベル座", translation="Abelza", category="place")
         # Exact source doesn't match, reading doesn't match, category differs.
         result = find_entity_for_mention(glossary, mention)
         assert result is None
@@ -731,18 +731,18 @@ class TestEntityLinking:
                 _make_entity(
                     entity_id="character_000001",
                     category="character",
-                    canonical_english="Abel",
-                    surface_forms=[{"source": "アベル", "english": "Abel"}],
+                    canonical_name="Abel",
+                    surface_forms=[{"source": "アベル", "translation": "Abel"}],
                 ),
                 _make_entity(
                     entity_id="character_000002",
                     category="character",
-                    canonical_english="Abe",
-                    surface_forms=[{"source": "アベル", "english": "Abe"}],
+                    canonical_name="Abe",
+                    surface_forms=[{"source": "アベル", "translation": "Abe"}],
                 ),
             ]
         )
-        mention = _make_mention(source="アベルー", english="Abel", category="character")
+        mention = _make_mention(source="アベルー", translation="Abel", category="character")
         assert find_entity_for_mention(glossary, mention) is None
 
 
@@ -800,22 +800,22 @@ class TestSurfaceFormMerge:
     def test_new_surface_form_added(self):
         """New source creates a new surface form on the entity."""
         entity = _make_entity(
-            surface_forms=[{"source": "スバル", "english": "Subaru"}],
+            surface_forms=[{"source": "スバル", "translation": "Subaru"}],
         )
-        mention = _make_mention(source="ナツキ・スバル", english="Natsuki Subaru")
+        mention = _make_mention(source="ナツキ・スバル", translation="Natsuki Subaru")
         add_or_update_surface_form(entity, mention, "0000.001")
         assert len(entity.surface_forms) == 2
         new_sf = entity.surface_forms[1]
         assert new_sf.source == "ナツキ・スバル"
-        assert new_sf.english == "Natsuki Subaru"
+        assert new_sf.translation == "Natsuki Subaru"
         assert new_sf.first_seen_chunk == "0000.001"
 
     def test_existing_source_increments_count(self):
         """Repeat source increments occurrence_count."""
         entity = _make_entity(
-            surface_forms=[{"source": "スバル", "english": "Subaru", "occurrence_count": 1}],
+            surface_forms=[{"source": "スバル", "translation": "Subaru", "occurrence_count": 1}],
         )
-        mention = _make_mention(source="スバル", english="Subaru")
+        mention = _make_mention(source="スバル", translation="Subaru")
         add_or_update_surface_form(entity, mention, "0000.002")
         assert len(entity.surface_forms) == 1
         assert entity.surface_forms[0].occurrence_count == 2
@@ -823,10 +823,10 @@ class TestSurfaceFormMerge:
     def test_context_hint_appended(self):
         """Context hint is appended to existing surface form."""
         entity = _make_entity(
-            surface_forms=[{"source": "スバル", "english": "Subaru"}],
+            surface_forms=[{"source": "スバル", "translation": "Subaru"}],
         )
         mention = _make_mention(
-            source="スバル", english="Subaru", context_hint="possibly same as ナツキ"
+            source="スバル", translation="Subaru", context_hint="possibly same as ナツキ"
         )
         add_or_update_surface_form(entity, mention, "0000.001")
         assert "possibly same as ナツキ" in entity.surface_forms[0].context_hints
@@ -834,34 +834,38 @@ class TestSurfaceFormMerge:
     def test_reading_backfilled(self):
         """Missing reading on existing form is backfilled from mention."""
         entity = _make_entity(
-            surface_forms=[{"source": "スバル", "english": "Subaru", "reading": None}],
+            surface_forms=[{"source": "スバル", "translation": "Subaru", "reading": None}],
         )
-        mention = _make_mention(source="スバル", english="Subaru", reading="すばる")
+        mention = _make_mention(source="スバル", translation="Subaru", reading="すばる")
         add_or_update_surface_form(entity, mention, "0000.001")
         assert entity.surface_forms[0].reading == "すばる"
 
-    def test_same_source_different_english_adds_variant(self):
-        """Same source with different English is preserved in english_variants."""
+    def test_same_source_different_translation_adds_variant(self):
+        """Same source with different translation is preserved in translation_variants."""
         entity = _make_entity(
-            surface_forms=[{"source": "スバル", "english": "Subaru"}],
+            surface_forms=[{"source": "スバル", "translation": "Subaru"}],
         )
-        mention = _make_mention(source="スバル", english="Subaru Natsuki")
+        mention = _make_mention(source="スバル", translation="Subaru Natsuki")
         add_or_update_surface_form(entity, mention, "0000.001")
         sf = entity.surface_forms[0]
-        assert sf.english == "Subaru"
-        assert sf.english_variants == ["Subaru Natsuki"]
+        assert sf.translation == "Subaru"
+        assert sf.translation_variants == ["Subaru Natsuki"]
 
-    def test_same_source_different_english_deduped(self):
+    def test_same_source_different_translation_deduped(self):
         """Repeat same-source variant is not duplicated."""
         entity = _make_entity(
             surface_forms=[
-                {"source": "スバル", "english": "Subaru", "english_variants": ["Subaru Natsuki"]}
+                {
+                    "source": "スバル",
+                    "translation": "Subaru",
+                    "translation_variants": ["Subaru Natsuki"],
+                }
             ],
         )
-        mention = _make_mention(source="スバル", english="Subaru Natsuki")
+        mention = _make_mention(source="スバル", translation="Subaru Natsuki")
         add_or_update_surface_form(entity, mention, "0000.001")
         sf = entity.surface_forms[0]
-        assert sf.english_variants == ["Subaru Natsuki"]
+        assert sf.translation_variants == ["Subaru Natsuki"]
 
 
 # ---------------------------------------------------------------------------
@@ -870,10 +874,10 @@ class TestSurfaceFormMerge:
 
 
 class TestMentionConflictRouting:
-    """Same-source English disagreements should NOT create entity-level ConflictRecord."""
+    """Same-source translation disagreements should NOT create entity-level ConflictRecord."""
 
-    def test_same_source_different_english_no_entity_conflict(self):
-        """Same source with different English only creates english_variants, not ConflictRecord."""
+    def test_same_source_different_translation_no_entity_conflict(self):
+        """Same source with different translation creates translation_variants only."""
         from dao_bridge.glossary import _BuildMeta, _merge_mention_into_glossary
 
         glossary = Glossary(
@@ -881,8 +885,8 @@ class TestMentionConflictRouting:
                 GlossaryEntity(
                     entity_id="character_000001",
                     category="character",
-                    canonical_english="Subaru",
-                    surface_forms=[SurfaceForm(source="スバル", english="Subaru")],
+                    canonical_name="Subaru",
+                    surface_forms=[SurfaceForm(source="スバル", translation="Subaru")],
                     source="extracted",
                 ),
             ]
@@ -891,16 +895,16 @@ class TestMentionConflictRouting:
 
         mention = ExtractedMention(
             source="スバル",
-            english="Subaru Natsuki",
+            translation="Subaru Natsuki",
             category="character",
         )
         _merge_mention_into_glossary(glossary, mention, "0001.b1", "0001.001", meta)
 
         # Should NOT have created an entity-level conflict.
         assert len(meta.conflicts) == 0
-        # Should be captured in english_variants instead.
+        # Should be captured in translation_variants instead.
         sf = glossary.entities[0].surface_forms[0]
-        assert "Subaru Natsuki" in sf.english_variants
+        assert "Subaru Natsuki" in sf.translation_variants
 
     def test_different_source_different_translation_adds_surface_form(self):
         """New source form with different translation adds a surface form, no conflict."""
@@ -911,8 +915,8 @@ class TestMentionConflictRouting:
                 GlossaryEntity(
                     entity_id="character_000001",
                     category="character",
-                    canonical_english="Subaru",
-                    surface_forms=[SurfaceForm(source="スバル", english="Subaru")],
+                    canonical_name="Subaru",
+                    surface_forms=[SurfaceForm(source="スバル", translation="Subaru")],
                     source="extracted",
                 ),
             ]
@@ -921,10 +925,10 @@ class TestMentionConflictRouting:
 
         # Force entity linking to return the existing entity even though
         # the source form is different.  In practice this happens via
-        # Jaro-Winkler >= 0.95 or reading+english match.
+        # Jaro-Winkler >= 0.95 or reading+translation match.
         mention = ExtractedMention(
             source="ナツキ・スバル",
-            english="Subaru Natsuki",
+            translation="Subaru Natsuki",
             category="character",
         )
         with patch(
@@ -942,11 +946,11 @@ class TestMentionConflictRouting:
         # The new surface form should be present on the entity.
         sources = {sf.source for sf in glossary.entities[0].surface_forms}
         assert "ナツキ・スバル" in sources
-        translations = {sf.english for sf in glossary.entities[0].surface_forms}
+        translations = {sf.translation for sf in glossary.entities[0].surface_forms}
         assert "Subaru Natsuki" in translations
 
-    def test_same_source_same_english_no_conflict(self):
-        """Same source with same English creates no conflicts at all."""
+    def test_same_source_same_translation_no_conflict(self):
+        """Same source with same translation creates no conflicts at all."""
         from dao_bridge.glossary import _BuildMeta, _merge_mention_into_glossary
 
         glossary = Glossary(
@@ -954,8 +958,8 @@ class TestMentionConflictRouting:
                 GlossaryEntity(
                     entity_id="character_000001",
                     category="character",
-                    canonical_english="Subaru",
-                    surface_forms=[SurfaceForm(source="スバル", english="Subaru")],
+                    canonical_name="Subaru",
+                    surface_forms=[SurfaceForm(source="スバル", translation="Subaru")],
                     source="extracted",
                 ),
             ]
@@ -964,13 +968,13 @@ class TestMentionConflictRouting:
 
         mention = ExtractedMention(
             source="スバル",
-            english="Subaru",
+            translation="Subaru",
             category="character",
         )
         _merge_mention_into_glossary(glossary, mention, "0001.b1", "0001.001", meta)
 
         assert len(meta.conflicts) == 0
-        assert glossary.entities[0].surface_forms[0].english_variants == []
+        assert glossary.entities[0].surface_forms[0].translation_variants == []
 
 
 # ---------------------------------------------------------------------------
@@ -1036,7 +1040,7 @@ class TestGlossaryBuild:
                 {
                     "source": "ナツキ・スバル",
                     "reading": "ナツキ・スバル",
-                    "english": "Natsuki Subaru",
+                    "translation": "Natsuki Subaru",
                     "category": "character",
                     "aliases": ["スバル"],
                     "nicknames": {},
@@ -1046,7 +1050,7 @@ class TestGlossaryBuild:
                 },
                 {
                     "source": "エミリア",
-                    "english": "Emilia",
+                    "translation": "Emilia",
                     "category": "character",
                     "aliases": [],
                     "nicknames": {"Subaru": "Emilia-tan"},
@@ -1063,7 +1067,7 @@ class TestGlossaryBuild:
             glossary = glossary_build(work, config, state, force=True)
 
         assert len(glossary.entities) == 2
-        subaru = next(e for e in glossary.entities if e.canonical_english == "Natsuki Subaru")
+        subaru = next(e for e in glossary.entities if e.canonical_name == "Natsuki Subaru")
         assert subaru.entity_id == "character_000001"
         assert subaru.source == "extracted"
         assert "スバル" in subaru.aliases
@@ -1072,9 +1076,9 @@ class TestGlossaryBuild:
         assert subaru.first_seen_chunk is not None
         assert len(subaru.surface_forms) == 1
         assert subaru.surface_forms[0].source == "ナツキ・スバル"
-        assert subaru.surface_forms[0].english == "Natsuki Subaru"
+        assert subaru.surface_forms[0].translation == "Natsuki Subaru"
 
-        emilia = next(e for e in glossary.entities if e.canonical_english == "Emilia")
+        emilia = next(e for e in glossary.entities if e.canonical_name == "Emilia")
         assert emilia.nicknames["Subaru"] == "Emilia-tan"
 
         # book_id populated from manifest.
@@ -1094,7 +1098,7 @@ class TestGlossaryBuild:
             mentions=[
                 {
                     "source": "スバル",
-                    "english": "Subaru",
+                    "translation": "Subaru",
                     "category": "character",
                     "aliases": ["バルス"],
                 },
@@ -1104,7 +1108,7 @@ class TestGlossaryBuild:
             mentions=[
                 {
                     "source": "スバル",
-                    "english": "Subaru",
+                    "translation": "Subaru",
                     "category": "character",
                     "aliases": ["バルス", "ナツキ"],
                 },
@@ -1118,7 +1122,7 @@ class TestGlossaryBuild:
 
             glossary = glossary_build(work, config, state, force=True)
 
-        subaru = next(e for e in glossary.entities if e.canonical_english == "Subaru")
+        subaru = next(e for e in glossary.entities if e.canonical_name == "Subaru")
         assert "バルス" in subaru.aliases
         assert "ナツキ" in subaru.aliases
         assert subaru.aliases.count("バルス") == 1
@@ -1137,7 +1141,7 @@ class TestGlossaryBuild:
             mentions=[
                 {
                     "source": "スバル",
-                    "english": "Subaru",
+                    "translation": "Subaru",
                     "category": "character",
                     "speech_style": "Casual speech.",
                 },
@@ -1147,7 +1151,7 @@ class TestGlossaryBuild:
             mentions=[
                 {
                     "source": "スバル",
-                    "english": "Subaru",
+                    "translation": "Subaru",
                     "category": "character",
                     "speech_style": "Uses modern slang.",
                 },
@@ -1161,7 +1165,7 @@ class TestGlossaryBuild:
 
             glossary = glossary_build(work, config, state, force=True)
 
-        subaru = next(e for e in glossary.entities if e.canonical_english == "Subaru")
+        subaru = next(e for e in glossary.entities if e.canonical_name == "Subaru")
         assert "Casual speech." in subaru.speech_style
         assert "Uses modern slang." in subaru.speech_style
         assert "\n" in subaru.speech_style
@@ -1179,15 +1183,15 @@ class TestGlossaryBuild:
             mentions=[
                 {
                     "source": "プリシラ",
-                    "english": "Priscilla",
+                    "translation": "Priscilla",
                     "category": "character",
                 },
             ],
             corrections=[
                 {
-                    "existing_english": "Priscilla",
+                    "existing_translation": "Priscilla",
                     "source_term": "プリシラ・バーリエル",
-                    "corrected_english": "Priscilla Barielle",
+                    "corrected_translation": "Priscilla Barielle",
                     "reason": "Full name appears.",
                 }
             ],
@@ -1201,16 +1205,16 @@ class TestGlossaryBuild:
             glossary = glossary_build(work, config, state, force=True)
 
         # The correction should not have been applied.
-        priscilla = next(e for e in glossary.entities if e.canonical_english == "Priscilla")
-        assert priscilla.canonical_english == "Priscilla"
+        priscilla = next(e for e in glossary.entities if e.canonical_name == "Priscilla")
+        assert priscilla.canonical_name == "Priscilla"
 
         # But it should be in the build meta conflicts.
         meta = _load_build_meta(work)
         assert len(meta.corrections) == 1
-        assert meta.corrections[0]["corrected_english"] == "Priscilla Barielle"
+        assert meta.corrections[0]["corrected_translation"] == "Priscilla Barielle"
         assert len(meta.conflicts) >= 1
 
-    def test_correction_prefers_unique_source_form_when_english_is_ambiguous(self, tmp_path):
+    def test_correction_prefers_unique_source_form_when_translation_is_ambiguous(self, tmp_path):
         """Correction routing falls back to a unique source-form match."""
         work = _setup_work_dir(tmp_path)
         config = _make_config(work)
@@ -1219,7 +1223,7 @@ class TestGlossaryBuild:
         _make_manifest(work, n_spines=1, chunks_per_spine=2)
         _write_chunks(work, n_spines=1, chunks_per_spine=2, tokens_per_chunk=500)
 
-        # Pre-seed two entities sharing the same canonical_english.
+        # Pre-seed two entities sharing the same canonical_name.
         _save_glossary(
             work,
             Glossary(
@@ -1227,18 +1231,18 @@ class TestGlossaryBuild:
                     GlossaryEntity(
                         entity_id="character_000001",
                         category="character",
-                        canonical_english="Priscilla",
-                        surface_forms=[SurfaceForm(source="プリシラ", english="Priscilla")],
+                        canonical_name="Priscilla",
+                        surface_forms=[SurfaceForm(source="プリシラ", translation="Priscilla")],
                         source="extracted",
                     ),
                     GlossaryEntity(
                         entity_id="character_000002",
                         category="character",
-                        canonical_english="Priscilla",
+                        canonical_name="Priscilla",
                         surface_forms=[
                             SurfaceForm(
                                 source="プリシラ・バーリエル",
-                                english="Priscilla Barielle",
+                                translation="Priscilla Barielle",
                             )
                         ],
                         source="extracted",
@@ -1252,9 +1256,9 @@ class TestGlossaryBuild:
             mentions=[],
             corrections=[
                 {
-                    "existing_english": "Priscilla",
+                    "existing_translation": "Priscilla",
                     "source_term": "プリシラ・バーリエル",
-                    "corrected_english": "Priscilla Barielle",
+                    "corrected_translation": "Priscilla Barielle",
                     "reason": "Full name appears.",
                 }
             ],
@@ -1266,7 +1270,7 @@ class TestGlossaryBuild:
             mock_llm_cls.return_value = mock_client
             glossary_build(work, config, state, force=False)
 
-        # canonical_english is ambiguous (two entities share "Priscilla"),
+        # canonical_name is ambiguous (two entities share "Priscilla"),
         # so the correction should fall back to the source_form signal
         # and attach to entity_000002 (which owns "プリシラ・バーリエル").
         meta = _load_build_meta(work)
@@ -1288,8 +1292,8 @@ class TestGlossaryBuild:
                 GlossaryEntity(
                     entity_id="character_000001",
                     category="character",
-                    canonical_english="Subaru (custom)",
-                    surface_forms=[SurfaceForm(source="スバル", english="Subaru (custom)")],
+                    canonical_name="Subaru (custom)",
+                    surface_forms=[SurfaceForm(source="スバル", translation="Subaru (custom)")],
                     source="user",
                     aliases=["original_alias"],
                 )
@@ -1301,7 +1305,7 @@ class TestGlossaryBuild:
             mentions=[
                 {
                     "source": "スバル",
-                    "english": "Natsuki Subaru",
+                    "translation": "Natsuki Subaru",
                     "category": "character",
                     "aliases": ["バルス"],
                     "speech_style": "Casual.",
@@ -1317,7 +1321,7 @@ class TestGlossaryBuild:
             glossary = glossary_build(work, config, state, force=False)
 
         # User entity should be unchanged.
-        subaru = next(e for e in glossary.entities if e.canonical_english == "Subaru (custom)")
+        subaru = next(e for e in glossary.entities if e.canonical_name == "Subaru (custom)")
         assert subaru.source == "user"
         assert subaru.aliases == ["original_alias"]
         assert subaru.speech_style is None
@@ -1356,10 +1360,10 @@ class TestGlossaryBuild:
         _write_chunks(work, n_spines=1, chunks_per_spine=4, tokens_per_chunk=500)
 
         batch1_response = _mock_extraction_response(
-            mentions=[{"source": "スバル", "english": "Subaru", "category": "character"}]
+            mentions=[{"source": "スバル", "translation": "Subaru", "category": "character"}]
         )
         batch2_response = _mock_extraction_response(
-            mentions=[{"source": "スバル", "english": "Subaru", "category": "character"}]
+            mentions=[{"source": "スバル", "translation": "Subaru", "category": "character"}]
         )
 
         with patch("dao_bridge.glossary.LLMClient") as mock_llm_cls:
@@ -1369,7 +1373,7 @@ class TestGlossaryBuild:
 
             glossary = glossary_build(work, config, state, force=True)
 
-        subaru = next(e for e in glossary.entities if e.canonical_english == "Subaru")
+        subaru = next(e for e in glossary.entities if e.canonical_name == "Subaru")
         assert subaru.surface_forms[0].occurrence_count == 2
 
     def test_new_surface_form_added_to_existing_entity(self, tmp_path):
@@ -1382,14 +1386,14 @@ class TestGlossaryBuild:
         _make_manifest(work, n_spines=1, chunks_per_spine=4)
         _write_chunks(work, n_spines=1, chunks_per_spine=4, tokens_per_chunk=500)
 
-        # Batch 1: mention スバル. Batch 2: mention スバル again with same reading+english
+        # Batch 1: mention スバル. Batch 2: mention スバル again with same reading+translation
         # (so it attaches) but also a mention with different source that shares
-        # reading+english (attaches as new surface form).
+        # reading+translation (attaches as new surface form).
         batch1_response = _mock_extraction_response(
             mentions=[
                 {
                     "source": "スバル",
-                    "english": "Subaru",
+                    "translation": "Subaru",
                     "reading": "すばる",
                     "category": "character",
                 }
@@ -1399,7 +1403,7 @@ class TestGlossaryBuild:
             mentions=[
                 {
                     "source": "ナツキ・スバル",
-                    "english": "Subaru",
+                    "translation": "Subaru",
                     "reading": "すばる",
                     "category": "character",
                 }
@@ -1440,7 +1444,7 @@ class TestBuildFileFlow:
 
         mock_response = _mock_extraction_response(
             mentions=[
-                {"source": "スバル", "english": "Subaru", "category": "character"},
+                {"source": "スバル", "translation": "Subaru", "category": "character"},
             ]
         )
 
@@ -1454,7 +1458,7 @@ class TestBuildFileFlow:
         assert glossary_build_path(work).exists()
         build_glossary = _load_glossary(work, glossary_build_path(work))
         assert len(build_glossary.entities) == 1
-        assert build_glossary.entities[0].canonical_english == "Subaru"
+        assert build_glossary.entities[0].canonical_name == "Subaru"
 
         # glossary.json should NOT exist (reconcile hasn't run).
         assert not glossary_path(work).exists()
@@ -1507,7 +1511,7 @@ class TestBuildResume:
             mentions=[
                 {
                     "source": "エミリア",
-                    "english": "Emilia",
+                    "translation": "Emilia",
                     "category": "character",
                 },
             ]
@@ -1527,14 +1531,14 @@ class TestBuildResume:
         # Verify first batch was saved to build output.
         glossary = _load_glossary(work, glossary_build_path(work))
         assert len(glossary.entities) == 1
-        assert glossary.entities[0].canonical_english == "Emilia"
+        assert glossary.entities[0].canonical_name == "Emilia"
 
         # Second run: resume from batch 2.
         batch2_response = _mock_extraction_response(
             mentions=[
                 {
                     "source": "レム",
-                    "english": "Rem",
+                    "translation": "Rem",
                     "category": "character",
                 },
             ]
@@ -1548,8 +1552,8 @@ class TestBuildResume:
             glossary = glossary_build(work, config, state, force=False)
 
         assert len(glossary.entities) == 2
-        assert any(e.canonical_english == "Emilia" for e in glossary.entities)
-        assert any(e.canonical_english == "Rem" for e in glossary.entities)
+        assert any(e.canonical_name == "Emilia" for e in glossary.entities)
+        assert any(e.canonical_name == "Rem" for e in glossary.entities)
 
 
 # ---------------------------------------------------------------------------
@@ -1573,7 +1577,7 @@ class TestBuildTargeted:
             mentions=[
                 {
                     "source": "スバル",
-                    "english": "Subaru",
+                    "translation": "Subaru",
                     "category": "character",
                 },
             ]
@@ -1601,7 +1605,7 @@ class TestBuildTargeted:
             mentions=[
                 {
                     "source": "エミリア",
-                    "english": "Emilia",
+                    "translation": "Emilia",
                     "category": "character",
                 },
             ]
@@ -1629,7 +1633,7 @@ class TestBuildTargeted:
             mentions=[
                 {
                     "source": "レム",
-                    "english": "Rem",
+                    "translation": "Rem",
                     "category": "character",
                 },
             ]
@@ -1715,7 +1719,7 @@ class TestBuildDownstreamInvalidation:
         # Complete build.
         mock_response = _mock_extraction_response(
             mentions=[
-                {"source": "スバル", "english": "Subaru", "category": "character"},
+                {"source": "スバル", "translation": "Subaru", "category": "character"},
             ]
         )
         with patch("dao_bridge.glossary.LLMClient") as mock_llm_cls:
@@ -1764,7 +1768,7 @@ class TestBuildDownstreamInvalidation:
 
         mock_response = _mock_extraction_response(
             mentions=[
-                {"source": "エミリア", "english": "Emilia", "category": "character"},
+                {"source": "エミリア", "translation": "Emilia", "category": "character"},
             ]
         )
         with patch("dao_bridge.glossary.LLMClient") as mock_llm_cls:
@@ -1786,7 +1790,7 @@ class TestBuildDownstreamInvalidation:
 
         mock_response = _mock_extraction_response(
             mentions=[
-                {"source": "レム", "english": "Rem", "category": "character"},
+                {"source": "レム", "translation": "Rem", "category": "character"},
             ]
         )
         with patch("dao_bridge.glossary.LLMClient") as mock_llm_cls:
@@ -1825,11 +1829,11 @@ class TestBuildDownstreamInvalidation:
 # ---------------------------------------------------------------------------
 
 
-class TestEnglishVariantsReconcile:
-    """Surface-form english_variants are reconciled directly from the glossary."""
+class TestTranslationVariantsReconcile:
+    """Surface-form translation_variants are reconciled directly from the glossary."""
 
-    def test_surface_form_conflict_resolved_from_english_variants(self, tmp_path):
-        """Reconcile updates the surface form and clears english_variants."""
+    def test_surface_form_conflict_resolved_from_translation_variants(self, tmp_path):
+        """Reconcile updates the surface form and clears translation_variants."""
         work = _setup_work_dir(tmp_path)
         config = _make_config(work)
         state = load_state(work)
@@ -1844,12 +1848,12 @@ class TestEnglishVariantsReconcile:
                 GlossaryEntity(
                     entity_id="character_000001",
                     category="character",
-                    canonical_english="Abel",
+                    canonical_name="Abel",
                     surface_forms=[
                         SurfaceForm(
                             source="アベル",
-                            english="Abel",
-                            english_variants=["Aberu", "Abell"],
+                            translation="Abel",
+                            translation_variants=["Aberu", "Abell"],
                         )
                     ],
                     source="extracted",
@@ -1860,7 +1864,7 @@ class TestEnglishVariantsReconcile:
         _save_build_meta(work, _BuildMeta())
 
         mock_reconcile = GlossaryReconcileResponse(
-            chosen_english="Abell",
+            chosen_translation="Abell",
             reasoning="Best rendering for this exact form.",
         )
 
@@ -1873,9 +1877,9 @@ class TestEnglishVariantsReconcile:
 
         entity = next(e for e in glossary.entities if e.entity_id == "character_000001")
         sf = entity.surface_forms[0]
-        assert sf.english == "Abell"
-        assert sf.english_variants == []
-        assert entity.canonical_english == "Abel"
+        assert sf.translation == "Abell"
+        assert sf.translation_variants == []
+        assert entity.canonical_name == "Abel"
 
     def test_multi_surface_forms_resolved_independently(self, tmp_path):
         """Each surface form with variants becomes its own reconcile item."""
@@ -1893,13 +1897,15 @@ class TestEnglishVariantsReconcile:
                 GlossaryEntity(
                     entity_id="character_000001",
                     category="character",
-                    canonical_english="Abel",
+                    canonical_name="Abel",
                     surface_forms=[
-                        SurfaceForm(source="アベル", english="Abel", english_variants=["Aberu"]),
+                        SurfaceForm(
+                            source="アベル", translation="Abel", translation_variants=["Aberu"]
+                        ),
                         SurfaceForm(
                             source="ヴィンセント",
-                            english="Vincent",
-                            english_variants=["Vincento"],
+                            translation="Vincent",
+                            translation_variants=["Vincento"],
                         ),
                     ],
                     source="extracted",
@@ -1911,11 +1917,11 @@ class TestEnglishVariantsReconcile:
 
         responses = [
             GlossaryReconcileResponse(
-                chosen_english="Aberu",
+                chosen_translation="Aberu",
                 reasoning="Preferred for this form.",
             ),
             GlossaryReconcileResponse(
-                chosen_english="Vincento",
+                chosen_translation="Vincento",
                 reasoning="Preferred for this form.",
             ),
         ]
@@ -1929,14 +1935,14 @@ class TestEnglishVariantsReconcile:
 
         entity = next(e for e in glossary.entities if e.entity_id == "character_000001")
         by_source = {sf.source: sf for sf in entity.surface_forms}
-        assert by_source["アベル"].english == "Aberu"
-        assert by_source["ヴィンセント"].english == "Vincento"
-        assert by_source["アベル"].english_variants == []
-        assert by_source["ヴィンセント"].english_variants == []
+        assert by_source["アベル"].translation == "Aberu"
+        assert by_source["ヴィンセント"].translation == "Vincento"
+        assert by_source["アベル"].translation_variants == []
+        assert by_source["ヴィンセント"].translation_variants == []
         assert mock_client.complete_json.call_count == 2
 
     def test_surface_form_change_and_variant_clear_persisted_together(self, tmp_path):
-        """Disk glossary persists chosen English and cleared variants in one save."""
+        """Disk glossary persists chosen translation and cleared variants in one save."""
         work = _setup_work_dir(tmp_path)
         config = _make_config(work)
         state = load_state(work)
@@ -1951,9 +1957,11 @@ class TestEnglishVariantsReconcile:
                 GlossaryEntity(
                     entity_id="character_000001",
                     category="character",
-                    canonical_english="Abel",
+                    canonical_name="Abel",
                     surface_forms=[
-                        SurfaceForm(source="アベル", english="Abel", english_variants=["Aberu"])
+                        SurfaceForm(
+                            source="アベル", translation="Abel", translation_variants=["Aberu"]
+                        )
                     ],
                     source="extracted",
                 )
@@ -1963,7 +1971,7 @@ class TestEnglishVariantsReconcile:
         _save_build_meta(work, _BuildMeta())
 
         mock_reconcile = GlossaryReconcileResponse(
-            chosen_english="Aberu",
+            chosen_translation="Aberu",
             reasoning="Best rendering for this form.",
         )
 
@@ -1976,7 +1984,7 @@ class TestEnglishVariantsReconcile:
             disk_glossary = _load_glossary(work_dir, path)
             entity = next(e for e in disk_glossary.entities if e.entity_id == "character_000001")
             sf = entity.surface_forms[0]
-            saved_states.append((sf.english, list(sf.english_variants)))
+            saved_states.append((sf.translation, list(sf.translation_variants)))
 
         with (
             patch("dao_bridge.glossary.LLMClient") as mock_llm_cls,
@@ -1991,8 +1999,8 @@ class TestEnglishVariantsReconcile:
             glossary = glossary_reconcile(work, config, state, force=True)
 
         entity = next(e for e in glossary.entities if e.entity_id == "character_000001")
-        assert entity.surface_forms[0].english == "Aberu"
-        assert entity.surface_forms[0].english_variants == []
+        assert entity.surface_forms[0].translation == "Aberu"
+        assert entity.surface_forms[0].translation_variants == []
         assert ("Aberu", []) in saved_states
 
     def test_surface_form_conflicts_do_not_create_item_state(self, tmp_path):
@@ -2011,9 +2019,11 @@ class TestEnglishVariantsReconcile:
                 GlossaryEntity(
                     entity_id="character_000001",
                     category="character",
-                    canonical_english="Abel",
+                    canonical_name="Abel",
                     surface_forms=[
-                        SurfaceForm(source="アベル", english="Abel", english_variants=["Aberu"])
+                        SurfaceForm(
+                            source="アベル", translation="Abel", translation_variants=["Aberu"]
+                        )
                     ],
                     source="extracted",
                 )
@@ -2023,7 +2033,7 @@ class TestEnglishVariantsReconcile:
         _save_build_meta(work, _BuildMeta())
 
         mock_reconcile = GlossaryReconcileResponse(
-            chosen_english="Aberu",
+            chosen_translation="Aberu",
             reasoning="Best rendering for this form.",
         )
 
@@ -2077,9 +2087,9 @@ class TestGlossaryReconcile:
                 GlossaryEntity(
                     entity_id="place_000001",
                     category="place",
-                    canonical_english="Lugnica",
+                    canonical_name="Lugnica",
                     surface_forms=[
-                        SurfaceForm(source="ルグニカ", reading="るぐにか", english="Lugnica")
+                        SurfaceForm(source="ルグニカ", reading="るぐにか", translation="Lugnica")
                     ],
                     source="extracted",
                 ),
@@ -2094,10 +2104,10 @@ class TestGlossaryReconcile:
                     "entity_id": "place_000001",
                     "source_form": "ルグニカ",
                     "reading": "るぐにか",
-                    "current_english": "Lugnica",
+                    "current_translation": "Lugnica",
                     "alternatives": [
                         {
-                            "english": "Lugunica",
+                            "translation": "Lugunica",
                             "context_snippet": "Batch 002",
                             "batch_id": "glossary_build.batch.002",
                         }
@@ -2111,11 +2121,11 @@ class TestGlossaryReconcile:
         return work, config, state
 
     def test_llm_picks_winner(self, tmp_path):
-        """Reconcile applies the LLM's chosen English form."""
+        """Reconcile applies the LLM's chosen translation form."""
         work, config, state = self._setup_with_conflicts(tmp_path)
 
         mock_reconcile = GlossaryReconcileResponse(
-            chosen_english="Lugunica",
+            chosen_translation="Lugunica",
             reasoning="More common romanization.",
         )
 
@@ -2127,14 +2137,14 @@ class TestGlossaryReconcile:
             glossary = glossary_reconcile(work, config, state, force=True)
 
         entity = next(e for e in glossary.entities if e.entity_id == "place_000001")
-        assert entity.canonical_english == "Lugunica"
+        assert entity.canonical_name == "Lugunica"
 
     def test_term_change_persisted_before_item_completion(self, tmp_path):
         """Disk glossary is updated before a term item is marked complete."""
         work, config, state = self._setup_with_conflicts(tmp_path)
 
         mock_reconcile = GlossaryReconcileResponse(
-            chosen_english="Lugunica",
+            chosen_translation="Lugunica",
             reasoning="More common romanization.",
         )
 
@@ -2142,7 +2152,7 @@ class TestGlossaryReconcile:
             if item_id.startswith("glossary_reconcile.term."):
                 disk_glossary = _load_glossary(work_dir)
                 entity = next(e for e in disk_glossary.entities if e.entity_id == "place_000001")
-                assert entity.canonical_english == "Lugunica"
+                assert entity.canonical_name == "Lugunica"
             return mark_item_completed(work_dir, pipeline_state, stage, item_id)
 
         with (
@@ -2159,14 +2169,14 @@ class TestGlossaryReconcile:
             glossary = glossary_reconcile(work, config, state, force=True)
 
         entity = next(e for e in glossary.entities if e.entity_id == "place_000001")
-        assert entity.canonical_english == "Lugunica"
+        assert entity.canonical_name == "Lugunica"
 
     def test_report_generated(self, tmp_path):
         """Reconcile report markdown is written."""
         work, config, state = self._setup_with_conflicts(tmp_path)
 
         mock_reconcile = GlossaryReconcileResponse(
-            chosen_english="Lugunica",
+            chosen_translation="Lugunica",
             reasoning="More common.",
         )
 
@@ -2200,8 +2210,8 @@ class TestGlossaryReconcile:
                 GlossaryEntity(
                     entity_id="character_000001",
                     category="character",
-                    canonical_english="Subaru",
-                    surface_forms=[SurfaceForm(source="スバル", english="Subaru")],
+                    canonical_name="Subaru",
+                    surface_forms=[SurfaceForm(source="スバル", translation="Subaru")],
                     source="extracted",
                     speech_style="Casual speech.\nUses modern slang.\nFrequent sarcasm.",
                 ),
@@ -2221,7 +2231,7 @@ class TestGlossaryReconcile:
 
             glossary = glossary_reconcile(work, config, state, force=True)
 
-        subaru = next(e for e in glossary.entities if e.canonical_english == "Subaru")
+        subaru = next(e for e in glossary.entities if e.canonical_name == "Subaru")
         assert subaru.speech_style == "Speaks casually with modern slang and frequent sarcasm."
         assert "\n" not in subaru.speech_style
 
@@ -2241,8 +2251,8 @@ class TestGlossaryReconcile:
                 GlossaryEntity(
                     entity_id="character_000001",
                     category="character",
-                    canonical_english="Subaru",
-                    surface_forms=[SurfaceForm(source="スバル", english="Subaru")],
+                    canonical_name="Subaru",
+                    surface_forms=[SurfaceForm(source="スバル", translation="Subaru")],
                     source="extracted",
                     speech_style="Casual speech.\nUses modern slang.",
                 ),
@@ -2258,7 +2268,7 @@ class TestGlossaryReconcile:
         def checking_mark_item_completed(work_dir, pipeline_state, stage, item_id):
             if item_id.startswith("glossary_reconcile.speech."):
                 disk_glossary = _load_glossary(work_dir)
-                entity = next(e for e in disk_glossary.entities if e.canonical_english == "Subaru")
+                entity = next(e for e in disk_glossary.entities if e.canonical_name == "Subaru")
                 assert entity.speech_style == "Speaks casually with modern slang."
             return mark_item_completed(work_dir, pipeline_state, stage, item_id)
 
@@ -2275,7 +2285,7 @@ class TestGlossaryReconcile:
 
             glossary = glossary_reconcile(work, config, state, force=True)
 
-        subaru = next(e for e in glossary.entities if e.canonical_english == "Subaru")
+        subaru = next(e for e in glossary.entities if e.canonical_name == "Subaru")
         assert subaru.speech_style == "Speaks casually with modern slang."
 
     def test_no_conflicts_completes_immediately(self, tmp_path):
@@ -2294,8 +2304,8 @@ class TestGlossaryReconcile:
                 GlossaryEntity(
                     entity_id="character_000001",
                     category="character",
-                    canonical_english="X",
-                    surface_forms=[SurfaceForm(source="X", english="X")],
+                    canonical_name="X",
+                    surface_forms=[SurfaceForm(source="X", translation="X")],
                     source="extracted",
                     speech_style="Single observation only.",
                 ),
@@ -2327,8 +2337,8 @@ class TestGlossaryReconcile:
                 GlossaryEntity(
                     entity_id="item_000001",
                     category="item",
-                    canonical_english="Holy Sword",
-                    surface_forms=[SurfaceForm(source="聖剣", english="Holy Sword")],
+                    canonical_name="Holy Sword",
+                    surface_forms=[SurfaceForm(source="聖剣", translation="Holy Sword")],
                     source="extracted",
                 ),
             ]
@@ -2341,7 +2351,7 @@ class TestGlossaryReconcile:
                     "entity_id": "item_000001",
                     "source_form": "聖剣",
                     "reading": None,
-                    "current_english": "Holy Sword",
+                    "current_translation": "Holy Sword",
                     "alternatives": [],
                     "category_variants": ["ability"],
                 }
@@ -2371,8 +2381,8 @@ class TestGlossaryReconcile:
                 GlossaryEntity(
                     entity_id="weapon_000001",
                     category="weapon",
-                    canonical_english="X",
-                    surface_forms=[SurfaceForm(source="X", english="X")],
+                    canonical_name="X",
+                    surface_forms=[SurfaceForm(source="X", translation="X")],
                     source="user",
                 ),
             ]
@@ -2391,7 +2401,7 @@ class TestGlossaryReconcile:
         assert not glossary_path(work).exists()
 
         mock_response = GlossaryReconcileResponse(
-            chosen_english="Lugunica", reasoning="Fan convention."
+            chosen_translation="Lugunica", reasoning="Fan convention."
         )
 
         with patch("dao_bridge.glossary.LLMClient") as mock_llm_cls:
@@ -2402,14 +2412,14 @@ class TestGlossaryReconcile:
 
         # Should have loaded the entity from cluster output.
         assert len(glossary.entities) == 1
-        assert glossary.entities[0].canonical_english == "Lugunica"
+        assert glossary.entities[0].canonical_name == "Lugunica"
 
     def test_reconcile_writes_to_glossary_json(self, tmp_path):
         """Reconcile output goes to glossary.json (final output)."""
         work, config, state = self._setup_with_conflicts(tmp_path)
 
         mock_response = GlossaryReconcileResponse(
-            chosen_english="Lugunica", reasoning="Fan convention."
+            chosen_translation="Lugunica", reasoning="Fan convention."
         )
 
         with patch("dao_bridge.glossary.LLMClient") as mock_llm_cls:
@@ -2421,7 +2431,7 @@ class TestGlossaryReconcile:
         # glossary.json should exist as the final output.
         assert glossary_path(work).exists()
         final = _load_glossary(work)
-        assert final.entities[0].canonical_english == "Lugunica"
+        assert final.entities[0].canonical_name == "Lugunica"
 
     def test_reconcile_force_rereads_cluster_output(self, tmp_path):
         """--force on reconcile deletes glossary.json and re-reads from glossary_cluster.json."""
@@ -2429,11 +2439,11 @@ class TestGlossaryReconcile:
 
         # Record original entity data from cluster output.
         original = _load_glossary(work, glossary_cluster_path(work))
-        original_english = original.entities[0].canonical_english
-        assert original_english == "Lugnica"
+        original_translation = original.entities[0].canonical_name
+        assert original_translation == "Lugnica"
 
         mock_response = GlossaryReconcileResponse(
-            chosen_english="Lugunica", reasoning="Fan convention."
+            chosen_translation="Lugunica", reasoning="Fan convention."
         )
 
         with patch("dao_bridge.glossary.LLMClient") as mock_llm_cls:
@@ -2443,12 +2453,12 @@ class TestGlossaryReconcile:
             glossary = glossary_reconcile(work, config, state, force=True)
 
         # Reconcile changed the entity.
-        assert glossary.entities[0].canonical_english == "Lugunica"
+        assert glossary.entities[0].canonical_name == "Lugunica"
 
         # Force re-run: should delete glossary.json and re-read from
         # glossary_cluster.json (which still has "Lugnica").
         mock_response2 = GlossaryReconcileResponse(
-            chosen_english="Lugnica Kingdom", reasoning="Different choice."
+            chosen_translation="Lugnica Kingdom", reasoning="Different choice."
         )
 
         with patch("dao_bridge.glossary.LLMClient") as mock_llm_cls:
@@ -2458,7 +2468,7 @@ class TestGlossaryReconcile:
             glossary = glossary_reconcile(work, config, state, force=True)
 
         # Should have the new LLM choice, applied from pristine cluster output.
-        assert glossary.entities[0].canonical_english == "Lugnica Kingdom"
+        assert glossary.entities[0].canonical_name == "Lugnica Kingdom"
 
     def test_cluster_output_not_mutated_by_reconcile(self, tmp_path):
         """glossary_cluster.json is byte-identical before and after reconcile."""
@@ -2468,7 +2478,7 @@ class TestGlossaryReconcile:
         cluster_bytes_before = glossary_cluster_path(work).read_bytes()
 
         mock_response = GlossaryReconcileResponse(
-            chosen_english="Lugunica", reasoning="Fan convention."
+            chosen_translation="Lugunica", reasoning="Fan convention."
         )
 
         with patch("dao_bridge.glossary.LLMClient") as mock_llm_cls:
@@ -2510,12 +2520,12 @@ class TestReconcileProgress:
                 GlossaryEntity(
                     entity_id="character_000001",
                     category="character",
-                    canonical_english="Abel",
+                    canonical_name="Abel",
                     surface_forms=[
                         SurfaceForm(
                             source="アベル",
-                            english="Abel",
-                            english_variants=["Aberu"],
+                            translation="Abel",
+                            translation_variants=["Aberu"],
                         ),
                     ],
                     speech_style="polite\nrude",
@@ -2533,9 +2543,13 @@ class TestReconcileProgress:
                 _ConflictRecord(
                     entity_id="character_000001",
                     source_form="アベル",
-                    current_english="Abel",
+                    current_translation="Abel",
                     alternatives=[
-                        {"english": "Abell", "context_snippet": "batch 1", "batch_id": "0000.b1"}
+                        {
+                            "translation": "Abell",
+                            "context_snippet": "batch 1",
+                            "batch_id": "0000.b1",
+                        }
                     ],
                 ),
             ]
@@ -2544,8 +2558,8 @@ class TestReconcileProgress:
 
         # Mock LLM: surface-form -> "Aberu", entity -> "Abell", speech -> consolidated.
         responses = [
-            GlossaryReconcileResponse(chosen_english="Aberu", reasoning="surface form"),
-            GlossaryReconcileResponse(chosen_english="Abell", reasoning="entity"),
+            GlossaryReconcileResponse(chosen_translation="Aberu", reasoning="surface form"),
+            GlossaryReconcileResponse(chosen_translation="Abell", reasoning="entity"),
             GlossarySpeechMergeResponse(consolidated_speech_style="polite but sometimes rude"),
         ]
 
@@ -2589,7 +2603,7 @@ class TestReconcileProgress:
         assert p2.phase_label == "Speech styles"
         assert p2.completed == 1
         assert p2.total == 1
-        assert p2.item_label == "Abell"  # canonical_english after entity reconcile
+        assert p2.item_label == "Abell"  # canonical_name after entity reconcile
 
     def test_empty_phases_emit_no_progress(self, tmp_path):
         """Phases with zero items are skipped entirely."""
@@ -2610,9 +2624,9 @@ class TestReconcileProgress:
                 GlossaryEntity(
                     entity_id="character_000001",
                     category="character",
-                    canonical_english="Abel",
+                    canonical_name="Abel",
                     surface_forms=[
-                        SurfaceForm(source="アベル", english="Abel"),
+                        SurfaceForm(source="アベル", translation="Abel"),
                     ],
                     source="extracted",
                 ),
@@ -2652,13 +2666,15 @@ class TestReconcileProgress:
                 GlossaryEntity(
                     entity_id="character_000001",
                     category="character",
-                    canonical_english="Abel",
+                    canonical_name="Abel",
                     surface_forms=[
-                        SurfaceForm(source="アベル", english="Abel", english_variants=["Aberu"]),
+                        SurfaceForm(
+                            source="アベル", translation="Abel", translation_variants=["Aberu"]
+                        ),
                         SurfaceForm(
                             source="アベルちゃん",
-                            english="Abel-chan",
-                            english_variants=["Aberu-chan"],
+                            translation="Abel-chan",
+                            translation_variants=["Aberu-chan"],
                         ),
                     ],
                     source="extracted",
@@ -2669,8 +2685,8 @@ class TestReconcileProgress:
         _save_build_meta(work, _BuildMeta())
 
         responses = [
-            GlossaryReconcileResponse(chosen_english="Aberu", reasoning="r1"),
-            GlossaryReconcileResponse(chosen_english="Aberu-chan", reasoning="r2"),
+            GlossaryReconcileResponse(chosen_translation="Aberu", reasoning="r1"),
+            GlossaryReconcileResponse(chosen_translation="Aberu-chan", reasoning="r2"),
         ]
 
         progress_calls: list[GlossaryReconcileProgress] = []
@@ -2705,7 +2721,7 @@ class TestGlossaryExport:
     """Tests for the glossary_export function."""
 
     def test_grouped_by_category_sorted_alphabetically(self, tmp_path):
-        """Entities are grouped by category and sorted by canonical_english."""
+        """Entities are grouped by category and sorted by canonical_name."""
         work = _setup_work_dir(tmp_path)
         config = _make_config(work)
 
@@ -2713,19 +2729,19 @@ class TestGlossaryExport:
             entities=[
                 _make_entity(
                     entity_id="character_000002",
-                    canonical_english="Zorro",
-                    surface_forms=[{"source": "B-char", "english": "Zorro"}],
+                    canonical_name="Zorro",
+                    surface_forms=[{"source": "B-char", "translation": "Zorro"}],
                 ),
                 _make_entity(
                     entity_id="character_000001",
-                    canonical_english="Alice",
-                    surface_forms=[{"source": "A-char", "english": "Alice"}],
+                    canonical_name="Alice",
+                    surface_forms=[{"source": "A-char", "translation": "Alice"}],
                 ),
                 _make_entity(
                     entity_id="place_000001",
                     category="place",
-                    canonical_english="Kingdom",
-                    surface_forms=[{"source": "Place1", "english": "Kingdom"}],
+                    canonical_name="Kingdom",
+                    surface_forms=[{"source": "Place1", "translation": "Kingdom"}],
                 ),
             ]
         )
@@ -2751,9 +2767,9 @@ class TestGlossaryExport:
                 GlossaryEntity(
                     entity_id="character_000001",
                     category="character",
-                    canonical_english="Subaru",
+                    canonical_name="Subaru",
                     surface_forms=[
-                        SurfaceForm(source="スバル", reading="すばる", english="Subaru")
+                        SurfaceForm(source="スバル", reading="すばる", translation="Subaru")
                     ],
                     aliases=["バルス"],
                     nicknames={"Rem": "Subaru-kun"},
@@ -2787,8 +2803,8 @@ class TestGlossaryExport:
                 _make_entity(
                     entity_id="term_000001",
                     category="term",
-                    canonical_english="Xterm",
-                    surface_forms=[{"source": "X", "english": "Xterm"}],
+                    canonical_name="Xterm",
+                    surface_forms=[{"source": "X", "translation": "Xterm"}],
                 ),
             ]
         )
@@ -2809,7 +2825,7 @@ class TestGlossaryExport:
         glossary = Glossary(
             entities=[
                 _make_entity(
-                    surface_forms=[{"source": "X", "english": "X"}],
+                    surface_forms=[{"source": "X", "translation": "X"}],
                 ),
             ]
         )
@@ -2827,7 +2843,7 @@ class TestGlossaryExport:
         glossary = Glossary(
             entities=[
                 _make_entity(
-                    surface_forms=[{"source": "X", "english": "X"}],
+                    surface_forms=[{"source": "X", "translation": "X"}],
                 ),
             ]
         )
@@ -2846,7 +2862,7 @@ class TestGlossaryExport:
         glossary = Glossary(
             entities=[
                 _make_entity(
-                    surface_forms=[{"source": "X", "english": "X"}],
+                    surface_forms=[{"source": "X", "translation": "X"}],
                 ),
             ]
         )
@@ -2874,8 +2890,8 @@ class TestGlossaryExport:
             entities=[
                 _make_entity(
                     entity_id="character_000042",
-                    canonical_english="Test",
-                    surface_forms=[{"source": "テスト", "english": "Test"}],
+                    canonical_name="Test",
+                    surface_forms=[{"source": "テスト", "translation": "Test"}],
                 ),
             ]
         )
@@ -2938,9 +2954,9 @@ class TestLanguageAgnostic:
                     GlossaryEntity(
                         entity_id="character_000001",
                         category="character",
-                        canonical_english="Hidden Subaru",
+                        canonical_name="Hidden Subaru",
                         surface_forms=[
-                            SurfaceForm(source="ナツキ・スバル", english="Hidden Subaru")
+                            SurfaceForm(source="ナツキ・スバル", translation="Hidden Subaru")
                         ],
                         source="extracted",
                     )
@@ -3033,7 +3049,7 @@ class TestGlossaryIntegration:
                 {
                     "source": "スバル",
                     "reading": "すばる",
-                    "english": "Subaru",
+                    "translation": "Subaru",
                     "category": "character",
                     "aliases": ["ナツキ・スバル"],
                     "speech_style": "Casual speech.",
@@ -3041,7 +3057,7 @@ class TestGlossaryIntegration:
                 },
                 {
                     "source": "エミリア",
-                    "english": "Emilia",
+                    "translation": "Emilia",
                     "category": "character",
                 },
             ]
@@ -3055,8 +3071,8 @@ class TestGlossaryIntegration:
             glossary = glossary_build(work, config, state, force=True)
 
         assert len(glossary.entities) >= 2
-        assert any(e.canonical_english == "Subaru" for e in glossary.entities)
-        assert any(e.canonical_english == "Emilia" for e in glossary.entities)
+        assert any(e.canonical_name == "Subaru" for e in glossary.entities)
+        assert any(e.canonical_name == "Emilia" for e in glossary.entities)
 
         # Verify glossary_build.json exists on disk (build output).
         bp = glossary_build_path(work)

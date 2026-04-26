@@ -15,7 +15,7 @@ import click
 import yaml
 
 from dao_bridge.config import AppConfig, load_config
-from dao_bridge.logging import setup_logging
+from dao_bridge.logging import _make_utf8_console, setup_logging
 from dao_bridge.state import (
     RunState,
     load_state,
@@ -104,6 +104,7 @@ def _run_translate_with_progress(
         TextColumn("avg {task.fields[avg_time]}", style="dim"),
         TimeElapsedColumn(),
         TimeRemainingColumn(),
+        console=_make_utf8_console(),
         transient=True,
         refresh_per_second=2,
     )
@@ -194,6 +195,7 @@ def _run_glossary_build_with_progress(
         TextColumn("{task.fields[item]}", style="bold"),
         TextColumn("{task.fields[of_batch]}", style="cyan"),
         TimeElapsedColumn(),
+        console=_make_utf8_console(),
         transient=True,
         refresh_per_second=2,
     )
@@ -267,6 +269,7 @@ def _run_glossary_reconcile_with_progress(
         MofNCompleteColumn(),
         TextColumn("{task.fields[item]}", style="bold"),
         TimeElapsedColumn(),
+        console=_make_utf8_console(),
         transient=True,
         refresh_per_second=2,
     )
@@ -391,7 +394,7 @@ def _default_config_yaml(epub_path: str, work_dir: str) -> str:
         },
         "output": {
             "epub_path": "./book.en.epub",
-            "title_suffix": " (English Translation)",
+            "title_suffix": None,
             "new_identifier": False,
             "css": "original",
             "add_translation_note": True,

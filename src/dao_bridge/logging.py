@@ -6,7 +6,6 @@ logger with a Rich console handler and a file handler.
 
 from __future__ import annotations
 
-import io
 import logging
 import sys
 from pathlib import Path
@@ -20,20 +19,17 @@ def _make_utf8_console() -> Console:
 
     On Windows with legacy code-pages (e.g. cp1252), Rich's default
     ``LegacyWindowsTerm`` renderer raises ``UnicodeEncodeError`` when log
-    messages contain CJK characters.  Wrapping ``sys.stdout`` in a
-    ``TextIOWrapper`` with ``utf-8`` encoding and ``errors="replace"``
-    avoids the crash while keeping output readable.
+    messages contain CJK characters. Reconfiguring ``sys.stdout`` to
+    ``utf-8`` with ``errors="replace"`` avoids the crash without creating
+    short-lived wrappers that can close the shared stdout stream when Rich
+    progress consoles are torn down.
     """
-    if sys.platform == "win32" and hasattr(sys.stdout, "buffer"):
+    if sys.platform == "win32" and hasattr(sys.stdout, "reconfigure"):
         try:
-            stream = io.TextIOWrapper(
-                sys.stdout.buffer, encoding="utf-8", errors="replace", line_buffering=True
-            )
+            sys.stdout.reconfigure(encoding="utf-8", errors="replace")
         except Exception:
-            stream = sys.stdout
-    else:
-        stream = sys.stdout
-    return Console(file=stream, force_terminal=True)
+            pass
+    return Console(file=sys.stdout, force_terminal=True)
 
 
 def setup_logging(work_dir: Path, verbose: bool = False) -> logging.Logger:

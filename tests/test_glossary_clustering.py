@@ -25,8 +25,8 @@ from dao_bridge.glossary import (
     glossary_cluster,
 )
 from dao_bridge.glossary_clustering import (
-    _english_containment_candidates,
-    _jp_substring_candidates,
+    _translation_containment_candidates,
+    _source_substring_candidates,
     _jw_similarity_candidates,
     _alias_overlap_candidates,
     _shared_reading_candidates,
@@ -91,7 +91,7 @@ def _mark_prior_stages_complete(work_dir: Path, state: PipelineState) -> None:
 def _make_entity(
     entity_id: str = "character_000001",
     category: str = "character",
-    canonical_english: str = "Subaru",
+    canonical_name: str = "Subaru",
     surface_forms: list[dict] | None = None,
     **kwargs,
 ) -> GlossaryEntity:
@@ -101,7 +101,7 @@ def _make_entity(
     return GlossaryEntity(
         entity_id=entity_id,
         category=category,
-        canonical_english=canonical_english,
+        canonical_name=canonical_name,
         surface_forms=sfs,
         source="extracted",
         **kwargs,
@@ -121,17 +121,17 @@ class TestJpSubstringCandidates:
         glossary = Glossary(
             entities=[
                 _make_entity(
-                    "c001", "character", "Abel", [{"source": "アベル", "english": "Abel"}]
+                    "c001", "character", "Abel", [{"source": "アベル", "translation": "Abel"}]
                 ),
                 _make_entity(
                     "c002",
                     "character",
                     "Abel-chan",
-                    [{"source": "アベルちゃん", "english": "Abel-chan"}],
+                    [{"source": "アベルちゃん", "translation": "Abel-chan"}],
                 ),
             ]
         )
-        pairs = _jp_substring_candidates(glossary)
+        pairs = _source_substring_candidates(glossary)
         assert ("c001", "c002") in pairs or ("c002", "c001") in pairs
 
     def test_no_match_different_strings(self):
@@ -139,12 +139,14 @@ class TestJpSubstringCandidates:
         glossary = Glossary(
             entities=[
                 _make_entity(
-                    "c001", "character", "Abel", [{"source": "アベル", "english": "Abel"}]
+                    "c001", "character", "Abel", [{"source": "アベル", "translation": "Abel"}]
                 ),
-                _make_entity("c002", "character", "Rem", [{"source": "レム", "english": "Rem"}]),
+                _make_entity(
+                    "c002", "character", "Rem", [{"source": "レム", "translation": "Rem"}]
+                ),
             ]
         )
-        pairs = _jp_substring_candidates(glossary)
+        pairs = _source_substring_candidates(glossary)
         assert len(pairs) == 0
 
     def test_reverse_containment(self):
@@ -158,7 +160,7 @@ class TestJpSubstringCandidates:
                     [
                         {
                             "source": "ヴィンセント・ヴォラキア皇帝",
-                            "english": "Emperor Vincent Volakia",
+                            "translation": "Emperor Vincent Volakia",
                         },
                     ],
                 ),
@@ -167,34 +169,34 @@ class TestJpSubstringCandidates:
                     "character",
                     "Vincent Volakia",
                     [
-                        {"source": "ヴィンセント・ヴォラキア", "english": "Vincent Volakia"},
+                        {"source": "ヴィンセント・ヴォラキア", "translation": "Vincent Volakia"},
                     ],
                 ),
             ]
         )
-        pairs = _jp_substring_candidates(glossary)
+        pairs = _source_substring_candidates(glossary)
         assert len(pairs) == 1
 
     def test_single_char_ignored(self):
         """Single-character sources do not create false positives."""
         glossary = Glossary(
             entities=[
-                _make_entity("c001", "character", "A", [{"source": "あ", "english": "A"}]),
-                _make_entity("c002", "character", "Aa", [{"source": "ああ", "english": "Aa"}]),
+                _make_entity("c001", "character", "A", [{"source": "あ", "translation": "A"}]),
+                _make_entity("c002", "character", "Aa", [{"source": "ああ", "translation": "Aa"}]),
             ]
         )
         # Single char "あ" is len 1, should not match "ああ" via substring
-        pairs = _jp_substring_candidates(glossary)
+        pairs = _source_substring_candidates(glossary)
         assert len(pairs) == 0
 
 
 # ---------------------------------------------------------------------------
-# Candidate generation — English containment
+# Candidate generation — Translation containment
 # ---------------------------------------------------------------------------
 
 
-class TestEnglishContainmentCandidates:
-    """English name containment heuristic."""
+class TestTranslationContainmentCandidates:
+    """Translation name containment heuristic."""
 
     def test_canonical_containment(self):
         """'Vincent Volakia' contained in 'Emperor Vincent Volakia'."""
@@ -205,7 +207,7 @@ class TestEnglishContainmentCandidates:
                     "character",
                     "Vincent Volakia",
                     [
-                        {"source": "ヴィンセント", "english": "Vincent Volakia"},
+                        {"source": "ヴィンセント", "translation": "Vincent Volakia"},
                     ],
                 ),
                 _make_entity(
@@ -213,16 +215,16 @@ class TestEnglishContainmentCandidates:
                     "character",
                     "Emperor Vincent Volakia",
                     [
-                        {"source": "ヴォラキア皇帝", "english": "Emperor Vincent Volakia"},
+                        {"source": "ヴォラキア皇帝", "translation": "Emperor Vincent Volakia"},
                     ],
                 ),
             ]
         )
-        pairs = _english_containment_candidates(glossary)
+        pairs = _translation_containment_candidates(glossary)
         assert len(pairs) == 1
 
-    def test_surface_form_english_containment(self):
-        """Surface form English is also checked, not just canonical."""
+    def test_surface_form_translation_containment(self):
+        """Surface form translation is also checked, not just canonical."""
         glossary = Glossary(
             entities=[
                 _make_entity(
@@ -230,7 +232,7 @@ class TestEnglishContainmentCandidates:
                     "character",
                     "Abel",
                     [
-                        {"source": "アベル", "english": "Abel"},
+                        {"source": "アベル", "translation": "Abel"},
                     ],
                 ),
                 _make_entity(
@@ -238,35 +240,37 @@ class TestEnglishContainmentCandidates:
                     "character",
                     "Abel-chan",
                     [
-                        {"source": "アベルちゃん", "english": "Abel-chan"},
+                        {"source": "アベルちゃん", "translation": "Abel-chan"},
                     ],
                 ),
             ]
         )
-        pairs = _english_containment_candidates(glossary)
+        pairs = _translation_containment_candidates(glossary)
         assert len(pairs) == 1
 
     def test_no_containment(self):
         glossary = Glossary(
             entities=[
                 _make_entity(
-                    "c001", "character", "Abel", [{"source": "アベル", "english": "Abel"}]
+                    "c001", "character", "Abel", [{"source": "アベル", "translation": "Abel"}]
                 ),
-                _make_entity("c002", "character", "Rem", [{"source": "レム", "english": "Rem"}]),
+                _make_entity(
+                    "c002", "character", "Rem", [{"source": "レム", "translation": "Rem"}]
+                ),
             ]
         )
-        pairs = _english_containment_candidates(glossary)
+        pairs = _translation_containment_candidates(glossary)
         assert len(pairs) == 0
 
-    def test_single_char_english_ignored(self):
-        """Single-character English strings are not matched."""
+    def test_single_char_translation_ignored(self):
+        """Single-character translation strings are not matched."""
         glossary = Glossary(
             entities=[
-                _make_entity("c001", "character", "A", [{"source": "ア", "english": "A"}]),
-                _make_entity("c002", "character", "AB", [{"source": "アブ", "english": "AB"}]),
+                _make_entity("c001", "character", "A", [{"source": "ア", "translation": "A"}]),
+                _make_entity("c002", "character", "AB", [{"source": "アブ", "translation": "AB"}]),
             ]
         )
-        pairs = _english_containment_candidates(glossary)
+        pairs = _translation_containment_candidates(glossary)
         assert len(pairs) == 0
 
 
@@ -286,7 +290,7 @@ class TestSharedReadingCandidates:
                     "character",
                     "Abel",
                     [
-                        {"source": "アベル", "reading": "あべる", "english": "Abel"},
+                        {"source": "アベル", "reading": "あべる", "translation": "Abel"},
                     ],
                 ),
                 _make_entity(
@@ -294,7 +298,7 @@ class TestSharedReadingCandidates:
                     "character",
                     "Aberu",
                     [
-                        {"source": "亜辺流", "reading": "あべる", "english": "Aberu"},
+                        {"source": "亜辺流", "reading": "あべる", "translation": "Aberu"},
                     ],
                 ),
             ]
@@ -310,7 +314,7 @@ class TestSharedReadingCandidates:
                     "character",
                     "Abel",
                     [
-                        {"source": "アベル", "reading": "あべる", "english": "Abel"},
+                        {"source": "アベル", "reading": "あべる", "translation": "Abel"},
                     ],
                 ),
                 _make_entity(
@@ -318,7 +322,7 @@ class TestSharedReadingCandidates:
                     "character",
                     "Rem",
                     [
-                        {"source": "レム", "reading": "れむ", "english": "Rem"},
+                        {"source": "レム", "reading": "れむ", "translation": "Rem"},
                     ],
                 ),
             ]
@@ -335,7 +339,7 @@ class TestSharedReadingCandidates:
                     "character",
                     "Abel",
                     [
-                        {"source": "アベル", "reading": None, "english": "Abel"},
+                        {"source": "アベル", "reading": None, "translation": "Abel"},
                     ],
                 ),
                 _make_entity(
@@ -343,7 +347,7 @@ class TestSharedReadingCandidates:
                     "character",
                     "Rem",
                     [
-                        {"source": "レム", "reading": None, "english": "Rem"},
+                        {"source": "レム", "reading": None, "translation": "Rem"},
                     ],
                 ),
             ]
@@ -368,7 +372,7 @@ class TestAliasOverlapCandidates:
                     "character",
                     "Vincent Volakia",
                     [
-                        {"source": "ヴィンセント・ヴォラキア", "english": "Vincent Volakia"},
+                        {"source": "ヴィンセント・ヴォラキア", "translation": "Vincent Volakia"},
                     ],
                     aliases=["アベル"],
                 ),
@@ -377,7 +381,7 @@ class TestAliasOverlapCandidates:
                     "character",
                     "Abel",
                     [
-                        {"source": "アベル", "english": "Abel"},
+                        {"source": "アベル", "translation": "Abel"},
                     ],
                 ),
             ]
@@ -393,7 +397,7 @@ class TestAliasOverlapCandidates:
                     "character",
                     "Entity A",
                     [
-                        {"source": "Aaa", "english": "Entity A"},
+                        {"source": "Aaa", "translation": "Entity A"},
                     ],
                     aliases=["shared_alias"],
                 ),
@@ -402,7 +406,7 @@ class TestAliasOverlapCandidates:
                     "character",
                     "Entity B",
                     [
-                        {"source": "Bbb", "english": "Entity B"},
+                        {"source": "Bbb", "translation": "Entity B"},
                     ],
                     aliases=["shared_alias"],
                 ),
@@ -419,7 +423,7 @@ class TestAliasOverlapCandidates:
                     "character",
                     "Abel",
                     [
-                        {"source": "アベル", "english": "Abel"},
+                        {"source": "アベル", "translation": "Abel"},
                     ],
                     aliases=["Masked Man"],
                 ),
@@ -428,7 +432,7 @@ class TestAliasOverlapCandidates:
                     "character",
                     "Rem",
                     [
-                        {"source": "レム", "english": "Rem"},
+                        {"source": "レム", "translation": "Rem"},
                     ],
                     aliases=["Blue Oni"],
                 ),
@@ -444,7 +448,7 @@ class TestAliasOverlapCandidates:
 
 
 class TestJwSimilarityCandidates:
-    """Jaro-Winkler similarity on source forms and English names."""
+    """Jaro-Winkler similarity on source forms and translation names."""
 
     def test_similar_romanisation(self):
         """Petelgeuse vs Petelgeous should be a candidate."""
@@ -455,7 +459,7 @@ class TestJwSimilarityCandidates:
                     "character",
                     "Petelgeuse",
                     [
-                        {"source": "ペテルギウス", "english": "Petelgeuse"},
+                        {"source": "ペテルギウス", "translation": "Petelgeuse"},
                     ],
                 ),
                 _make_entity(
@@ -463,7 +467,7 @@ class TestJwSimilarityCandidates:
                     "character",
                     "Petelgeous",
                     [
-                        {"source": "ペテルジュース", "english": "Petelgeous"},
+                        {"source": "ペテルジュース", "translation": "Petelgeous"},
                     ],
                 ),
             ]
@@ -480,7 +484,7 @@ class TestJwSimilarityCandidates:
                     "character",
                     "Abel",
                     [
-                        {"source": "アベル", "english": "Abel"},
+                        {"source": "アベル", "translation": "Abel"},
                     ],
                 ),
                 _make_entity(
@@ -488,7 +492,7 @@ class TestJwSimilarityCandidates:
                     "character",
                     "Rem",
                     [
-                        {"source": "レム", "english": "Rem"},
+                        {"source": "レム", "translation": "Rem"},
                     ],
                 ),
             ]
@@ -505,7 +509,7 @@ class TestJwSimilarityCandidates:
                     "character",
                     "Subaru",
                     [
-                        {"source": "スバル", "english": "Subaru"},
+                        {"source": "スバル", "translation": "Subaru"},
                     ],
                 ),
                 _make_entity(
@@ -513,7 +517,7 @@ class TestJwSimilarityCandidates:
                     "character",
                     "Subaru-kun",
                     [
-                        {"source": "スバルくん", "english": "Subaru-kun"},
+                        {"source": "スバルくん", "translation": "Subaru-kun"},
                     ],
                 ),
             ]
@@ -531,7 +535,7 @@ class TestCrossCategoryCandidates:
     """Category is a soft signal — cross-category pairs are allowed."""
 
     def test_cross_category_pair_generated(self):
-        """character vs title with shared English creates a candidate."""
+        """character vs title with shared translation creates a candidate."""
         glossary = Glossary(
             entities=[
                 _make_entity(
@@ -539,7 +543,7 @@ class TestCrossCategoryCandidates:
                     "character",
                     "Abel",
                     [
-                        {"source": "アベル", "english": "Abel"},
+                        {"source": "アベル", "translation": "Abel"},
                     ],
                 ),
                 _make_entity(
@@ -547,13 +551,13 @@ class TestCrossCategoryCandidates:
                     "title",
                     "Abel-chan",
                     [
-                        {"source": "アベルちゃん", "english": "Abel-chan"},
+                        {"source": "アベルちゃん", "translation": "Abel-chan"},
                     ],
                 ),
             ]
         )
         # JP substring should still fire across categories.
-        pairs = _jp_substring_candidates(glossary)
+        pairs = _source_substring_candidates(glossary)
         assert len(pairs) == 1
 
     def test_generate_cluster_candidates_includes_cross_category(self):
@@ -565,7 +569,7 @@ class TestCrossCategoryCandidates:
                     "character",
                     "Abel",
                     [
-                        {"source": "アベル", "english": "Abel"},
+                        {"source": "アベル", "translation": "Abel"},
                     ],
                 ),
                 _make_entity(
@@ -573,7 +577,7 @@ class TestCrossCategoryCandidates:
                     "title",
                     "Abel",
                     [
-                        {"source": "アベル様", "english": "Lord Abel"},
+                        {"source": "アベル様", "translation": "Lord Abel"},
                     ],
                 ),
             ]
@@ -598,7 +602,7 @@ class TestMergeEntities:
             "character",
             "Abel",
             [
-                {"source": "アベル", "english": "Abel"},
+                {"source": "アベル", "translation": "Abel"},
             ],
         )
         loser = _make_entity(
@@ -606,7 +610,7 @@ class TestMergeEntities:
             "character",
             "Vincent Volakia",
             [
-                {"source": "ヴィンセント・ヴォラキア", "english": "Vincent Volakia"},
+                {"source": "ヴィンセント・ヴォラキア", "translation": "Vincent Volakia"},
             ],
         )
         merge_entities(winner, loser, "Abel")
@@ -621,7 +625,7 @@ class TestMergeEntities:
             "character",
             "Abel",
             [
-                {"source": "アベル", "english": "Abel", "occurrence_count": 3},
+                {"source": "アベル", "translation": "Abel", "occurrence_count": 3},
             ],
         )
         loser = _make_entity(
@@ -629,7 +633,7 @@ class TestMergeEntities:
             "character",
             "Abel",
             [
-                {"source": "アベル", "english": "Abel", "occurrence_count": 2},
+                {"source": "アベル", "translation": "Abel", "occurrence_count": 2},
             ],
         )
         merge_entities(winner, loser)
@@ -638,14 +642,14 @@ class TestMergeEntities:
         # Occurrence counts should be summed.
         assert winner.surface_forms[0].occurrence_count == 5
 
-    def test_dedup_preserves_alternate_english_as_variant(self):
-        """Same source, different English: alternate is preserved in english_variants."""
+    def test_dedup_preserves_alternate_translation_as_variant(self):
+        """Same source, different translation: alternate is preserved in translation_variants."""
         winner = _make_entity(
             "c001",
             "character",
             "Abel",
             [
-                {"source": "アベル", "english": "Abel"},
+                {"source": "アベル", "translation": "Abel"},
             ],
         )
         loser = _make_entity(
@@ -653,20 +657,20 @@ class TestMergeEntities:
             "character",
             "Aberu",
             [
-                {"source": "アベル", "english": "Aberu"},
+                {"source": "アベル", "translation": "Aberu"},
             ],
         )
         merge_entities(winner, loser)
         sf = winner.surface_forms[0]
-        assert sf.english == "Abel"  # Winner's form kept.
-        assert "Aberu" in sf.english_variants
+        assert sf.translation == "Abel"  # Winner's form kept.
+        assert "Aberu" in sf.translation_variants
 
-    def test_preferred_canonical_english(self):
-        """preferred_canonical_english overrides winner's canonical."""
+    def test_preferred_canonical_name(self):
+        """preferred_canonical_name overrides winner's canonical."""
         winner = _make_entity("c001", "character", "Abel")
         loser = _make_entity("c002", "character", "Vincent Volakia")
-        merge_entities(winner, loser, preferred_canonical_english="Vincent Volakia")
-        assert winner.canonical_english == "Vincent Volakia"
+        merge_entities(winner, loser, preferred_canonical_name="Vincent Volakia")
+        assert winner.canonical_name == "Vincent Volakia"
 
     def test_aliases_union(self):
         winner = _make_entity("c001", "character", "Abel", aliases=["Masked Man"])
@@ -739,7 +743,7 @@ class TestMergeEntities:
             "character",
             "Abel",
             [
-                {"source": "アベル", "english": "Abel", "context_hints": ["hint A"]},
+                {"source": "アベル", "translation": "Abel", "context_hints": ["hint A"]},
             ],
         )
         loser = _make_entity(
@@ -747,7 +751,7 @@ class TestMergeEntities:
             "character",
             "Vincent",
             [
-                {"source": "ヴィンセント", "english": "Vincent", "context_hints": ["hint B"]},
+                {"source": "ヴィンセント", "translation": "Vincent", "context_hints": ["hint B"]},
             ],
         )
         merge_entities(winner, loser)
@@ -772,7 +776,7 @@ class TestMergeEntities:
             "character",
             "Abel",
             [
-                {"source": "アベル", "english": "Abel", "reading": None},
+                {"source": "アベル", "translation": "Abel", "reading": None},
             ],
         )
         loser = _make_entity(
@@ -780,7 +784,7 @@ class TestMergeEntities:
             "character",
             "Abel",
             [
-                {"source": "アベル", "english": "Abel", "reading": "あべる"},
+                {"source": "アベル", "translation": "Abel", "reading": "あべる"},
             ],
         )
         merge_entities(winner, loser)
@@ -793,7 +797,7 @@ class TestMergeEntities:
             "character",
             "Abel",
             [
-                {"source": "アベル", "english": "Abel", "first_seen_chunk": "0003.001"},
+                {"source": "アベル", "translation": "Abel", "first_seen_chunk": "0003.001"},
             ],
         )
         loser = _make_entity(
@@ -801,7 +805,7 @@ class TestMergeEntities:
             "character",
             "Abel",
             [
-                {"source": "アベル", "english": "Abel", "first_seen_chunk": "0001.005"},
+                {"source": "アベル", "translation": "Abel", "first_seen_chunk": "0001.005"},
             ],
         )
         merge_entities(winner, loser)
@@ -857,7 +861,7 @@ class TestRenderEntityForClusterPrompt:
             "character",
             "Abel",
             [
-                {"source": "アベル", "english": "Abel", "reading": "あべる"},
+                {"source": "アベル", "translation": "Abel", "reading": "あべる"},
             ],
             summary="A masked traveler.",
         )
@@ -877,7 +881,7 @@ class TestRenderEntityForClusterPrompt:
             [
                 {
                     "source": "アベル",
-                    "english": "Abel",
+                    "translation": "Abel",
                     "context_hints": ["same person as ヴィンセント"],
                 },
             ],
@@ -890,7 +894,7 @@ class TestRenderEntityForClusterPrompt:
             "c001",
             "character",
             "Abel",
-            [{"source": "アベル", "english": "Abel"}],
+            [{"source": "アベル", "translation": "Abel"}],
             aliases=["Masked Man"],
             speech_style="calm and composed",
         )
@@ -921,9 +925,9 @@ class TestClusterReport:
             {
                 "winner_id": "c001",
                 "loser_id": "c002",
-                "winner_english": "Abel",
-                "loser_english": "Vincent Volakia",
-                "result_english": "Abel",
+                "winner_name": "Abel",
+                "loser_name": "Vincent Volakia",
+                "result_name": "Abel",
                 "reasoning": "Same character.",
                 "surface_forms_added": ["`ヴィンセント` -> Vincent Volakia"],
             }
@@ -954,7 +958,7 @@ class TestGenerateClusterCandidates:
                     "character",
                     "Abel",
                     [
-                        {"source": "アベル", "english": "Abel"},
+                        {"source": "アベル", "translation": "Abel"},
                     ],
                 ),
                 _make_entity(
@@ -962,12 +966,12 @@ class TestGenerateClusterCandidates:
                     "character",
                     "Abel-chan",
                     [
-                        {"source": "アベルちゃん", "english": "Abel-chan"},
+                        {"source": "アベルちゃん", "translation": "Abel-chan"},
                     ],
                 ),
             ]
         )
-        # Both JP substring and English containment should fire,
+        # Both JP substring and translation containment should fire,
         # but the result should be deduplicated.
         config = GlossaryClusterConfig()
         pairs = generate_cluster_candidates(glossary, config)
@@ -983,7 +987,7 @@ class TestGenerateClusterCandidates:
         glossary = Glossary(
             entities=[
                 _make_entity(
-                    "c001", "character", "Abel", [{"source": "アベル", "english": "Abel"}]
+                    "c001", "character", "Abel", [{"source": "アベル", "translation": "Abel"}]
                 ),
             ]
         )
@@ -996,13 +1000,13 @@ class TestGenerateClusterCandidates:
         glossary = Glossary(
             entities=[
                 _make_entity(
-                    "z999", "character", "Abel", [{"source": "アベル", "english": "Abel"}]
+                    "z999", "character", "Abel", [{"source": "アベル", "translation": "Abel"}]
                 ),
                 _make_entity(
                     "a001",
                     "character",
                     "Abel-chan",
-                    [{"source": "アベルちゃん", "english": "Abel-chan"}],
+                    [{"source": "アベルちゃん", "translation": "Abel-chan"}],
                 ),
             ]
         )
@@ -1031,7 +1035,7 @@ class TestIterativeClustering:
             "character",
             "Abel",
             [
-                {"source": "アベル", "english": "Abel"},
+                {"source": "アベル", "translation": "Abel"},
             ],
         )
         b = _make_entity(
@@ -1039,7 +1043,7 @@ class TestIterativeClustering:
             "character",
             "Abel-chan",
             [
-                {"source": "アベルちゃん", "english": "Abel-chan"},
+                {"source": "アベルちゃん", "translation": "Abel-chan"},
             ],
         )
         c = _make_entity(
@@ -1047,7 +1051,7 @@ class TestIterativeClustering:
             "character",
             "Lord Abel",
             [
-                {"source": "アベル様", "english": "Lord Abel"},
+                {"source": "アベル様", "translation": "Lord Abel"},
             ],
         )
         glossary = Glossary(entities=[a, b, c])
@@ -1099,7 +1103,7 @@ class TestGlossaryClusterIntegration:
                     "character",
                     "Abel",
                     [
-                        {"source": "アベル", "english": "Abel"},
+                        {"source": "アベル", "translation": "Abel"},
                     ],
                     summary="A masked traveler.",
                 ),
@@ -1108,7 +1112,7 @@ class TestGlossaryClusterIntegration:
                     "character",
                     "Abel-chan",
                     [
-                        {"source": "アベルちゃん", "english": "Abel-chan"},
+                        {"source": "アベルちゃん", "translation": "Abel-chan"},
                     ],
                     summary="Abel with honorific.",
                 ),
@@ -1117,7 +1121,7 @@ class TestGlossaryClusterIntegration:
                     "place",
                     "Lugnica",
                     [
-                        {"source": "ルグニカ", "english": "Lugnica"},
+                        {"source": "ルグニカ", "translation": "Lugnica"},
                     ],
                 ),
             ]
@@ -1137,7 +1141,7 @@ class TestGlossaryClusterIntegration:
                     entity_id_b="character_000002",
                     same_entity=True,
                     preferred_entity_id="character_000001",
-                    preferred_canonical_english="Abel",
+                    preferred_canonical_name="Abel",
                     reasoning="Same character with honorific suffix.",
                 ),
             ]
@@ -1154,11 +1158,11 @@ class TestGlossaryClusterIntegration:
         abel = next(e for e in glossary.entities if e.entity_id == "character_000001")
         assert "アベル" in [sf.source for sf in abel.surface_forms]
         assert "アベルちゃん" in [sf.source for sf in abel.surface_forms]
-        assert abel.canonical_english == "Abel"
+        assert abel.canonical_name == "Abel"
 
         # Place entity untouched.
         lugnica = next(e for e in glossary.entities if e.entity_id == "place_000001")
-        assert lugnica.canonical_english == "Lugnica"
+        assert lugnica.canonical_name == "Lugnica"
 
     def test_no_merge_when_llm_says_not_same(self, tmp_path):
         """If LLM says not same_entity, no merge happens."""
@@ -1199,7 +1203,7 @@ class TestGlossaryClusterIntegration:
                     "character",
                     "Abel",
                     [
-                        {"source": "アベル", "english": "Abel"},
+                        {"source": "アベル", "translation": "Abel"},
                     ],
                 ),
                 _make_entity(
@@ -1207,7 +1211,7 @@ class TestGlossaryClusterIntegration:
                     "place",
                     "Lugnica",
                     [
-                        {"source": "ルグニカ", "english": "Lugnica"},
+                        {"source": "ルグニカ", "translation": "Lugnica"},
                     ],
                 ),
             ]
@@ -1235,7 +1239,7 @@ class TestGlossaryClusterIntegration:
                     entity_id_b="character_000002",
                     same_entity=True,
                     preferred_entity_id="character_000001",
-                    preferred_canonical_english="Abel",
+                    preferred_canonical_name="Abel",
                     reasoning="Same character with honorific.",
                 ),
             ]
@@ -1263,7 +1267,7 @@ class TestGlossaryClusterIntegration:
                     entity_id_b="character_000002",
                     same_entity=True,
                     preferred_entity_id="character_000001",
-                    preferred_canonical_english="Abel",
+                    preferred_canonical_name="Abel",
                     reasoning="Same character.",
                 ),
             ]
@@ -1343,7 +1347,7 @@ class TestGlossaryClusterIntegration:
                     entity_id_b="character_000002",
                     same_entity=True,
                     preferred_entity_id="character_000001",
-                    preferred_canonical_english="Abel",
+                    preferred_canonical_name="Abel",
                     reasoning="Same character.",
                 ),
             ]
@@ -1373,7 +1377,7 @@ class TestGlossaryClusterIntegration:
                     entity_id_b="character_000002",
                     same_entity=True,
                     preferred_entity_id="character_000001",
-                    preferred_canonical_english="Abel",
+                    preferred_canonical_name="Abel",
                     reasoning="Same character.",
                 ),
             ]
@@ -1400,7 +1404,7 @@ class TestGlossaryClusterIntegration:
                     entity_id_b="character_000002",
                     same_entity=True,
                     preferred_entity_id="character_000001",
-                    preferred_canonical_english="Abel",
+                    preferred_canonical_name="Abel",
                     reasoning="Same character.",
                 ),
             ]
@@ -1496,7 +1500,7 @@ class TestGlossaryClusterIntegration:
                     entity_id_b="character_000002",
                     same_entity=True,
                     preferred_entity_id="character_000001",
-                    preferred_canonical_english="Abel",
+                    preferred_canonical_name="Abel",
                     reasoning="Same character.",
                 ),
             ]
@@ -1543,7 +1547,7 @@ class TestGlossaryClusterIntegration:
                     entity_id_b="character_000002",
                     same_entity=True,
                     preferred_entity_id="character_000001",
-                    preferred_canonical_english="Abel",
+                    preferred_canonical_name="Abel",
                     reasoning="Same character.",
                 ),
             ]
@@ -1569,7 +1573,7 @@ class TestGlossaryClusterIntegration:
                     entity_id_b="character_000002",
                     same_entity=True,
                     preferred_entity_id="character_000001",
-                    preferred_canonical_english="Abel",
+                    preferred_canonical_name="Abel",
                     reasoning="Same character.",
                 ),
             ]
@@ -1602,7 +1606,7 @@ class TestGlossaryClusterIntegration:
                     entity_id_b="character_000002",
                     same_entity=True,
                     preferred_entity_id="character_000001",
-                    preferred_canonical_english="Abel",
+                    preferred_canonical_name="Abel",
                     reasoning="Same character.",
                 ),
             ]
@@ -1629,7 +1633,7 @@ class TestGlossaryClusterIntegration:
                     entity_id_b="character_000002",
                     same_entity=True,
                     preferred_entity_id="character_000001",
-                    preferred_canonical_english="Abel",
+                    preferred_canonical_name="Abel",
                     reasoning="Same character.",
                 ),
             ]
@@ -1671,9 +1675,9 @@ class TestRemapBuildMetaConflicts:
                 _ConflictRecord(
                     entity_id="c002",
                     source_form="アベル",
-                    current_english="Aberu",
+                    current_translation="Aberu",
                     alternatives=[
-                        {"english": "Abel", "context_snippet": "batch 2", "batch_id": "0001.b1"}
+                        {"translation": "Abel", "context_snippet": "batch 2", "batch_id": "0001.b1"}
                     ],
                 ),
             ]
@@ -1682,7 +1686,7 @@ class TestRemapBuildMetaConflicts:
 
         assert len(meta.conflicts) == 1
         assert meta.conflicts[0].entity_id == "c001"
-        assert meta.conflicts[0].alternatives[0]["english"] == "Abel"
+        assert meta.conflicts[0].alternatives[0]["translation"] == "Abel"
 
     def test_merge_duplicate_records(self):
         """When both winner and loser have conflict records, they are merged."""
@@ -1693,18 +1697,26 @@ class TestRemapBuildMetaConflicts:
                 _ConflictRecord(
                     entity_id="c001",
                     source_form="アベル",
-                    current_english="Abel",
+                    current_translation="Abel",
                     alternatives=[
-                        {"english": "Aberu", "context_snippet": "batch 1", "batch_id": "0000.b1"}
+                        {
+                            "translation": "Aberu",
+                            "context_snippet": "batch 1",
+                            "batch_id": "0000.b1",
+                        }
                     ],
                     category_variants=["character"],
                 ),
                 _ConflictRecord(
                     entity_id="c002",
                     source_form="アベル",
-                    current_english="Abel",
+                    current_translation="Abel",
                     alternatives=[
-                        {"english": "Abeel", "context_snippet": "batch 3", "batch_id": "0002.b1"}
+                        {
+                            "translation": "Abeel",
+                            "context_snippet": "batch 3",
+                            "batch_id": "0002.b1",
+                        }
                     ],
                     category_variants=["title"],
                 ),
@@ -1717,15 +1729,15 @@ class TestRemapBuildMetaConflicts:
         record = meta.conflicts[0]
         assert record.entity_id == "c001"
         # Both alternatives should be present.
-        alt_english = {a["english"] for a in record.alternatives}
-        assert "Aberu" in alt_english
-        assert "Abeel" in alt_english
+        alt_translations = {a["translation"] for a in record.alternatives}
+        assert "Aberu" in alt_translations
+        assert "Abeel" in alt_translations
         # Both category variants should be present.
         assert "character" in record.category_variants
         assert "title" in record.category_variants
 
     def test_dedup_alternatives_on_merge(self):
-        """Duplicate alternatives (same english) are not duplicated."""
+        """Duplicate alternatives (same translation) are not duplicated."""
         from dao_bridge.glossary import _BuildMeta, _ConflictRecord, _remap_build_meta_conflicts
 
         meta = _BuildMeta(
@@ -1733,17 +1745,25 @@ class TestRemapBuildMetaConflicts:
                 _ConflictRecord(
                     entity_id="c001",
                     source_form="アベル",
-                    current_english="Abel",
+                    current_translation="Abel",
                     alternatives=[
-                        {"english": "Aberu", "context_snippet": "batch 1", "batch_id": "0000.b1"}
+                        {
+                            "translation": "Aberu",
+                            "context_snippet": "batch 1",
+                            "batch_id": "0000.b1",
+                        }
                     ],
                 ),
                 _ConflictRecord(
                     entity_id="c002",
                     source_form="アベル",
-                    current_english="Abel",
+                    current_translation="Abel",
                     alternatives=[
-                        {"english": "Aberu", "context_snippet": "batch 2", "batch_id": "0001.b1"}
+                        {
+                            "translation": "Aberu",
+                            "context_snippet": "batch 2",
+                            "batch_id": "0001.b1",
+                        }
                     ],
                 ),
             ]
@@ -1763,7 +1783,7 @@ class TestRemapBuildMetaConflicts:
                 _ConflictRecord(
                     entity_id="c001",
                     source_form="アベル",
-                    current_english="Abel",
+                    current_translation="Abel",
                     alternatives=[],
                 ),
             ]
@@ -1796,19 +1816,19 @@ class TestBatchInternalMergeOrder:
                     "c001",
                     "character",
                     "Abel",
-                    [{"source": "アベル", "english": "Abel"}],
+                    [{"source": "アベル", "translation": "Abel"}],
                 ),
                 _make_entity(
                     "c002",
                     "character",
                     "Abel-chan",
-                    [{"source": "アベルちゃん", "english": "Abel-chan"}],
+                    [{"source": "アベルちゃん", "translation": "Abel-chan"}],
                 ),
                 _make_entity(
                     "c003",
                     "character",
                     "Lord Abel",
-                    [{"source": "アベル様", "english": "Lord Abel"}],
+                    [{"source": "アベル様", "translation": "Lord Abel"}],
                 ),
             ]
         )
@@ -1825,7 +1845,7 @@ class TestBatchInternalMergeOrder:
                     entity_id_b="c002",
                     same_entity=True,
                     preferred_entity_id="c001",
-                    preferred_canonical_english="Abel",
+                    preferred_canonical_name="Abel",
                     reasoning="Same character with honorific.",
                 ),
                 GlossaryClusterDecision(
@@ -1833,7 +1853,7 @@ class TestBatchInternalMergeOrder:
                     entity_id_b="c003",
                     same_entity=True,
                     preferred_entity_id="c001",
-                    preferred_canonical_english="Abel",
+                    preferred_canonical_name="Abel",
                     reasoning="Same character with honorific.",
                 ),
             ]
@@ -1873,25 +1893,25 @@ class TestBatchInternalMergeOrder:
                     "c001",
                     "character",
                     "Abel",
-                    [{"source": "アベル", "english": "Abel"}],
+                    [{"source": "アベル", "translation": "Abel"}],
                 ),
                 _make_entity(
                     "c002",
                     "character",
                     "Abel-chan",
-                    [{"source": "アベルちゃん", "english": "Abel-chan"}],
+                    [{"source": "アベルちゃん", "translation": "Abel-chan"}],
                 ),
                 _make_entity(
                     "c003",
                     "character",
                     "Abel-sama",
-                    [{"source": "アベル様", "english": "Abel-sama"}],
+                    [{"source": "アベル様", "translation": "Abel-sama"}],
                 ),
                 _make_entity(
                     "c004",
                     "character",
                     "Vincent Volakia",
-                    [{"source": "ヴィンセント・ヴォラキア", "english": "Vincent Volakia"}],
+                    [{"source": "ヴィンセント・ヴォラキア", "translation": "Vincent Volakia"}],
                 ),
             ]
         )
@@ -1906,7 +1926,7 @@ class TestBatchInternalMergeOrder:
                     entity_id_b="c002",
                     same_entity=True,
                     preferred_entity_id="c001",
-                    preferred_canonical_english="Abel",
+                    preferred_canonical_name="Abel",
                     reasoning="Same character with honorific.",
                 ),
                 GlossaryClusterDecision(
@@ -1914,7 +1934,7 @@ class TestBatchInternalMergeOrder:
                     entity_id_b="c003",
                     same_entity=True,
                     preferred_entity_id="c001",
-                    preferred_canonical_english="Abel",
+                    preferred_canonical_name="Abel",
                     reasoning="Same character with honorific.",
                 ),
                 GlossaryClusterDecision(
@@ -1922,7 +1942,7 @@ class TestBatchInternalMergeOrder:
                     entity_id_b="c004",
                     same_entity=True,
                     preferred_entity_id="c004",
-                    preferred_canonical_english="Vincent Volakia",
+                    preferred_canonical_name="Vincent Volakia",
                     reasoning="True identity is Vincent.",
                 ),
             ]
@@ -1939,7 +1959,7 @@ class TestBatchInternalMergeOrder:
         # D (c004) was preferred for the last merge, so it should be the
         # winner — meaning c004 is the surviving entity_id.
         assert survivor.entity_id == "c004"
-        assert survivor.canonical_english == "Vincent Volakia"
+        assert survivor.canonical_name == "Vincent Volakia"
         # All surface forms present.
         sources = {sf.source for sf in survivor.surface_forms}
         assert "アベル" in sources
@@ -1960,13 +1980,13 @@ class TestBatchInternalMergeOrder:
                     "c001",
                     "character",
                     "Abel",
-                    [{"source": "アベル", "english": "Abel"}],
+                    [{"source": "アベル", "translation": "Abel"}],
                 ),
                 _make_entity(
                     "c002",
                     "character",
                     "Abel-chan",
-                    [{"source": "アベルちゃん", "english": "Abel-chan"}],
+                    [{"source": "アベルちゃん", "translation": "Abel-chan"}],
                 ),
             ]
         )
@@ -1980,7 +2000,7 @@ class TestBatchInternalMergeOrder:
                     entity_id_b="c002",
                     same_entity=True,
                     preferred_entity_id="c999",  # bogus ID
-                    preferred_canonical_english="Abel",
+                    preferred_canonical_name="Abel",
                     reasoning="Same character.",
                 ),
             ]
@@ -2001,51 +2021,51 @@ class TestBatchInternalMergeOrder:
 
 
 # ---------------------------------------------------------------------------
-# Issue 5: english_variants in merge
+# Issue 5: translation_variants in merge
 # ---------------------------------------------------------------------------
 
 
-class TestEnglishVariantsMerge:
-    """Conflicting English on same source goes to english_variants, not context_hints."""
+class TestTranslationVariantsMerge:
+    """Conflicting translation on same source goes to translation_variants, not context_hints."""
 
-    def test_english_variant_stored(self):
-        """Alternate English is stored in english_variants, not context_hints."""
+    def test_translation_variant_stored(self):
+        """Alternate translation is stored in translation_variants, not context_hints."""
         winner = _make_entity(
             "c001",
             "character",
             "Abel",
-            [{"source": "アベル", "english": "Abel"}],
+            [{"source": "アベル", "translation": "Abel"}],
         )
         loser = _make_entity(
             "c002",
             "character",
             "Aberu",
-            [{"source": "アベル", "english": "Aberu"}],
+            [{"source": "アベル", "translation": "Aberu"}],
         )
         merge_entities(winner, loser)
         sf = winner.surface_forms[0]
-        assert "Aberu" in sf.english_variants
+        assert "Aberu" in sf.translation_variants
         # Should NOT be in context_hints.
-        assert not any("alternate English" in h for h in sf.context_hints)
+        assert not any("alternate translation" in h for h in sf.context_hints)
 
-    def test_english_variants_union_from_loser(self):
-        """Loser's existing english_variants are also carried over."""
+    def test_translation_variants_union_from_loser(self):
+        """Loser's existing translation_variants are also carried over."""
         winner = _make_entity(
             "c001",
             "character",
             "Abel",
-            [{"source": "アベル", "english": "Abel"}],
+            [{"source": "アベル", "translation": "Abel"}],
         )
         loser = _make_entity(
             "c002",
             "character",
             "Aberu",
-            [{"source": "アベル", "english": "Aberu", "english_variants": ["Abell"]}],
+            [{"source": "アベル", "translation": "Aberu", "translation_variants": ["Abell"]}],
         )
         merge_entities(winner, loser)
         sf = winner.surface_forms[0]
-        assert "Aberu" in sf.english_variants
-        assert "Abell" in sf.english_variants
+        assert "Aberu" in sf.translation_variants
+        assert "Abell" in sf.translation_variants
 
     def test_no_duplicate_variants(self):
         """Same variant is not added twice."""
@@ -2053,38 +2073,38 @@ class TestEnglishVariantsMerge:
             "c001",
             "character",
             "Abel",
-            [{"source": "アベル", "english": "Abel", "english_variants": ["Aberu"]}],
+            [{"source": "アベル", "translation": "Abel", "translation_variants": ["Aberu"]}],
         )
         loser = _make_entity(
             "c002",
             "character",
             "Aberu",
-            [{"source": "アベル", "english": "Aberu"}],
+            [{"source": "アベル", "translation": "Aberu"}],
         )
         merge_entities(winner, loser)
         sf = winner.surface_forms[0]
-        assert sf.english_variants.count("Aberu") == 1
+        assert sf.translation_variants.count("Aberu") == 1
 
-    def test_winner_english_not_added_as_variant(self):
-        """The winner's own English is not added to english_variants."""
+    def test_winner_name_not_added_as_variant(self):
+        """The winner's own translation is not added to translation_variants."""
         winner = _make_entity(
             "c001",
             "character",
             "Abel",
-            [{"source": "アベル", "english": "Abel"}],
+            [{"source": "アベル", "translation": "Abel"}],
         )
         loser = _make_entity(
             "c002",
             "character",
             "Abel copy",
-            [{"source": "アベル", "english": "Abel", "english_variants": ["Aberu"]}],
+            [{"source": "アベル", "translation": "Abel", "translation_variants": ["Aberu"]}],
         )
         merge_entities(winner, loser)
         sf = winner.surface_forms[0]
-        # "Abel" should not appear in variants (it IS the english).
-        assert "Abel" not in sf.english_variants
+        # "Abel" should not appear in variants (it IS the translation).
+        assert "Abel" not in sf.translation_variants
         # "Aberu" should be carried over from loser.
-        assert "Aberu" in sf.english_variants
+        assert "Aberu" in sf.translation_variants
 
 
 # ---------------------------------------------------------------------------
@@ -2109,7 +2129,7 @@ class TestClusterForceResetsDownstreamState:
                     "c001",
                     "character",
                     "Abel",
-                    [{"source": "アベル", "english": "Abel"}],
+                    [{"source": "アベル", "translation": "Abel"}],
                 ),
             ]
         )

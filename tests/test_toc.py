@@ -256,7 +256,7 @@ def _make_config(**overrides):
         },
         "output": {
             "epub_path": "./book.en.epub",
-            "title_suffix": " (English Translation)",
+            "title_suffix": None,
             "new_identifier": False,
             "css": "original",
             "add_translation_note": True,
@@ -461,8 +461,8 @@ class TestTranslateTitles:
                 GlossaryEntity(
                     entity_id="character_000001",
                     category="character",
-                    canonical_english="Subaru",
-                    surface_forms=[SurfaceForm(source="スバル", english="Subaru")],
+                    canonical_name="Subaru",
+                    surface_forms=[SurfaceForm(source="スバル", translation="Subaru")],
                     source="extracted",
                 ),
             ]
@@ -815,22 +815,22 @@ class TestRenderGlossaryForToc:
                 GlossaryEntity(
                     entity_id="character_000001",
                     category="character",
-                    canonical_english="Subaru",
-                    surface_forms=[SurfaceForm(source="スバル", english="Subaru")],
+                    canonical_name="Subaru",
+                    surface_forms=[SurfaceForm(source="スバル", translation="Subaru")],
                     source="extracted",
                 ),
                 GlossaryEntity(
                     entity_id="place_000001",
                     category="place",
-                    canonical_english="Lugunica",
-                    surface_forms=[SurfaceForm(source="ルグニカ", english="Lugunica")],
+                    canonical_name="Lugunica",
+                    surface_forms=[SurfaceForm(source="ルグニカ", translation="Lugunica")],
                     source="extracted",
                 ),
                 GlossaryEntity(
                     entity_id="concept_000001",
                     category="concept",
-                    canonical_english="mana",
-                    surface_forms=[SurfaceForm(source="マナ", english="mana")],
+                    canonical_name="mana",
+                    surface_forms=[SurfaceForm(source="マナ", translation="mana")],
                     source="extracted",
                 ),
             ]
@@ -856,15 +856,15 @@ class TestRenderGlossaryForToc:
                 GlossaryEntity(
                     entity_id="character_000001",
                     category="character",
-                    canonical_english="Subaru",
-                    surface_forms=[SurfaceForm(source="スバル", english="Subaru")],
+                    canonical_name="Subaru",
+                    surface_forms=[SurfaceForm(source="スバル", translation="Subaru")],
                     source="extracted",
                 ),
                 GlossaryEntity(
                     entity_id="concept_000001",
                     category="concept",
-                    canonical_english="mana",
-                    surface_forms=[SurfaceForm(source="マナ", english="mana")],
+                    canonical_name="mana",
+                    surface_forms=[SurfaceForm(source="マナ", translation="mana")],
                     source="extracted",
                 ),
             ]
@@ -884,15 +884,15 @@ class TestRenderGlossaryForToc:
                 GlossaryEntity(
                     entity_id="character_000001",
                     category="character",
-                    canonical_english="Subaru",
-                    surface_forms=[SurfaceForm(source="スバル", english="Subaru")],
+                    canonical_name="Subaru",
+                    surface_forms=[SurfaceForm(source="スバル", translation="Subaru")],
                     source="extracted",
                 ),
                 GlossaryEntity(
                     entity_id="concept_000001",
                     category="concept",
-                    canonical_english="mana",
-                    surface_forms=[SurfaceForm(source="マナ", english="mana")],
+                    canonical_name="mana",
+                    surface_forms=[SurfaceForm(source="マナ", translation="mana")],
                     source="extracted",
                 ),
             ]

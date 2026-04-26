@@ -5,10 +5,10 @@ Choose the single best {target_language} rendering for this exact source text.
 Source term: {source_term}
 Reading: {reading}
 
-Candidate translations: {current_english}, {alternatives}
+Candidate translations: {current_translation}, {alternatives}
 
 Consider: accuracy of transliteration, established fan or official conventions, consistency with the glossary, and which rendering best fits this exact source term. If the source term is a name intentionally using a romanized English word, prefer that standard English word over a phonetic respelling.
 
 Return JSON with exactly these fields:
-- "chosen_english": the single best {target_language} translation
+- "chosen_translation": the single best {target_language} translation
 - "reasoning": brief explanation of your choice

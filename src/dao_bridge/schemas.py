@@ -101,18 +101,18 @@ GlossarySource = Literal["seed", "extracted", "user", "master"]
 class SurfaceForm(BaseModel):
     """A source-language text form that refers to an entity.
 
-    Each surface form carries its own English rendering.  For example,
-    ``アベル → Abel`` and ``ヴィンセント・ヴォラキア皇帝 → Emperor Vincent
-    Volakia`` may both belong to the same :class:`GlossaryEntity`, but
-    they translate differently depending on which form appears in the
+    Each surface form carries its own target-language translation.  For
+    example, ``アベル → Abel`` and ``ヴィンセント・ヴォラキア皇帝 → Emperor
+    Vincent Volakia`` may both belong to the same :class:`GlossaryEntity`,
+    but they translate differently depending on which form appears in the
     source text.
     """
 
     source: str  # The source-language string, e.g. "アベル"
     reading: str | None = None  # From furigana, if available
-    english: str  # English rendering for THIS specific form
-    english_variants: list[str] = Field(default_factory=list)
-    # Alternate English renderings discovered during clustering merges.
+    translation: str  # Target-language rendering for THIS specific form
+    translation_variants: list[str] = Field(default_factory=list)
+    # Alternate translations discovered during clustering merges.
     # Reconcile inspects these to resolve translation conflicts.
     context_hints: list[str] = Field(default_factory=list)
     notes: str | None = None
@@ -125,14 +125,14 @@ class GlossaryEntity(BaseModel):
 
     An entity owns a pool of :class:`SurfaceForm` objects — all the
     source-language strings that refer to this person, place, item, or
-    concept.  The *canonical_english* is the primary name used in
+    concept.  The *canonical_name* is the primary name used in
     reports and logs; individual surface forms carry their own per-form
-    English renderings for translation.
+    translations.
     """
 
     entity_id: str  # Stable slug, e.g. "character_000012"
     category: str  # Validated against config.glossary.categories
-    canonical_english: str  # Primary English name, e.g. "Abel"
+    canonical_name: str  # Primary target-language name, e.g. "Abel"
     summary: str | None = None  # Accumulated understanding of this entity
     surface_forms: list[SurfaceForm] = Field(default_factory=list)
 
@@ -174,7 +174,7 @@ class ExtractedMention(BaseModel):
 
     source: str  # Exact source-language term as written
     reading: str | None = None  # Pronunciation from furigana, else null
-    english: str  # Proposed English rendering for this form
+    translation: str  # Proposed target-language rendering for this form
     category: str  # One of the allowed categories
     summary_update: str | None = None  # Concise sentence about what this entity appears to be
     context_hint: str | None = None  # Low-confidence hint, e.g. "same person as アベル"
@@ -187,9 +187,9 @@ class ExtractedMention(BaseModel):
 class GlossaryCorrectionEntry(BaseModel):
     """A correction proposed by the LLM during glossary extraction."""
 
-    existing_english: str
+    existing_translation: str
     source_term: str
-    corrected_english: str
+    corrected_translation: str
     reason: str
 
 
@@ -203,7 +203,7 @@ class GlossaryExtractionResponse(BaseModel):
 class GlossaryReconcileResponse(BaseModel):
     """LLM response for resolving a term conflict."""
 
-    chosen_english: str
+    chosen_translation: str
     reasoning: str
 
 
@@ -220,7 +220,7 @@ class GlossaryClusterDecision(BaseModel):
     entity_id_b: str
     same_entity: bool
     preferred_entity_id: str | None = None
-    preferred_canonical_english: str | None = None
+    preferred_canonical_name: str | None = None
     reasoning: str
 
 
@@ -245,7 +245,7 @@ class TranslatedChunk(BaseModel):
     """Output of the translation stage for one chunk."""
 
     chunk_id: str
-    source_text: str  # copy of Japanese source
+    source_text: str  # copy of source-language text
     pass1_translation: str  # Pass 1 output, kept for debugging
     pass1_analysis: str | None = None  # <analysis> block from Pass 1 (stripped from translation)
     translated_text: str  # final: Pass 2 if double_pass, else Pass 1

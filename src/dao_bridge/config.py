@@ -209,7 +209,7 @@ class OutputConfig(BaseModel):
     """EPUB output parameters."""
 
     epub_path: str = "./book.en.epub"
-    title_suffix: str = " (English Translation)"
+    title_suffix: str | None = None  # Auto-generated from target language when None
     new_identifier: bool = False
     css: Literal["original", "default"] = "original"
     add_translation_note: bool = True

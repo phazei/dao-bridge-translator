@@ -4,7 +4,7 @@ A term was extracted from multiple sections of a novel and received different pr
 
 Source term: {source_term}
 Reading: {reading}
-Current translation: {current_english}
+Current translation: {current_translation}
 
 Alternative translations proposed in different sections:
 {alternatives}
@@ -12,5 +12,5 @@ Alternative translations proposed in different sections:
 Consider: accuracy of transliteration, established fan/official conventions, full name vs partial name, and consistency with the rest of the glossary.
 
 Return JSON with exactly these fields:
-- "chosen_english": the single best {target_language} translation
+- "chosen_translation": the single best {target_language} translation
 - "reasoning": brief explanation of your choice

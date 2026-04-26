@@ -99,8 +99,8 @@ def _make_glossary(entities: list[GlossaryEntity] | None = None) -> Glossary:
             GlossaryEntity(
                 entity_id="character_000001",
                 category="character",
-                canonical_english="Natsuki Subaru",
-                surface_forms=[SurfaceForm(source="ナツキ・スバル", english="Natsuki Subaru")],
+                canonical_name="Natsuki Subaru",
+                surface_forms=[SurfaceForm(source="ナツキ・スバル", translation="Natsuki Subaru")],
                 speech_style="Speaks casually, modern slang.",
                 nicknames={"Ram": "Barusu"},
                 source="extracted",
@@ -108,8 +108,8 @@ def _make_glossary(entities: list[GlossaryEntity] | None = None) -> Glossary:
             GlossaryEntity(
                 entity_id="place_000001",
                 category="place",
-                canonical_english="Guaral",
-                surface_forms=[SurfaceForm(source="グァラル", english="Guaral")],
+                canonical_name="Guaral",
+                surface_forms=[SurfaceForm(source="グァラル", translation="Guaral")],
                 notes="fortress city in Vollachia",
                 source="extracted",
             ),
@@ -352,7 +352,7 @@ class TestRenderGlossary:
             GlossaryEntity(
                 entity_id="term_000001",
                 category="term",
-                canonical_english="Test Term",
+                canonical_name="Test Term",
                 surface_forms=[],
                 source="seed",
             ),

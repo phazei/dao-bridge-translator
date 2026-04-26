@@ -6,7 +6,7 @@ Four-stage glossary pipeline:
    from chunked source text via batched LLM calls.  Links each mention to
    an existing entity or creates a new one.  Accumulates a per-book
    glossary, saving after each batch for resumability.
-2. **Cluster** *(PR 2)* — finds duplicate entities that build-time linking
+2. **Cluster** — finds duplicate entities that build-time linking
    missed and merges them with LLM confirmation.
 3. **Reconcile** — resolves within-book conflicts (differing English
    proposals, corrections, category mismatches) and consolidates multiple
@@ -1375,6 +1375,356 @@ def glossary_build(
 
 
 # ---------------------------------------------------------------------------
+# glossary_cluster
+# ---------------------------------------------------------------------------
+
+
+def glossary_cluster(
+    work_dir: Path,
+    config: AppConfig,
+    state: PipelineState,
+    *,
+    force: bool = False,
+    retry_failed: bool = False,
+    on_progress: Callable[[str], None] | None = None,
+) -> Glossary:
+    """Find and merge duplicate entities that build-time linking missed.
+
+    Iteratively generates candidate entity pairs using deterministic
+    heuristics (substring containment, English containment, shared
+    reading, alias overlap, Jaro-Winkler similarity), then sends each
+    batch of candidates to the LLM for confirmation.  Confirmed pairs
+    are merged and the glossary is saved after each batch.
+
+    Candidate pairs are recomputed fresh each iteration — merges in one
+    iteration may create new heuristic matches (e.g. merging A + B
+    exposes a substring match to C).  Iterations are capped by
+    ``config.glossary.cluster.max_iterations``.
+
+    Writes a clustering report to ``<work_dir>/glossary_cluster_report.md``.
+
+    Parameters
+    ----------
+    work_dir:
+        Resolved work directory.
+    config:
+        Application configuration.
+    state:
+        Pipeline state (mutated in place).
+    force:
+        If *True*, reset and cluster from scratch.
+    retry_failed:
+        If *True*, re-enter a completed stage to retry only failed items.
+        Preserves completed item state (unlike ``force``).
+    on_progress:
+        Optional callback invoked with the item ID after each batch
+        is processed.
+
+    Returns
+    -------
+    Glossary
+        The updated glossary with duplicate entities merged.
+    """
+    from dao_bridge.glossary_clustering import (
+        generate_cluster_candidates,
+        merge_entities,
+        remap_entity_id,
+        render_entity_for_cluster_prompt,
+        write_cluster_report,
+    )
+    from dao_bridge.schemas import GlossaryClusterResponse
+
+    stage = "glossary_cluster"
+
+    # Gate: glossary_build stage must be completed.
+    if not is_stage_completed(state, "glossary_build"):
+        raise RuntimeError(
+            "Glossary build stage not completed. Run 'dao-bridge glossary-build' first."
+        )
+
+    # Handle force / already-completed.
+    if force:
+        reset_stage(work_dir, state, stage)
+
+    # Handle --retry-failed: re-open a completed stage without wiping items.
+    if retry_failed and not force:
+        reopen_stage(work_dir, state, stage)
+
+    if not force and not retry_failed and is_stage_completed(state, stage):
+        logger.info("Glossary cluster already completed — skipping (use --force to re-run)")
+        return _load_glossary(work_dir)
+
+    # Load glossary and validate categories.
+    glossary = _load_glossary(work_dir)
+    validate_glossary_categories(glossary, config.glossary.categories)
+
+    mark_stage_started(work_dir, state, stage)
+
+    cluster_config = config.glossary.cluster
+    batch_size = cluster_config.batch_size
+
+    # Resolve language names for the prompt.
+    source_lang = resolve_language_name(config.languages.source)
+    target_lang = resolve_language_name(config.languages.target)
+
+    # Load prompt template.
+    template = _load_prompt_template("glossary_cluster.txt")
+
+    # Lazy LLM client.
+    _llm_client: LLMClient | None = None
+
+    def _get_llm_client() -> LLMClient:
+        nonlocal _llm_client
+        if _llm_client is None:
+            _llm_client = LLMClient(config.models.glossary, config.llm)
+        return _llm_client
+
+    # Tracking for the report.
+    merge_log: list[dict] = []
+    total_candidates_evaluated = 0
+
+    # Entity ID lookup helper.
+    def _entity_by_id(eid: str) -> GlossaryEntity | None:
+        for entity in glossary.entities:
+            if entity.entity_id == eid:
+                return entity
+        return None
+
+    # Iterative clustering loop.
+    iteration = 0
+    for iteration in range(1, cluster_config.max_iterations + 1):
+        # Generate candidates fresh each iteration.
+        candidates = generate_cluster_candidates(glossary, cluster_config)
+
+        if not candidates:
+            logger.debug("Clustering iteration %d: no candidates — stopping early", iteration)
+            break
+
+        # Sort for deterministic processing order.
+        candidate_list = sorted(candidates)
+
+        # Split into batches.
+        batches: list[list[tuple[str, str]]] = []
+        for start in range(0, len(candidate_list), batch_size):
+            batches.append(candidate_list[start : start + batch_size])
+
+        merges_this_iteration = 0
+        # ID remap table for this iteration: absorbed_id -> surviving_id.
+        id_map: dict[str, str] = {}
+
+        for batch_idx, batch_pairs in enumerate(batches, 1):
+            item_id = f"iter{iteration}.batch{batch_idx}"
+
+            # Check if already completed (for resumability).
+            pending = iter_pending_items(state, stage, [item_id])
+            if not pending:
+                if on_progress:
+                    on_progress(item_id)
+                continue
+
+            mark_item_started(work_dir, state, stage, item_id)
+
+            try:
+                # Remap entity IDs in case earlier batches in this
+                # iteration already merged some of these entities.
+                raw_decisions = [(a, b, None) for a, b in batch_pairs]
+                remapped = remap_entity_id(raw_decisions, id_map)
+                # Rebuild pairs after remapping, dropping self-merges.
+                active_pairs = [(a, b) for a, b, _ in remapped]
+
+                if not active_pairs:
+                    mark_item_completed(work_dir, state, stage, item_id)
+                    if on_progress:
+                        on_progress(item_id)
+                    continue
+
+                # Build prompt with entity pair renderings.
+                pair_texts: list[str] = []
+                for pair_idx, (eid_a, eid_b) in enumerate(active_pairs, 1):
+                    ea = _entity_by_id(eid_a)
+                    eb = _entity_by_id(eid_b)
+                    if ea is None or eb is None:
+                        continue
+                    pair_texts.append(
+                        f"--- Pair {pair_idx} ---\n"
+                        f"Entity A:\n{render_entity_for_cluster_prompt(ea)}\n\n"
+                        f"Entity B:\n{render_entity_for_cluster_prompt(eb)}"
+                    )
+
+                if not pair_texts:
+                    mark_item_completed(work_dir, state, stage, item_id)
+                    if on_progress:
+                        on_progress(item_id)
+                    continue
+
+                entity_pairs_str = "\n\n".join(pair_texts)
+                prompt = template.format(
+                    source_language=source_lang,
+                    target_language=target_lang,
+                    entity_pairs=entity_pairs_str,
+                )
+
+                # Call LLM.
+                messages = [{"role": "user", "content": prompt}]
+                client = _get_llm_client()
+                response = client.complete_json(
+                    messages,
+                    response_model=GlossaryClusterResponse,
+                    context_label=f"cluster.{item_id}",
+                )
+                total_candidates_evaluated += len(active_pairs)
+
+                # Collect confirmed merge decisions.
+                merge_decisions: list[tuple[str, str, str | None]] = []
+                for decision in response.decisions:
+                    if not decision.same_entity:
+                        continue
+                    merge_decisions.append(
+                        (
+                            decision.entity_id_a,
+                            decision.entity_id_b,
+                            decision.preferred_canonical_english,
+                        )
+                    )
+
+                # Apply remapping to the LLM's decisions in case the
+                # LLM returned IDs that were already absorbed.
+                merge_decisions = remap_entity_id(merge_decisions, id_map)
+
+                # Execute merges.
+                for eid_a, eid_b, pref_english in merge_decisions:
+                    ea = _entity_by_id(eid_a)
+                    eb = _entity_by_id(eid_b)
+                    if ea is None or eb is None:
+                        logger.warning(
+                            "Cluster merge skipped: entity %s or %s not found",
+                            eid_a,
+                            eid_b,
+                        )
+                        continue
+
+                    # Determine winner — look for preferred_entity_id
+                    # in the original LLM decisions.
+                    winner, loser = ea, eb
+                    preferred_id = None
+                    for dec in response.decisions:
+                        if dec.same_entity and (
+                            {dec.entity_id_a, dec.entity_id_b} == {eid_a, eid_b}
+                            or {dec.entity_id_a, dec.entity_id_b}
+                            == {
+                                _reverse_lookup(eid_a, id_map, eid_a),
+                                _reverse_lookup(eid_b, id_map, eid_b),
+                            }
+                        ):
+                            preferred_id = dec.preferred_entity_id
+                            break
+
+                    if preferred_id and preferred_id == eb.entity_id:
+                        winner, loser = eb, ea
+
+                    # Record surface forms being added before merge.
+                    existing_sources = {sf.source for sf in winner.surface_forms}
+                    new_sf_labels = [
+                        f"`{sf.source}` -> {sf.english}"
+                        for sf in loser.surface_forms
+                        if sf.source not in existing_sources
+                    ]
+
+                    # Find the reasoning from the LLM.
+                    reasoning = ""
+                    for dec in response.decisions:
+                        if dec.same_entity and {dec.entity_id_a, dec.entity_id_b} & {
+                            eid_a,
+                            eid_b,
+                        }:
+                            reasoning = dec.reasoning
+                            break
+
+                    merge_entities(winner, loser, pref_english)
+                    glossary.entities.remove(loser)
+
+                    # Update ID remap table.
+                    id_map[loser.entity_id] = winner.entity_id
+
+                    merge_log.append(
+                        {
+                            "winner_id": winner.entity_id,
+                            "loser_id": loser.entity_id,
+                            "winner_english": winner.canonical_english,
+                            "loser_english": loser.canonical_english
+                            if loser.canonical_english != winner.canonical_english
+                            else pref_english or loser.canonical_english,
+                            "result_english": winner.canonical_english,
+                            "reasoning": reasoning,
+                            "surface_forms_added": new_sf_labels,
+                        }
+                    )
+
+                    merges_this_iteration += 1
+
+                # Save after each batch.
+                _save_glossary(work_dir, glossary)
+                mark_item_completed(work_dir, state, stage, item_id)
+
+                logger.debug(
+                    "Cluster %s: %d pairs evaluated, %d merges",
+                    item_id,
+                    len(active_pairs),
+                    sum(1 for d in response.decisions if d.same_entity),
+                )
+
+            except LLMStructuredOutputError as exc:
+                logger.error("Structured output failed for cluster %s: %s", item_id, exc)
+                mark_item_failed(work_dir, state, stage, item_id, str(exc))
+                _save_glossary(work_dir, glossary)
+                raise
+            except Exception as exc:
+                logger.error("Unexpected error in cluster %s: %s", item_id, exc)
+                mark_item_failed(work_dir, state, stage, item_id, str(exc))
+                _save_glossary(work_dir, glossary)
+                raise
+
+            if on_progress:
+                on_progress(item_id)
+
+        logger.info(
+            "Clustering iteration %d: %d candidates, %d merges",
+            iteration,
+            len(candidate_list),
+            merges_this_iteration,
+        )
+
+        # If no merges happened this iteration, further iterations will
+        # produce the same candidates — stop early.
+        if merges_this_iteration == 0:
+            break
+
+    # Write clustering report.
+    report_path = work_dir / "glossary_cluster_report.md"
+    write_cluster_report(report_path, merge_log, iteration, total_candidates_evaluated)
+
+    # Mark stage completed.
+    mark_stage_completed(work_dir, state, stage)
+
+    logger.info(
+        "Glossary cluster complete: %d merges across %d iterations, %d entities remaining",
+        len(merge_log),
+        iteration,
+        len(glossary.entities),
+    )
+
+    return glossary
+
+
+def _reverse_lookup(target: str, id_map: dict[str, str], default: str) -> str:
+    """Find a key in *id_map* that maps to *target*, or return *default*."""
+    for k, v in id_map.items():
+        if v == target:
+            return k
+    return default
+
+
+# ---------------------------------------------------------------------------
 # glossary_reconcile
 # ---------------------------------------------------------------------------
 
@@ -1421,10 +1771,10 @@ def glossary_reconcile(
     """
     stage = "glossary_reconcile"
 
-    # Gate: glossary_build stage must be completed.
-    if not is_stage_completed(state, "glossary_build"):
+    # Gate: glossary_cluster stage must be completed.
+    if not is_stage_completed(state, "glossary_cluster"):
         raise RuntimeError(
-            "Glossary build stage not completed. Run 'dao-bridge glossary-build' first."
+            "Glossary cluster stage not completed. Run 'dao-bridge glossary-cluster' first."
         )
 
     # Handle force / already-completed.

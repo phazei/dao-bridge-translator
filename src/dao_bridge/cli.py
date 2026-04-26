@@ -833,6 +833,65 @@ def glossary_build_cmd(
 
 
 # ---------------------------------------------------------------------------
+# glossary-cluster
+# ---------------------------------------------------------------------------
+
+
+@cli.command("glossary-cluster")
+@click.option(
+    "--work-dir", type=click.Path(exists=True), default="./work", help="Work directory path."
+)
+@click.option("--force", is_flag=True, help="Re-cluster from scratch.")
+@click.option(
+    "--retry-failed",
+    is_flag=True,
+    help="Re-enter a completed stage to retry only failed batches.",
+)
+@click.pass_context
+def glossary_cluster_cmd(
+    ctx: click.Context, work_dir: str, force: bool, retry_failed: bool
+) -> None:
+    """Find and merge duplicate glossary entities via LLM confirmation.
+
+    Generates candidate entity pairs using deterministic heuristics
+    (substring containment, English containment, shared reading, alias
+    overlap, Jaro-Winkler similarity) and sends them to the LLM for
+    confirmation.  Iterates until no new candidates are found or the
+    iteration cap is reached.
+
+    Writes a clustering report to glossary_cluster_report.md.
+
+    Requires: glossary-build stage completed.
+    """
+    if force and retry_failed:
+        raise click.ClickException("--force and --retry-failed are mutually exclusive.")
+
+    work = Path(work_dir).resolve()
+    setup_logging(work, ctx.obj["verbose"])
+    config = _resolve_config(work)
+    state = load_state(work)
+
+    from rich.progress import Progress
+
+    from dao_bridge.glossary import glossary_cluster
+
+    with Progress(transient=True) as progress:
+        task = progress.add_task("Clustering glossary entities...", total=None)
+
+        glossary = glossary_cluster(
+            work,
+            config,
+            state,
+            force=force,
+            retry_failed=retry_failed,
+            on_progress=lambda _: progress.advance(task),
+        )
+
+    click.echo(f"Glossary cluster complete: {len(glossary.entities)} entities.")
+    click.echo(f"Report: {work / 'glossary_cluster_report.md'}")
+
+
+# ---------------------------------------------------------------------------
 # glossary-reconcile
 # ---------------------------------------------------------------------------
 
@@ -857,7 +916,7 @@ def glossary_reconcile_cmd(
     and consolidates multiple speech-style observations per character.
     Writes a reconciliation report to glossary_reconcile_report.md.
 
-    Requires: glossary-build stage completed.
+    Requires: glossary-cluster stage completed.
     """
     if force and retry_failed:
         raise click.ClickException("--force and --retry-failed are mutually exclusive.")
@@ -1099,7 +1158,7 @@ def run(ctx: click.Context, work_dir: str, force: bool, retry_failed: bool) -> N
     """Run the full translation pipeline.
 
     Chains: extract -> clean -> classify -> chunk -> glossary-build ->
-    glossary-reconcile -> translate -> assemble -> rebuild.
+    glossary-cluster -> glossary-reconcile -> translate -> assemble -> rebuild.
 
     Each stage skips completed work unless --force is passed.
     Use --retry-failed to re-enter completed stages and retry only
@@ -1195,7 +1254,16 @@ def run(ctx: click.Context, work_dir: str, force: bool, retry_failed: bool) -> N
 
     _run_stage("glossary-build", _glossary_build)
 
-    # --- Stage 6: glossary-reconcile ---
+    # --- Stage 6: glossary-cluster ---
+    def _glossary_cluster():
+        from dao_bridge.glossary import glossary_cluster
+
+        glossary = glossary_cluster(work, config, state, force=force, retry_failed=retry_failed)
+        click.echo(f"  {len(glossary.entities)} entities (after clustering)")
+
+    _run_stage("glossary-cluster", _glossary_cluster)
+
+    # --- Stage 7: glossary-reconcile ---
     def _glossary_reconcile():
         from dao_bridge.glossary import glossary_reconcile
 
@@ -1204,12 +1272,12 @@ def run(ctx: click.Context, work_dir: str, force: bool, retry_failed: bool) -> N
 
     _run_stage("glossary-reconcile", _glossary_reconcile)
 
-    # --- Stage 6b: glossary-crosscheck (skip with warning if not implemented) ---
+    # --- Stage 7b: glossary-crosscheck (skip with warning if not implemented) ---
     if config.glossary.master_glossary_path and config.glossary.crosscheck.enabled:
         click.echo("=== glossary-crosscheck ===")
         click.echo("  WARNING: glossary-crosscheck is not yet implemented, skipping.")
 
-    # --- Stage 7: translate ---
+    # --- Stage 8: translate ---
     def _translate():
         # Re-load manifest in case chunk stage updated it.
         nonlocal manifest

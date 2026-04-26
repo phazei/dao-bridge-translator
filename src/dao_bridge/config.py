@@ -101,6 +101,17 @@ class ChunkingConfig(BaseModel):
 # ---------------------------------------------------------------------------
 
 
+class GlossaryClusterConfig(BaseModel):
+    """Glossary clustering sub-config."""
+
+    max_iterations: int = 3
+    """Maximum candidate-generation / merge iterations before stopping."""
+    jw_threshold: float = 0.75
+    """Jaro-Winkler similarity threshold for candidate pair generation."""
+    batch_size: int = 10
+    """Number of candidate pairs per LLM confirmation call."""
+
+
 class GlossaryCrosscheckConfig(BaseModel):
     """Glossary crosscheck sub-config."""
 
@@ -144,6 +155,7 @@ class GlossaryConfig(BaseModel):
         ),
     )
     master_glossary_path: str | None = None
+    cluster: GlossaryClusterConfig = Field(default_factory=GlossaryClusterConfig)
     crosscheck: GlossaryCrosscheckConfig = Field(default_factory=GlossaryCrosscheckConfig)
     promote_on_complete: bool = False
 

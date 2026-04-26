@@ -9,6 +9,8 @@ from dao_bridge.schemas import (
     Chunk,
     ExtractedMention,
     Glossary,
+    GlossaryClusterDecision,
+    GlossaryClusterResponse,
     GlossaryEntity,
     GlossaryExtractionResponse,
     Manifest,
@@ -386,6 +388,88 @@ class TestGlossaryExtractionResponse:
         )
         assert len(r.mentions) == 1
         assert r.mentions[0].source == "スバル"
+
+
+# ---------------------------------------------------------------------------
+# GlossaryClusterDecision / GlossaryClusterResponse
+# ---------------------------------------------------------------------------
+
+
+class TestGlossaryClusterDecision:
+    def test_basic_construction(self):
+        d = GlossaryClusterDecision(
+            entity_id_a="c001",
+            entity_id_b="c002",
+            same_entity=True,
+            preferred_entity_id="c001",
+            preferred_canonical_english="Abel",
+            reasoning="Same character.",
+        )
+        assert d.same_entity is True
+        assert d.preferred_entity_id == "c001"
+
+    def test_not_same_entity(self):
+        d = GlossaryClusterDecision(
+            entity_id_a="c001",
+            entity_id_b="p001",
+            same_entity=False,
+            reasoning="Different entity types.",
+        )
+        assert d.same_entity is False
+        assert d.preferred_entity_id is None
+        assert d.preferred_canonical_english is None
+
+    def test_round_trip_json(self):
+        d = GlossaryClusterDecision(
+            entity_id_a="c001",
+            entity_id_b="c002",
+            same_entity=True,
+            preferred_entity_id="c001",
+            preferred_canonical_english="Abel",
+            reasoning="Same character with honorific suffix.",
+        )
+        data = d.model_dump(mode="json")
+        restored = GlossaryClusterDecision(**data)
+        assert restored.entity_id_a == "c001"
+        assert restored.preferred_canonical_english == "Abel"
+
+
+class TestGlossaryClusterResponse:
+    def test_empty(self):
+        r = GlossaryClusterResponse()
+        assert r.decisions == []
+
+    def test_with_decisions(self):
+        r = GlossaryClusterResponse(
+            decisions=[
+                GlossaryClusterDecision(
+                    entity_id_a="c001",
+                    entity_id_b="c002",
+                    same_entity=True,
+                    preferred_entity_id="c001",
+                    preferred_canonical_english="Abel",
+                    reasoning="Same character.",
+                ),
+            ]
+        )
+        assert len(r.decisions) == 1
+        assert r.decisions[0].same_entity is True
+
+    def test_round_trip_json(self):
+        r = GlossaryClusterResponse(
+            decisions=[
+                GlossaryClusterDecision(
+                    entity_id_a="c001",
+                    entity_id_b="c002",
+                    same_entity=False,
+                    reasoning="Not the same.",
+                ),
+            ]
+        )
+        data = r.model_dump(mode="json")
+        restored = GlossaryClusterResponse(**data)
+        assert len(restored.decisions) == 1
+        assert restored.decisions[0].same_entity is False
 
 
 # ---------------------------------------------------------------------------

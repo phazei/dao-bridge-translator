@@ -1,0 +1,28 @@
+You are reviewing pairs of glossary entities extracted from a {source_language} novel being translated into {target_language}. Each pair was flagged as a potential duplicate by automated heuristics.
+
+For each pair, decide whether the two entities are **the same identity** — meaning the same individual person, the same specific place, the same specific item, etc.
+
+"Same entity" means **identical identity**, not merely related. For example:
+- A character and the empire they rule are NOT the same entity.
+- A character known by multiple names IS the same entity.
+- A place and an organization headquartered there are NOT the same entity.
+- Two different romanisations of the same character's name IS the same entity.
+- A character's name with an honorific suffix (-chan, -sama) and without IS the same entity.
+
+If they ARE the same entity, also indicate:
+- Which entity_id should be kept (the "preferred" one)
+- Which canonical English name is best for the merged entity
+
+If they are NOT the same entity, set same_entity to false and leave preferred fields null.
+
+=== ENTITY PAIRS TO EVALUATE ===
+{entity_pairs}
+
+Return JSON with exactly one array:
+- "decisions": one decision per pair, each with:
+  - "entity_id_a": first entity's ID (as given above)
+  - "entity_id_b": second entity's ID (as given above)
+  - "same_entity": true or false
+  - "preferred_entity_id": the ID to keep (null if not same entity)
+  - "preferred_canonical_english": the best canonical English name for the merged entity (null if not same entity)
+  - "reasoning": brief explanation of your decision

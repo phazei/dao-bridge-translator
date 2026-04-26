@@ -1504,14 +1504,17 @@ class TestBuildTargeted:
 class TestGlossaryReconcile:
     """Tests for the glossary_reconcile function."""
 
-    def test_raises_when_build_not_completed(self, tmp_path):
-        """Reconcile raises RuntimeError if glossary_build stage is not completed."""
+    def test_raises_when_cluster_not_completed(self, tmp_path):
+        """Reconcile raises RuntimeError if glossary_cluster stage is not completed."""
         work = _setup_work_dir(tmp_path)
         config = _make_config(work)
         state = load_state(work)
         _mark_prior_stages_complete(work, state)
+        # Build is done but cluster is not.
+        mark_stage_started(work, state, "glossary_build")
+        mark_stage_completed(work, state, "glossary_build")
 
-        with pytest.raises(RuntimeError, match="Glossary build stage not completed"):
+        with pytest.raises(RuntimeError, match="Glossary cluster stage not completed"):
             glossary_reconcile(work, config, state, force=False)
 
     def _setup_with_conflicts(self, tmp_path):
@@ -1522,6 +1525,8 @@ class TestGlossaryReconcile:
         _mark_prior_stages_complete(work, state)
         mark_stage_started(work, state, "glossary_build")
         mark_stage_completed(work, state, "glossary_build")
+        mark_stage_started(work, state, "glossary_cluster")
+        mark_stage_completed(work, state, "glossary_cluster")
 
         # Create glossary with an entity.
         glossary = Glossary(
@@ -1644,6 +1649,8 @@ class TestGlossaryReconcile:
         _mark_prior_stages_complete(work, state)
         mark_stage_started(work, state, "glossary_build")
         mark_stage_completed(work, state, "glossary_build")
+        mark_stage_started(work, state, "glossary_cluster")
+        mark_stage_completed(work, state, "glossary_cluster")
 
         glossary = Glossary(
             entities=[
@@ -1683,6 +1690,8 @@ class TestGlossaryReconcile:
         _mark_prior_stages_complete(work, state)
         mark_stage_started(work, state, "glossary_build")
         mark_stage_completed(work, state, "glossary_build")
+        mark_stage_started(work, state, "glossary_cluster")
+        mark_stage_completed(work, state, "glossary_cluster")
 
         glossary = Glossary(
             entities=[
@@ -1734,6 +1743,8 @@ class TestGlossaryReconcile:
         _mark_prior_stages_complete(work, state)
         mark_stage_started(work, state, "glossary_build")
         mark_stage_completed(work, state, "glossary_build")
+        mark_stage_started(work, state, "glossary_cluster")
+        mark_stage_completed(work, state, "glossary_cluster")
 
         glossary = Glossary(
             entities=[
@@ -1765,6 +1776,8 @@ class TestGlossaryReconcile:
         _mark_prior_stages_complete(work, state)
         mark_stage_started(work, state, "glossary_build")
         mark_stage_completed(work, state, "glossary_build")
+        mark_stage_started(work, state, "glossary_cluster")
+        mark_stage_completed(work, state, "glossary_cluster")
 
         glossary = Glossary(
             entities=[
@@ -2193,6 +2206,17 @@ class TestGlossaryIntegration:
         assert gp.exists()
         disk_glossary = Glossary(**json.loads(gp.read_text(encoding="utf-8")))
         assert len(disk_glossary.entities) >= 2
+
+        # --- glossary-cluster (no duplicates, so no-op) ---
+        from dao_bridge.glossary import glossary_cluster
+
+        glossary = glossary_cluster(work, config, state, force=True)
+
+        assert state.stages.get("glossary_cluster") is not None
+        assert state.stages["glossary_cluster"].status == "completed"
+
+        cluster_report_path = work / "glossary_cluster_report.md"
+        assert cluster_report_path.exists()
 
         # --- glossary-reconcile (no conflicts, so no-op) ---
         with patch("dao_bridge.glossary.LLMClient") as mock_llm_cls:

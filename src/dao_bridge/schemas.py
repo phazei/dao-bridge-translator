@@ -210,6 +210,23 @@ class GlossarySpeechMergeResponse(BaseModel):
     consolidated_speech_style: str
 
 
+class GlossaryClusterDecision(BaseModel):
+    """LLM decision for a single candidate entity pair during clustering."""
+
+    entity_id_a: str
+    entity_id_b: str
+    same_entity: bool
+    preferred_entity_id: str | None = None
+    preferred_canonical_english: str | None = None
+    reasoning: str
+
+
+class GlossaryClusterResponse(BaseModel):
+    """LLM response for a batch of clustering candidate pairs."""
+
+    decisions: list[GlossaryClusterDecision] = Field(default_factory=list)
+
+
 class TocTranslationResponse(BaseModel):
     """LLM response for ToC title translation."""
 

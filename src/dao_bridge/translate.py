@@ -812,6 +812,7 @@ def translate_chunk(
                     messages,
                     QAResponse,
                     max_retries=3,
+                    temperature=tp.qa_temperature,
                     context_label=f"{chunk.chunk_id}:qa",
                 )
                 qa_result_val = qa_resp.result

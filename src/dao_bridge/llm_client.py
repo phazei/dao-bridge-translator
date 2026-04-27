@@ -112,6 +112,7 @@ class LLMClient:
         self,
         messages: list[dict],
         max_tokens: int | None = None,
+        temperature: float | None = None,
     ) -> CompletionResult:
         """Multi-turn chat completion with automatic retries on transient errors.
 
@@ -131,8 +132,9 @@ class LLMClient:
             "model": self.config.model,
             "messages": messages,
         }
-        if self.config.temperature is not None:
-            kwargs["temperature"] = self.config.temperature
+        effective_temperature = self.config.temperature if temperature is None else temperature
+        if effective_temperature is not None:
+            kwargs["temperature"] = effective_temperature
         if max_tokens is not None:
             kwargs["max_tokens"] = max_tokens
 
@@ -180,6 +182,7 @@ class LLMClient:
         response_model: type[BaseModel],
         max_retries: int = 3,
         max_tokens: int | None = None,
+        temperature: float | None = None,
         context_label: str | None = None,
     ) -> BaseModel:
         """Chat completion that returns a validated Pydantic model.
@@ -236,7 +239,11 @@ class LLMClient:
 
         while consecutive_failures < max_retries and total_attempts < max_total_attempts:
             total_attempts += 1
-            result = self.complete(conversation, max_tokens=max_tokens)
+            result = self.complete(
+                conversation,
+                max_tokens=max_tokens,
+                temperature=temperature,
+            )
             raw_text = result.text.strip()
 
             # Strip markdown code fences if present.

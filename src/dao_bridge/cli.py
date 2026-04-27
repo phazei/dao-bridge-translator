@@ -388,6 +388,7 @@ def _default_config_yaml(epub_path: str, work_dir: str) -> str:
             "summary_max_tokens": 2000,
             "glossary_injection": "relevant",
             "qa_check": True,
+            "qa_temperature": 0.1,
             "qa_max_retries": 1,
             "min_length_ratio": 0.3,
             "max_length_ratio": 2.0,

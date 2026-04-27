@@ -195,6 +195,7 @@ class TranslationPhaseConfig(BaseModel):
     summary_max_tokens: int = 2000
     glossary_injection: Literal["relevant", "all"] = "relevant"
     qa_check: bool = True
+    qa_temperature: float | None = 0.1
     qa_max_retries: int = 1
     min_length_ratio: float = 0.3
     max_length_ratio: float = 2.0

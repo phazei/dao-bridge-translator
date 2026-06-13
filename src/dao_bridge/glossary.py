@@ -1616,11 +1616,14 @@ def glossary_cluster(
         The updated glossary with duplicate entities merged.
     """
     from dao_bridge.glossary_clustering import (
+        ClusterConfidence,
         _resolve_id,
         generate_cluster_candidates,
         merge_entities,
+        pick_canonical_for_auto_merge,
         remap_entity_id,
         render_entity_for_cluster_prompt,
+        score_candidate_confidence,
         write_cluster_report,
     )
     from dao_bridge.schemas import GlossaryClusterResponse
@@ -1741,16 +1744,95 @@ def glossary_cluster(
         # Sort for deterministic processing order.
         candidate_list = sorted(candidates)
 
-        # Split into batches.
-        batches: list[list[tuple[str, str]]] = []
-        for start in range(0, len(candidate_list), batch_size):
-            batches.append(candidate_list[start : start + batch_size])
-
         merges_this_iteration = 0
         iteration_merge_entries: list[dict] = []
         iteration_candidates = 0
         # ID remap table for this iteration: absorbed_id -> surviving_id.
         id_map: dict[str, str] = {}
+
+        # Partition candidates by confidence. HIGH pairs auto-merge without an
+        # LLM call; everything else goes to the LLM as before. Partition is done
+        # against the ORIGINAL (pre-remap) pairs — evidence was recorded against
+        # original IDs. Auto-merge resolution and the LLM loop both consult the
+        # shared per-iteration id_map.
+        high_pairs: list[tuple[str, str]] = []
+        llm_pairs: list[tuple[str, str]] = []
+        if cluster_config.auto_merge_enabled:
+            for pair in candidate_list:
+                if score_candidate_confidence(candidates[pair]) == ClusterConfidence.HIGH:
+                    high_pairs.append(pair)
+                else:
+                    llm_pairs.append(pair)
+        else:
+            llm_pairs = list(candidate_list)
+
+        logger.info(
+            "Cluster %s: %d high-confidence auto-merges, %d pairs for LLM review",
+            item_id,
+            len(high_pairs),
+            len(llm_pairs),
+        )
+
+        # --- Auto-merge phase (no LLM) ---
+        for eid_a, eid_b in high_pairs:
+            resolved_a = _resolve_id(eid_a, id_map)
+            resolved_b = _resolve_id(eid_b, id_map)
+            if resolved_a == resolved_b:
+                # Already merged via an earlier auto-merge this iteration.
+                continue
+            ea = _entity_by_id(resolved_a)
+            eb = _entity_by_id(resolved_b)
+            if ea is None or eb is None:
+                continue
+
+            # Look up evidence by the ORIGINAL pre-remap pair key.
+            winner, loser, pref_name = pick_canonical_for_auto_merge(
+                ea, eb, candidates[(eid_a, eid_b)]
+            )
+
+            existing_sources = {sf.source for sf in winner.surface_forms}
+            new_sf_labels = [
+                f"`{sf.source}` -> {sf.translation}"
+                for sf in loser.surface_forms
+                if sf.source not in existing_sources
+            ]
+
+            loser_name = (
+                loser.canonical_name
+                if loser.canonical_name != winner.canonical_name
+                else pref_name or loser.canonical_name
+            )
+
+            merge_entities(winner, loser, pref_name)
+            glossary.entities.remove(loser)
+            id_map[loser.entity_id] = winner.entity_id
+            _remap_build_meta_conflicts(build_meta, loser.entity_id, winner.entity_id)
+
+            iteration_merge_entries.append(
+                {
+                    "winner_id": winner.entity_id,
+                    "loser_id": loser.entity_id,
+                    "winner_name": winner.canonical_name,
+                    "loser_name": loser_name,
+                    "result_name": winner.canonical_name,
+                    "reasoning": "HIGH CONFIDENCE AUTO-MERGE (multiple heuristics agreed)",
+                    "auto_merged": True,
+                    "surface_forms_added": new_sf_labels,
+                }
+            )
+            merges_this_iteration += 1
+
+        if high_pairs:
+            _save_glossary(work_dir, glossary, glossary_cluster_path(work_dir))
+            _save_build_meta(work_dir, build_meta)
+
+        # --- LLM phase ---
+        # Split the LLM-bound pairs into batches. The batch loop already remaps
+        # each pair through id_map before building prompts, so pairs whose entity
+        # was just auto-merged are resolved or dropped as self-merges.
+        batches: list[list[tuple[str, str]]] = []
+        for start in range(0, len(llm_pairs), batch_size):
+            batches.append(llm_pairs[start : start + batch_size])
 
         try:
             for batch_idx, batch_pairs in enumerate(batches, 1):
@@ -1875,6 +1957,7 @@ def glossary_cluster(
                             else pref_name or loser.canonical_name,
                             "result_name": winner.canonical_name,
                             "reasoning": reasoning,
+                            "auto_merged": False,
                             "surface_forms_added": new_sf_labels,
                         }
                     )

@@ -110,6 +110,18 @@ class GlossaryClusterConfig(BaseModel):
     """Jaro-Winkler similarity threshold for candidate pair generation."""
     batch_size: int = 10
     """Number of candidate pairs per LLM confirmation call."""
+    auto_merge_enabled: bool = False
+    """When True, high-confidence candidate pairs (multiple agreeing heuristics
+    plus same category) are merged deterministically without an LLM call. When
+    False (the default), every candidate goes to the LLM regardless of
+    confidence.
+
+    Defaults to False because the current string-only confidence scorer
+    produces false auto-merges on real data: containment + Jaro-Winkler fire
+    identically for "qualifier means the same entity" and "qualifier means a
+    distinct rank" (see score_candidate_confidence and the addendum in
+    build_phases/glossary-cluster-evidence-and-auto-merge.md). Enabling auto-merge
+    is only recommended once the scorer gains a corroborating embedding signal."""
 
 
 class GlossaryCrosscheckConfig(BaseModel):

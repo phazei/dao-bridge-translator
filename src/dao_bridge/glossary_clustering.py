@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import logging
 from collections import defaultdict
+from dataclasses import dataclass, field
+from enum import Enum
 
 from dao_bridge.config import GlossaryClusterConfig
 from dao_bridge.schemas import Glossary, GlossaryEntity, SurfaceForm
@@ -32,6 +34,67 @@ _MAX_SUMMARY_LENGTH = 500
 
 CandidatePair = tuple[str, str]
 """An ordered ``(entity_id_a, entity_id_b)`` pair where ``a < b``."""
+
+
+# Heuristic name constants — single source of truth for tagging + scoring.
+HEURISTIC_SOURCE_SUBSTRING = "source_substring"
+HEURISTIC_TRANSLATION_CONTAINMENT = "translation_containment"
+HEURISTIC_SHARED_READING = "shared_reading"
+HEURISTIC_ALIAS_OVERLAP = "alias_overlap"
+HEURISTIC_JW = "jaro_winkler"
+
+# JW magnitude that promotes the Jaro-Winkler signal to "strong" for auto-merge
+# scoring. Deliberately higher than the candidate-generation threshold (0.75):
+# candidate generation casts a wide net, auto-merge skips the LLM and needs a
+# higher bar (mirrors build-stage auto-attach at JW >= 0.95).
+_AUTO_MERGE_JW_STRONG = 0.90
+
+
+@dataclass
+class Evidence:
+    """Why a candidate pair was generated, and how strong the signals were.
+
+    Carried per pair from candidate generation through to confidence scoring.
+    Never persisted; lives only for the duration of a clustering iteration.
+    """
+
+    heuristics: set[str] = field(default_factory=set)
+    """Names of heuristics that flagged this pair (see HEURISTIC_* constants)."""
+
+    jw_score: float | None = None
+    """Best bi-directional Jaro-Winkler score observed for this pair, if the
+    JW heuristic flagged it. None when JW did not fire."""
+
+    same_category: bool = False
+    """Whether the two entities share a category. A supporting signal, never
+    sufficient alone."""
+
+    source_contains: str | None = None
+    """For source-substring matches: the entity_id whose source form CONTAINS
+    the other's (the longer/more specific form). None if not applicable or
+    bidirectional."""
+
+    translation_contains: str | None = None
+    """For translation-containment matches: the entity_id whose translation
+    CONTAINS the other's. None if not applicable or bidirectional."""
+
+    # Reserved for embeddings (NOT populated by this phase). Documented here so
+    # the shape is stable when embeddings land.
+    cosine: float | None = None
+    """Cosine similarity from an embedding heuristic. Always None in this phase."""
+
+
+Candidates = dict[CandidatePair, Evidence]
+"""Candidate pairs keyed by canonically ordered ``(a, b)`` with their evidence."""
+
+
+class ClusterConfidence(Enum):
+    """Confidence tier for a candidate pair."""
+
+    HIGH = "high"      # Auto-merge without LLM.
+    MEDIUM = "medium"  # Send to LLM for confirmation (today's default path).
+    LOW = "low"        # Reserved for embeddings: weak semantic-only pairs to
+    # auto-reject. Not produced in this phase.
 
 
 def _ordered_pair(id_a: str, id_b: str) -> CandidatePair:
@@ -220,6 +283,106 @@ def _jw_any_match(ea: GlossaryEntity, eb: GlossaryEntity, threshold: float) -> b
 
 
 # ---------------------------------------------------------------------------
+# Evidence annotators (read-only; reuse the heuristics' own predicate rules)
+# ---------------------------------------------------------------------------
+#
+# These are lookup-only annotations of an already-authoritative pair set. They
+# never re-decide *whether* a pair qualifies — the heuristic above already did —
+# they only read back a magnitude or direction for pairs that already passed.
+
+
+def _best_jw_score(ea: GlossaryEntity, eb: GlossaryEntity) -> float | None:
+    """Return the max bi-directional Jaro-Winkler score over source and
+    translation forms, mirroring :func:`_jw_any_match` but returning the
+    magnitude instead of a bool. ``None`` if no comparable forms exist.
+    """
+    best: float | None = None
+
+    def _track(value: float) -> None:
+        nonlocal best
+        if best is None or value > best:
+            best = value
+
+    # Source-form pairs.
+    for sf_a in ea.surface_forms:
+        if not sf_a.source:
+            continue
+        for sf_b in eb.surface_forms:
+            if not sf_b.source:
+                continue
+            _track(string_similarity(sf_a.source, sf_b.source))
+
+    # Translation pairs (canonical name + surface form translations).
+    for tl_a in _all_translation_forms(ea):
+        if not tl_a:
+            continue
+        for tl_b in _all_translation_forms(eb):
+            if not tl_b:
+                continue
+            _track(string_similarity(tl_a, tl_b))
+
+    return best
+
+
+def _containment_direction_source(
+    ea: GlossaryEntity, eb: GlossaryEntity
+) -> str | None:
+    """Return the entity_id whose source form CONTAINS the other's.
+
+    ``None`` if neither strictly contains the other, or if both directions hold
+    (ambiguous). Reuses the same ``len > 1`` skip rule as
+    :func:`_has_source_substring_overlap`.
+    """
+    a_contains_b = False
+    b_contains_a = False
+    for sf_a in ea.surface_forms:
+        if not sf_a.source:
+            continue
+        for sf_b in eb.surface_forms:
+            if not sf_b.source:
+                continue
+            if len(sf_a.source) <= 1 and len(sf_b.source) <= 1:
+                continue
+            if len(sf_a.source) > 1 and sf_b.source != sf_a.source and sf_b.source in sf_a.source:
+                a_contains_b = True
+            if len(sf_b.source) > 1 and sf_a.source != sf_b.source and sf_a.source in sf_b.source:
+                b_contains_a = True
+    if a_contains_b and not b_contains_a:
+        return ea.entity_id
+    if b_contains_a and not a_contains_b:
+        return eb.entity_id
+    return None
+
+
+def _containment_direction_translation(
+    ea: GlossaryEntity, eb: GlossaryEntity
+) -> str | None:
+    """Return the entity_id whose translation form CONTAINS the other's.
+
+    ``None`` if neither strictly contains the other, or if both directions hold
+    (ambiguous). Mirrors :func:`_has_translation_containment` over
+    :func:`_all_translation_forms`.
+    """
+    forms_a = [f.lower() for f in _all_translation_forms(ea) if f and len(f) > 1]
+    forms_b = [f.lower() for f in _all_translation_forms(eb) if f and len(f) > 1]
+    a_contains_b = False
+    b_contains_a = False
+    for la in forms_a:
+        for lb in forms_b:
+            if la == lb:
+                continue
+            if lb in la:
+                a_contains_b = True
+            if la in lb:
+                b_contains_a = True
+    if a_contains_b and not b_contains_a:
+        return ea.entity_id
+    if b_contains_a and not a_contains_b:
+        return eb.entity_id
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Top-level candidate generation
 # ---------------------------------------------------------------------------
 
@@ -227,29 +390,159 @@ def _jw_any_match(ea: GlossaryEntity, eb: GlossaryEntity, threshold: float) -> b
 def generate_cluster_candidates(
     glossary: Glossary,
     config: GlossaryClusterConfig,
-) -> set[CandidatePair]:
-    """Run all heuristics and return deduplicated candidate pairs.
+) -> Candidates:
+    """Run all heuristics and return candidate pairs WITH evidence.
 
-    Category is treated as a soft signal — cross-category pairs are
-    allowed so that e.g. ``character`` vs ``title`` merges can be
-    evaluated by the LLM.  Same-category simply provides supporting
-    evidence.
+    Each heuristic still returns a set of pairs; this function tags those pairs
+    with the heuristic that produced them and accumulates them into per-pair
+    :class:`Evidence`. No heuristic logic is duplicated here — we only annotate.
+
+    Category is treated as a soft signal — cross-category pairs are allowed so
+    that e.g. ``character`` vs ``title`` merges can be evaluated by the LLM.
+    Same-category simply provides supporting evidence.
+
+    The return is a ``dict`` keyed by the same canonically ordered ``(a, b)``
+    pairs as before, so existing consumers (``if not candidates``,
+    ``sorted(candidates)``, iterating ``(a, b)`` pairs) are unchanged.
     """
-    candidates: set[CandidatePair] = set()
-    candidates |= _source_substring_candidates(glossary)
-    candidates |= _translation_containment_candidates(glossary)
-    candidates |= _shared_reading_candidates(glossary)
-    candidates |= _alias_overlap_candidates(glossary)
-    candidates |= _jw_similarity_candidates(glossary, threshold=config.jw_threshold)
+    evidence: dict[CandidatePair, Evidence] = defaultdict(Evidence)
+    entity_by_id = {e.entity_id: e for e in glossary.entities}
 
-    # Remove self-pairs (should not happen, but be safe).
-    candidates = {(a, b) for a, b in candidates if a != b}
+    def _tag(pairs: set[CandidatePair], name: str) -> None:
+        for pair in pairs:
+            if pair[0] == pair[1]:
+                continue
+            evidence[pair].heuristics.add(name)
+
+    _tag(_source_substring_candidates(glossary), HEURISTIC_SOURCE_SUBSTRING)
+    _tag(
+        _translation_containment_candidates(glossary),
+        HEURISTIC_TRANSLATION_CONTAINMENT,
+    )
+    _tag(_shared_reading_candidates(glossary), HEURISTIC_SHARED_READING)
+    _tag(_alias_overlap_candidates(glossary), HEURISTIC_ALIAS_OVERLAP)
+    _tag(
+        _jw_similarity_candidates(glossary, threshold=config.jw_threshold),
+        HEURISTIC_JW,
+    )
+
+    # Annotate same_category, JW magnitude, and containment direction for the
+    # pairs we already have. This is annotation of an authoritative pair set,
+    # not re-qualification.
+    for (id_a, id_b), ev in evidence.items():
+        ea = entity_by_id.get(id_a)
+        eb = entity_by_id.get(id_b)
+        if ea is None or eb is None:
+            continue
+        ev.same_category = ea.category == eb.category
+        if HEURISTIC_JW in ev.heuristics:
+            ev.jw_score = _best_jw_score(ea, eb)
+        if HEURISTIC_SOURCE_SUBSTRING in ev.heuristics:
+            ev.source_contains = _containment_direction_source(ea, eb)
+        if HEURISTIC_TRANSLATION_CONTAINMENT in ev.heuristics:
+            ev.translation_contains = _containment_direction_translation(ea, eb)
 
     logger.debug(
         "Cluster candidate generation produced %d pairs",
-        len(candidates),
+        len(evidence),
     )
-    return candidates
+    return dict(evidence)
+
+
+# ---------------------------------------------------------------------------
+# Confidence scoring + auto-merge canonical picker
+# ---------------------------------------------------------------------------
+
+
+def score_candidate_confidence(evidence: Evidence) -> ClusterConfidence:
+    """Tier a candidate pair from its recorded evidence.
+
+    HIGH (auto-merge) requires multiple strong, agreeing signals AND same
+    category. Everything else is MEDIUM (LLM confirmation). This phase never
+    returns LOW.
+
+    Reads evidence only — performs no entity comparison, no recomputation.
+
+    .. warning::
+
+        This string-only scorer is **known to produce false auto-merges on real
+        data** and ``auto_merge_enabled`` defaults to False because of it. The
+        "2+ strong signals AND same category" rule cannot tell apart two cases
+        that fire identical evidence (source/translation containment + a high
+        Jaro-Winkler score + shared category):
+
+        - "qualifier means the SAME entity" — e.g. ``Dark Huo Ling'er`` is an
+          aspect of ``Huo Ling'er`` (a correct merge), and
+        - "qualifier means a DISTINCT rank/thing" — e.g. ``Quasi-Immortal
+          Emperor`` (准仙帝) is a cultivation realm *just below* ``Immortal
+          Emperor`` (仙帝), a wrong merge.
+
+        A live run on perfect-world-cn produced 4 auto-merges, 2 of them wrong
+        (the Quasi-/Immortal Emperor case above, and ``Huang`` vs ``Da Zhuang``
+        on a coincidental JW match). See the addendum in
+        ``build_phases/glossary-cluster-evidence-and-auto-merge.md``.
+
+        Therefore HIGH is **not trusted by default**. The scorer is intended to
+        gain a corroborating embedding signal (``Evidence.cosine``) in the
+        embeddings phase — embedding distance distinguishes the adjacent-realm
+        and unrelated-character cases — before ``auto_merge_enabled=True`` is
+        recommended.
+    """
+    strong = {
+        HEURISTIC_SOURCE_SUBSTRING,
+        HEURISTIC_TRANSLATION_CONTAINMENT,
+        HEURISTIC_SHARED_READING,
+        HEURISTIC_ALIAS_OVERLAP,
+    }
+    strong_count = len(evidence.heuristics & strong)
+
+    # A high-magnitude JW counts as a strong signal; the candidate-gen threshold
+    # (0.75) is intentionally looser, so JW alone at the candidate level is NOT
+    # strong.
+    high_jw = evidence.jw_score is not None and evidence.jw_score >= _AUTO_MERGE_JW_STRONG
+    if high_jw:
+        strong_count += 1
+
+    if strong_count >= 2 and evidence.same_category:
+        return ClusterConfidence.HIGH
+
+    return ClusterConfidence.MEDIUM
+
+
+def pick_canonical_for_auto_merge(
+    ea: GlossaryEntity,
+    eb: GlossaryEntity,
+    evidence: Evidence,
+) -> tuple[GlossaryEntity, GlossaryEntity, str]:
+    """Choose (winner, loser, preferred_canonical_name) for a HIGH-confidence merge.
+
+    Priority:
+      1. Containment direction, if known — the container (more specific) name wins.
+      2. Longer canonical_name (tends to be more specific).
+      3. Earlier first_seen_chunk.
+      4. Stable fallback (ea).
+    """
+    # 1. Prefer the container side when direction is known.
+    container_id = evidence.translation_contains or evidence.source_contains
+    if container_id == ea.entity_id:
+        return ea, eb, ea.canonical_name
+    if container_id == eb.entity_id:
+        return eb, ea, eb.canonical_name
+
+    # 2. Longer canonical name.
+    if len(ea.canonical_name) > len(eb.canonical_name):
+        return ea, eb, ea.canonical_name
+    if len(eb.canonical_name) > len(ea.canonical_name):
+        return eb, ea, eb.canonical_name
+
+    # 3. Earlier first_seen_chunk.
+    if ea.first_seen_chunk and eb.first_seen_chunk:
+        if ea.first_seen_chunk <= eb.first_seen_chunk:
+            return ea, eb, ea.canonical_name
+        return eb, ea, eb.canonical_name
+
+    # 4. Stable fallback.
+    return ea, eb, ea.canonical_name
 
 
 # ---------------------------------------------------------------------------
@@ -512,9 +805,14 @@ def write_cluster_report(
     """
     from dao_bridge.workdir import atomic_write
 
+    auto_count = sum(1 for e in merge_log if e.get("auto_merged"))
+    llm_count = len(merge_log) - auto_count
+
     lines = ["# Glossary Clustering Report", ""]
     lines.append(f"- Iterations: {total_iterations}")
     lines.append(f"- Total candidate pairs evaluated: {total_candidates_evaluated}")
+    lines.append(f"- Auto-merges (high confidence): {auto_count}")
+    lines.append(f"- LLM-confirmed merges: {llm_count}")
     lines.append(f"- Merges performed: {len(merge_log)}")
     lines.append("")
 
@@ -524,7 +822,9 @@ def write_cluster_report(
         lines.append("## Merges")
         lines.append("")
         for entry in merge_log:
+            merge_type = "auto-merge" if entry.get("auto_merged") else "LLM-confirmed"
             lines.append(f"### {entry['winner_name']} <- {entry['loser_name']}")
+            lines.append(f"- **Type:** {merge_type}")
             lines.append(f"- **Winner:** `{entry['winner_id']}`")
             lines.append(f"- **Absorbed:** `{entry['loser_id']}`")
             lines.append(f"- **Result canonical name:** {entry['result_name']}")

@@ -25,15 +25,24 @@ from dao_bridge.glossary import (
     glossary_cluster,
 )
 from dao_bridge.glossary_clustering import (
-    _translation_containment_candidates,
-    _source_substring_candidates,
-    _jw_similarity_candidates,
+    HEURISTIC_ALIAS_OVERLAP,
+    HEURISTIC_JW,
+    HEURISTIC_SHARED_READING,
+    HEURISTIC_SOURCE_SUBSTRING,
+    HEURISTIC_TRANSLATION_CONTAINMENT,
+    ClusterConfidence,
+    Evidence,
     _alias_overlap_candidates,
+    _jw_similarity_candidates,
     _shared_reading_candidates,
+    _source_substring_candidates,
+    _translation_containment_candidates,
     generate_cluster_candidates,
     merge_entities,
+    pick_canonical_for_auto_merge,
     remap_entity_id,
     render_entity_for_cluster_prompt,
+    score_candidate_confidence,
     write_cluster_report,
 )
 from dao_bridge.schemas import (
@@ -65,10 +74,17 @@ from dao_bridge.workdir import (
 
 
 def _make_config(work_dir: Path, **overrides) -> AppConfig:
-    """Create a minimal AppConfig pointing at work_dir."""
+    """Create a minimal AppConfig pointing at work_dir.
+
+    Auto-merge is disabled by default so the LLM-path integration tests below
+    continue to route every candidate through the (mocked) LLM. Tests that
+    exercise the auto-merge path opt in with ``auto_merge_enabled=True`` via a
+    nested ``glossary`` override.
+    """
     defaults = {
         "source_epub": str(work_dir / "test.epub"),
         "work_dir": str(work_dir),
+        "glossary": {"cluster": {"auto_merge_enabled": False}},
     }
     defaults.update(overrides)
     return AppConfig(**defaults)
@@ -2157,3 +2173,583 @@ class TestClusterForceResetsDownstreamState:
         assert state.stages["glossary_reconcile"].status == "pending"
         # Reconcile output should be deleted.
         assert not glossary_path(work).exists()
+
+
+# ---------------------------------------------------------------------------
+# Candidate evidence (generate_cluster_candidates returns Candidates dict)
+# ---------------------------------------------------------------------------
+
+
+class TestCandidateEvidence:
+    """generate_cluster_candidates carries per-pair Evidence."""
+
+    def test_returns_dict_keyed_by_ordered_pairs(self):
+        glossary = Glossary(
+            entities=[
+                _make_entity(
+                    "c001", "character", "Abel", [{"source": "アベル", "translation": "Abel"}]
+                ),
+                _make_entity(
+                    "c002",
+                    "character",
+                    "Abel-chan",
+                    [{"source": "アベルちゃん", "translation": "Abel-chan"}],
+                ),
+            ]
+        )
+        cands = generate_cluster_candidates(glossary, GlossaryClusterConfig())
+        assert isinstance(cands, dict)
+        assert ("c001", "c002") in cands
+        assert isinstance(cands[("c001", "c002")], Evidence)
+        # Backward-compatible consumer behaviour over dict keys.
+        assert len(cands) == 1
+        for a, b in cands:
+            assert a < b
+
+    def test_multiple_heuristics_recorded(self):
+        """A pair flagged by several heuristics records all of them."""
+        glossary = Glossary(
+            entities=[
+                _make_entity(
+                    "c001", "character", "Abel", [{"source": "アベル", "translation": "Abel"}]
+                ),
+                _make_entity(
+                    "c002",
+                    "character",
+                    "Abel-chan",
+                    [{"source": "アベルちゃん", "translation": "Abel-chan"}],
+                ),
+            ]
+        )
+        cands = generate_cluster_candidates(glossary, GlossaryClusterConfig())
+        ev = cands[("c001", "c002")]
+        # Source substring (アベル ⊂ アベルちゃん) and translation containment
+        # (Abel ⊂ Abel-chan) both fire.
+        assert HEURISTIC_SOURCE_SUBSTRING in ev.heuristics
+        assert HEURISTIC_TRANSLATION_CONTAINMENT in ev.heuristics
+
+    def test_jw_score_populated_only_when_jw_fired(self):
+        """jw_score is set (>= threshold) when JW flags, None otherwise."""
+        # Romanisation variants — JW fires, containment does not.
+        glossary = Glossary(
+            entities=[
+                _make_entity(
+                    "c001",
+                    "character",
+                    "Petelgeuse",
+                    [{"source": "ペテルギウス", "translation": "Petelgeuse"}],
+                ),
+                _make_entity(
+                    "c002",
+                    "character",
+                    "Petelgeous",
+                    [{"source": "ペテルギウス", "translation": "Petelgeous"}],
+                ),
+            ]
+        )
+        config = GlossaryClusterConfig()
+        cands = generate_cluster_candidates(glossary, config)
+        ev = cands[("c001", "c002")]
+        assert HEURISTIC_JW in ev.heuristics
+        assert ev.jw_score is not None
+        assert ev.jw_score >= config.jw_threshold
+
+    def test_jw_score_none_when_jw_did_not_fire(self):
+        """A pair found only via containment has no jw_score."""
+        ev = Evidence(heuristics={HEURISTIC_TRANSLATION_CONTAINMENT})
+        assert ev.jw_score is None
+
+    def test_same_category_reflected(self):
+        same = Glossary(
+            entities=[
+                _make_entity(
+                    "c001", "character", "Abel", [{"source": "アベル", "translation": "Abel"}]
+                ),
+                _make_entity(
+                    "c002",
+                    "character",
+                    "Abel-chan",
+                    [{"source": "アベルちゃん", "translation": "Abel-chan"}],
+                ),
+            ]
+        )
+        cands = generate_cluster_candidates(same, GlossaryClusterConfig())
+        assert cands[("c001", "c002")].same_category is True
+
+        cross = Glossary(
+            entities=[
+                _make_entity(
+                    "c001", "character", "Abel", [{"source": "アベル", "translation": "Abel"}]
+                ),
+                _make_entity(
+                    "t001",
+                    "title",
+                    "Abel-sama",
+                    [{"source": "アベル様", "translation": "Abel-sama"}],
+                ),
+            ]
+        )
+        cands2 = generate_cluster_candidates(cross, GlossaryClusterConfig())
+        assert cands2[("c001", "t001")].same_category is False
+
+    def test_containment_direction_recorded(self):
+        """source_contains / translation_contains record the container id."""
+        glossary = Glossary(
+            entities=[
+                _make_entity(
+                    "c001", "character", "Abel", [{"source": "アベル", "translation": "Abel"}]
+                ),
+                _make_entity(
+                    "c002",
+                    "character",
+                    "Abel-chan",
+                    [{"source": "アベルちゃん", "translation": "Abel-chan"}],
+                ),
+            ]
+        )
+        cands = generate_cluster_candidates(glossary, GlossaryClusterConfig())
+        ev = cands[("c001", "c002")]
+        # c002 is the container in both source (アベルちゃん ⊃ アベル) and
+        # translation (Abel-chan ⊃ Abel).
+        assert ev.source_contains == "c002"
+        assert ev.translation_contains == "c002"
+
+    def test_containment_direction_none_when_bidirectional(self):
+        """Identical forms (no strict container) record None direction."""
+        glossary = Glossary(
+            entities=[
+                _make_entity(
+                    "c001", "character", "Abel", [{"source": "アベル", "translation": "Abel"}]
+                ),
+                _make_entity(
+                    "c002", "character", "Abel", [{"source": "アベル", "translation": "Abel"}]
+                ),
+            ]
+        )
+        cands = generate_cluster_candidates(glossary, GlossaryClusterConfig())
+        ev = cands[("c001", "c002")]
+        assert ev.source_contains is None
+        assert ev.translation_contains is None
+
+
+# ---------------------------------------------------------------------------
+# Confidence scoring
+# ---------------------------------------------------------------------------
+
+
+class TestScoreCandidateConfidence:
+    """score_candidate_confidence tiers a pair from its evidence only."""
+
+    def test_two_containment_signals_same_category_high(self):
+        ev = Evidence(
+            heuristics={HEURISTIC_SOURCE_SUBSTRING, HEURISTIC_TRANSLATION_CONTAINMENT},
+            same_category=True,
+        )
+        assert score_candidate_confidence(ev) == ClusterConfidence.HIGH
+
+    def test_shared_reading_plus_alias_overlap_same_category_high(self):
+        ev = Evidence(
+            heuristics={HEURISTIC_SHARED_READING, HEURISTIC_ALIAS_OVERLAP},
+            same_category=True,
+        )
+        assert score_candidate_confidence(ev) == ClusterConfidence.HIGH
+
+    def test_high_jw_plus_containment_same_category_high(self):
+        ev = Evidence(
+            heuristics={HEURISTIC_JW, HEURISTIC_TRANSLATION_CONTAINMENT},
+            jw_score=0.93,
+            same_category=True,
+        )
+        assert score_candidate_confidence(ev) == ClusterConfidence.HIGH
+
+    def test_single_strong_signal_same_category_medium(self):
+        ev = Evidence(heuristics={HEURISTIC_SOURCE_SUBSTRING}, same_category=True)
+        assert score_candidate_confidence(ev) == ClusterConfidence.MEDIUM
+
+    def test_two_strong_signals_different_category_medium(self):
+        ev = Evidence(
+            heuristics={HEURISTIC_SOURCE_SUBSTRING, HEURISTIC_TRANSLATION_CONTAINMENT},
+            same_category=False,
+        )
+        assert score_candidate_confidence(ev) == ClusterConfidence.MEDIUM
+
+    def test_jw_just_below_strong_boundary_medium(self):
+        """JW 0.78 (< 0.90) is not a strong signal; alone -> MEDIUM."""
+        ev = Evidence(heuristics={HEURISTIC_JW}, jw_score=0.78, same_category=True)
+        assert score_candidate_confidence(ev) == ClusterConfidence.MEDIUM
+
+    def test_jw_at_090_boundary_counts_as_strong(self):
+        """JW exactly 0.90 is strong; with containment + same cat -> HIGH."""
+        ev = Evidence(
+            heuristics={HEURISTIC_JW, HEURISTIC_SOURCE_SUBSTRING},
+            jw_score=0.90,
+            same_category=True,
+        )
+        assert score_candidate_confidence(ev) == ClusterConfidence.HIGH
+
+    def test_jw_only_high_magnitude_is_single_signal_medium(self):
+        """A high JW alone is one strong signal -> MEDIUM (needs 2)."""
+        ev = Evidence(heuristics={HEURISTIC_JW}, jw_score=0.97, same_category=True)
+        assert score_candidate_confidence(ev) == ClusterConfidence.MEDIUM
+
+    def test_never_returns_low(self):
+        """This phase's scorer never returns LOW for any evidence shape."""
+        shapes = [
+            Evidence(),
+            Evidence(heuristics={HEURISTIC_JW}, jw_score=0.5),
+            Evidence(
+                heuristics={HEURISTIC_SOURCE_SUBSTRING, HEURISTIC_SHARED_READING},
+                same_category=True,
+            ),
+            Evidence(heuristics={HEURISTIC_ALIAS_OVERLAP}, same_category=False),
+        ]
+        for ev in shapes:
+            assert score_candidate_confidence(ev) != ClusterConfidence.LOW
+
+
+class TestScorerKnownFalsePositiveBaseline:
+    """Regression baseline: documents TODAY's unsafe HIGH behaviour.
+
+    The string-only scorer cannot distinguish "qualifier means same entity"
+    from "qualifier means a distinct rank". Both emit containment + JW + same
+    category and score HIGH. This is a KNOWN false-positive source (see the
+    addendum in build_phases/glossary-cluster-evidence-and-auto-merge.md and the
+    warning on score_candidate_confidence).
+
+    The embeddings phase is EXPECTED to change these assertions from HIGH to
+    MEDIUM once an embedding signal corroborates (or overrides) the string
+    heuristics. Flipping them then is an intentional, visible change — not a
+    silent regression.
+    """
+
+    def test_quasi_immortal_emperor_currently_scores_high(self):
+        """准仙帝/Quasi-Immortal Emperor vs 仙帝/Immortal Emperor are DISTINCT
+        adjacent realms, yet today's scorer says HIGH (wrong)."""
+        glossary = Glossary(
+            entities=[
+                _make_entity(
+                    "t001",
+                    "title",
+                    "Immortal Emperor",
+                    [{"source": "仙帝", "translation": "Immortal Emperor"}],
+                ),
+                _make_entity(
+                    "t002",
+                    "title",
+                    "Quasi-Immortal Emperor",
+                    [{"source": "准仙帝", "translation": "Quasi-Immortal Emperor"}],
+                ),
+            ]
+        )
+        cands = generate_cluster_candidates(glossary, GlossaryClusterConfig())
+        ev = cands[("t001", "t002")]
+        # Containment (仙帝 ⊂ 准仙帝, Immortal Emperor ⊂ Quasi-Immortal Emperor)
+        # + high JW + same category.
+        assert HEURISTIC_SOURCE_SUBSTRING in ev.heuristics
+        assert HEURISTIC_TRANSLATION_CONTAINMENT in ev.heuristics
+        # KNOWN-UNSAFE: scores HIGH today. Embeddings phase should make MEDIUM.
+        assert score_candidate_confidence(ev) == ClusterConfidence.HIGH
+
+
+# ---------------------------------------------------------------------------
+# Auto-merge canonical picker
+# ---------------------------------------------------------------------------
+
+
+class TestPickCanonicalForAutoMerge:
+    """pick_canonical_for_auto_merge selects winner/loser/name deterministically."""
+
+    def test_containment_direction_wins(self):
+        ea = _make_entity("c001", "character", "Abel")
+        eb = _make_entity("c002", "character", "Abel-chan")
+        ev = Evidence(translation_contains="c002")
+        winner, loser, name = pick_canonical_for_auto_merge(ea, eb, ev)
+        assert winner.entity_id == "c002"
+        assert loser.entity_id == "c001"
+        assert name == "Abel-chan"
+
+    def test_source_containment_direction_used_when_no_translation(self):
+        ea = _make_entity("c001", "character", "Abel")
+        eb = _make_entity("c002", "character", "Abel-chan")
+        ev = Evidence(source_contains="c001")
+        winner, _loser, name = pick_canonical_for_auto_merge(ea, eb, ev)
+        assert winner.entity_id == "c001"
+        assert name == "Abel"
+
+    def test_longer_canonical_name_wins_without_direction(self):
+        ea = _make_entity("c001", "character", "Vincent")
+        eb = _make_entity("c002", "character", "Vincent Volakia")
+        winner, loser, name = pick_canonical_for_auto_merge(ea, eb, Evidence())
+        assert winner.entity_id == "c002"
+        assert name == "Vincent Volakia"
+
+    def test_earlier_first_seen_chunk_wins_on_equal_length(self):
+        ea = _make_entity("c001", "character", "Aaa", first_seen_chunk="0005.001")
+        eb = _make_entity("c002", "character", "Bbb", first_seen_chunk="0001.001")
+        winner, _loser, _name = pick_canonical_for_auto_merge(ea, eb, Evidence())
+        assert winner.entity_id == "c002"
+
+    def test_stable_fallback_to_ea_when_no_signal(self):
+        ea = _make_entity("c001", "character", "Aaa")
+        eb = _make_entity("c002", "character", "Bbb")
+        winner, _loser, name = pick_canonical_for_auto_merge(ea, eb, Evidence())
+        assert winner.entity_id == "c001"
+        assert name == "Aaa"
+
+
+# ---------------------------------------------------------------------------
+# Auto-merge integration (auto_merge_enabled=True, opt-in)
+# ---------------------------------------------------------------------------
+
+
+def _make_config_auto_merge(work_dir: Path) -> AppConfig:
+    """Config with auto-merge explicitly enabled (opt-in)."""
+    return _make_config(work_dir, glossary={"cluster": {"auto_merge_enabled": True}})
+
+
+class TestAutoMergeIntegration:
+    """End-to-end glossary_cluster with auto_merge_enabled=True."""
+
+    def test_high_pairs_merge_without_llm_call(self, tmp_path):
+        """A HIGH-confidence pair auto-merges; the LLM is never called."""
+        work = _setup_work_dir(tmp_path)
+        config = _make_config_auto_merge(work)
+        state = load_state(work)
+        _mark_prior_stages_complete(work, state)
+
+        # Abel / Abel-chan: source substring + translation containment + same
+        # category => HIGH.
+        glossary = Glossary(
+            entities=[
+                _make_entity(
+                    "c001", "character", "Abel", [{"source": "アベル", "translation": "Abel"}]
+                ),
+                _make_entity(
+                    "c002",
+                    "character",
+                    "Abel-chan",
+                    [{"source": "アベルちゃん", "translation": "Abel-chan"}],
+                ),
+            ]
+        )
+        _save_glossary(work, glossary, glossary_build_path(work))
+
+        with patch("dao_bridge.glossary.LLMClient") as MockClient:
+            instance = MockClient.return_value
+            result = glossary_cluster(work, config, state)
+            # No LLM call for a purely-HIGH candidate set.
+            instance.complete_json.assert_not_called()
+
+        assert len(result.entities) == 1
+        # Report tags it as auto-merge with the fixed reasoning + counts.
+        report = (work / "glossary_cluster_report.md").read_text(encoding="utf-8")
+        assert "Auto-merges (high confidence): 1" in report
+        assert "LLM-confirmed merges: 0" in report
+        assert "**Type:** auto-merge" in report
+        assert "HIGH CONFIDENCE AUTO-MERGE" in report
+
+    def test_medium_pair_routed_to_llm(self, tmp_path):
+        """A MEDIUM (cross-category) pair still goes to the LLM."""
+        work = _setup_work_dir(tmp_path)
+        config = _make_config_auto_merge(work)
+        state = load_state(work)
+        _mark_prior_stages_complete(work, state)
+
+        # Cross-category containment => same_category False => MEDIUM.
+        glossary = Glossary(
+            entities=[
+                _make_entity(
+                    "c001", "character", "Abel", [{"source": "アベル", "translation": "Abel"}]
+                ),
+                _make_entity(
+                    "t001",
+                    "title",
+                    "Abel-chan",
+                    [{"source": "アベルちゃん", "translation": "Abel-chan"}],
+                ),
+            ]
+        )
+        _save_glossary(work, glossary, glossary_build_path(work))
+
+        mock_response = GlossaryClusterResponse(
+            decisions=[
+                GlossaryClusterDecision(
+                    entity_id_a="c001",
+                    entity_id_b="t001",
+                    same_entity=True,
+                    preferred_entity_id="c001",
+                    preferred_canonical_name="Abel",
+                    reasoning="Same character.",
+                ),
+            ]
+        )
+        with patch("dao_bridge.glossary.LLMClient") as MockClient:
+            instance = MockClient.return_value
+            instance.complete_json.return_value = mock_response
+            result = glossary_cluster(work, config, state)
+            instance.complete_json.assert_called()
+
+        assert len(result.entities) == 1
+        report = (work / "glossary_cluster_report.md").read_text(encoding="utf-8")
+        assert "Auto-merges (high confidence): 0" in report
+        assert "LLM-confirmed merges: 1" in report
+        assert "**Type:** LLM-confirmed" in report
+
+    def test_mixed_high_and_medium(self, tmp_path):
+        """HIGH pair auto-merges (no LLM); MEDIUM pair handled by LLM."""
+        work = _setup_work_dir(tmp_path)
+        config = _make_config_auto_merge(work)
+        state = load_state(work)
+        _mark_prior_stages_complete(work, state)
+
+        glossary = Glossary(
+            entities=[
+                # HIGH pair (same-category containment).
+                _make_entity(
+                    "c001", "character", "Abel", [{"source": "アベル", "translation": "Abel"}]
+                ),
+                _make_entity(
+                    "c002",
+                    "character",
+                    "Abel-chan",
+                    [{"source": "アベルちゃん", "translation": "Abel-chan"}],
+                ),
+                # MEDIUM pair (cross-category containment).
+                _make_entity(
+                    "p001", "place", "Rome", [{"source": "ローマ", "translation": "Rome"}]
+                ),
+                _make_entity(
+                    "t002",
+                    "title",
+                    "Rome City",
+                    [{"source": "ローマシティ", "translation": "Rome City"}],
+                ),
+            ]
+        )
+        _save_glossary(work, glossary, glossary_build_path(work))
+
+        # The LLM should only ever see the MEDIUM pair; it declines to merge.
+        mock_response = GlossaryClusterResponse(
+            decisions=[
+                GlossaryClusterDecision(
+                    entity_id_a="p001",
+                    entity_id_b="t002",
+                    same_entity=False,
+                    reasoning="Different kinds.",
+                ),
+            ]
+        )
+        with patch("dao_bridge.glossary.LLMClient") as MockClient:
+            instance = MockClient.return_value
+            instance.complete_json.return_value = mock_response
+            result = glossary_cluster(work, config, state)
+            # LLM called for the MEDIUM pair only.
+            instance.complete_json.assert_called()
+            # The prompt must NOT contain the auto-merged HIGH entities.
+            sent_prompt = instance.complete_json.call_args_list[0].args[0][0]["content"]
+            assert "ローマ" in sent_prompt  # MEDIUM pair present
+            assert "アベル" not in sent_prompt  # HIGH pair never sent to LLM
+
+        # HIGH pair merged (Abel/Abel-chan -> 1), MEDIUM pair NOT merged (2).
+        names = sorted(e.canonical_name for e in result.entities)
+        assert "Rome" in names
+        assert "Rome City" in names
+        # Abel collapsed to a single entity.
+        abel_like = [e for e in result.entities if "Abel" in e.canonical_name]
+        assert len(abel_like) == 1
+        report = (work / "glossary_cluster_report.md").read_text(encoding="utf-8")
+        assert "Auto-merges (high confidence): 1" in report
+
+    def test_disabled_routes_everything_to_llm(self, tmp_path):
+        """auto_merge_enabled=False: a HIGH pair still goes to the LLM."""
+        work = _setup_work_dir(tmp_path)
+        config = _make_config(work)  # default fixture: auto_merge_enabled False
+        state = load_state(work)
+        _mark_prior_stages_complete(work, state)
+
+        glossary = Glossary(
+            entities=[
+                _make_entity(
+                    "c001", "character", "Abel", [{"source": "アベル", "translation": "Abel"}]
+                ),
+                _make_entity(
+                    "c002",
+                    "character",
+                    "Abel-chan",
+                    [{"source": "アベルちゃん", "translation": "Abel-chan"}],
+                ),
+            ]
+        )
+        _save_glossary(work, glossary, glossary_build_path(work))
+
+        mock_response = GlossaryClusterResponse(
+            decisions=[
+                GlossaryClusterDecision(
+                    entity_id_a="c001",
+                    entity_id_b="c002",
+                    same_entity=True,
+                    preferred_entity_id="c001",
+                    preferred_canonical_name="Abel",
+                    reasoning="Same character.",
+                ),
+            ]
+        )
+        with patch("dao_bridge.glossary.LLMClient") as MockClient:
+            instance = MockClient.return_value
+            instance.complete_json.return_value = mock_response
+            result = glossary_cluster(work, config, state)
+            # Even though the pair is HIGH, the flag is off -> LLM is consulted.
+            instance.complete_json.assert_called()
+
+        assert len(result.entities) == 1
+        report = (work / "glossary_cluster_report.md").read_text(encoding="utf-8")
+        assert "Auto-merges (high confidence): 0" in report
+        assert "LLM-confirmed merges: 1" in report
+
+    def test_auto_merge_absorbs_entity_also_in_medium_pair(self, tmp_path):
+        """Invariant: an entity in a HIGH pair that also appears in a MEDIUM
+        pair is remapped through id_map; the MEDIUM pair resolves/drops without
+        referencing a removed entity (no KeyError, no stale merge)."""
+        work = _setup_work_dir(tmp_path)
+        config = _make_config_auto_merge(work)
+        state = load_state(work)
+        _mark_prior_stages_complete(work, state)
+
+        # c001/c002 are a HIGH same-category containment pair.
+        # c002 ALSO forms a MEDIUM cross-category pair with t003 (containment,
+        # different category). After auto-merging c001+c002, the c002<->t003
+        # candidate must remap c002 to the surviving id before the LLM phase.
+        glossary = Glossary(
+            entities=[
+                _make_entity(
+                    "c001", "character", "Abel", [{"source": "アベル", "translation": "Abel"}]
+                ),
+                _make_entity(
+                    "c002",
+                    "character",
+                    "Abel-chan",
+                    [{"source": "アベルちゃん", "translation": "Abel-chan"}],
+                ),
+                _make_entity(
+                    "t003",
+                    "title",
+                    "Abel-chan the Great",
+                    [{"source": "アベルちゃん大王", "translation": "Abel-chan the Great"}],
+                ),
+            ]
+        )
+        _save_glossary(work, glossary, glossary_build_path(work))
+
+        # LLM declines the surviving MEDIUM pair (whatever it resolves to).
+        mock_response = GlossaryClusterResponse(decisions=[])
+        with patch("dao_bridge.glossary.LLMClient") as MockClient:
+            instance = MockClient.return_value
+            instance.complete_json.return_value = mock_response
+            # Must not raise (no KeyError on evidence lookup, no stale entity).
+            result = glossary_cluster(work, config, state)
+
+        # c001+c002 auto-merged. t003 declined by LLM -> remains separate.
+        ids = {e.entity_id for e in result.entities}
+        # Loser of the HIGH auto-merge is gone; t003 survives.
+        assert "t003" in ids
+        assert len(result.entities) == 2

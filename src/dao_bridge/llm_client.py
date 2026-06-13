@@ -56,6 +56,33 @@ _TRANSIENT_EXCEPTIONS = (
 )
 
 
+def _error_code(exc: Exception) -> str | None:
+    """Best-effort provider error code extraction."""
+    code = getattr(exc, "code", None)
+    if isinstance(code, str) and code:
+        return code
+
+    body = getattr(exc, "body", None)
+    if isinstance(body, dict):
+        error = body.get("error")
+        if isinstance(error, dict):
+            nested_code = error.get("code")
+            if isinstance(nested_code, str) and nested_code:
+                return nested_code
+    return None
+
+
+def _should_retry(exc: Exception) -> bool:
+    """Return whether this provider error is worth retrying."""
+    if isinstance(exc, openai.BadRequestError):
+        return False
+
+    if isinstance(exc, openai.RateLimitError):
+        return _error_code(exc) != "insufficient_quota"
+
+    return True
+
+
 # ---------------------------------------------------------------------------
 # Client
 # ---------------------------------------------------------------------------
@@ -80,6 +107,7 @@ class LLMClient:
             base_url=config.base_url,
             api_key=config.api_key,
             timeout=self.llm_config.request_timeout_seconds,
+            max_retries=0,
         )
         self._total_token_usage: dict[str, int] = {
             "prompt_tokens": 0,
@@ -140,8 +168,18 @@ class LLMClient:
 
         last_error: Exception | None = None
         for attempt in range(1, self.llm_config.max_retries + 1):
+            attempt_started = time.monotonic()
+            logger.info(
+                "LLM request start (%d/%d): model=%s timeout=%.1fs messages=%d",
+                attempt,
+                self.llm_config.max_retries,
+                self.config.model,
+                self.llm_config.request_timeout_seconds,
+                len(messages),
+            )
             try:
                 response = self._client.chat.completions.create(**kwargs)
+                elapsed = time.monotonic() - attempt_started
                 choice = response.choices[0]
                 usage = {}
                 if response.usage:
@@ -152,6 +190,14 @@ class LLMClient:
                     }
                     for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
                         self._total_token_usage[key] += usage.get(key, 0)
+                logger.info(
+                    "LLM request success (%d/%d): model=%s elapsed=%.2fs finish=%s",
+                    attempt,
+                    self.llm_config.max_retries,
+                    response.model or self.config.model,
+                    elapsed,
+                    choice.finish_reason or "",
+                )
                 return CompletionResult(
                     text=choice.message.content or "",
                     token_usage=usage,
@@ -159,12 +205,25 @@ class LLMClient:
                     finish_reason=choice.finish_reason or "",
                 )
             except _TRANSIENT_EXCEPTIONS as exc:
+                elapsed = time.monotonic() - attempt_started
+                if not _should_retry(exc):
+                    logger.error(
+                        "LLM request failed without retry (%d/%d): model=%s elapsed=%.2fs error=%s",
+                        attempt,
+                        self.llm_config.max_retries,
+                        self.config.model,
+                        elapsed,
+                        exc,
+                    )
+                    raise
                 last_error = exc
                 wait = self.llm_config.retry_backoff_seconds * (2 ** (attempt - 1))
                 logger.warning(
-                    "Transient LLM error (attempt %d/%d): %s — retrying in %.1fs",
+                    "Transient LLM error (attempt %d/%d): model=%s elapsed=%.2fs error=%s — retrying in %.1fs",
                     attempt,
                     self.llm_config.max_retries,
+                    self.config.model,
+                    elapsed,
                     exc,
                     wait,
                 )

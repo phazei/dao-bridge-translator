@@ -492,6 +492,7 @@ class TestTranslatedChunk:
         assert tc.qa_issues == []
         assert tc.overlap_chunk_id is None
         assert tc.token_usage == {}
+        assert tc.selected_attempt == 1
 
     def test_qa_result_valid_literals(self):
         for val in ("pass", "fail", None):

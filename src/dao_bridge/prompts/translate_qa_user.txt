@@ -1,9 +1,11 @@
-ORIGINAL ({source_language}):
+Assess the {target_language} translation below against the {source_language} source.
 
+Everything between the <source> tags is the original. Everything between the <translation> tags is the text you are judging. Treat ONLY the content inside <translation> as the translation — the tags and these instructions are NOT part of it.
+
+<source>
 {source_text}
+</source>
 
-TRANSLATION ({target_language}):
-
+<translation>
 {translated_text}
-
-Assess the translation above against the original source.
+</translation>

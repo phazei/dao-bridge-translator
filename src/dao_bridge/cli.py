@@ -389,7 +389,7 @@ def _default_config_yaml(epub_path: str, work_dir: str) -> str:
             "glossary_injection": "relevant",
             "qa_check": True,
             "qa_temperature": 0.1,
-            "qa_max_retries": 1,
+            "qa_max_retries": 2,
             "min_length_ratio": 0.3,
             "max_length_ratio": 2.0,
         },
@@ -600,7 +600,7 @@ def status(ctx: click.Context, work_dir: str, detail: bool) -> None:
         counts = Counter(item.status for _, item in items)
         # Show counts on one line, indented under the stage.
         parts = []
-        for s in ("completed", "started", "failed", "failed_qa", "pending"):
+        for s in ("completed", "started", "failed", "pending"):
             c = counts.get(s, 0)
             if c > 0:
                 parts.append(f"{s}={c}")
@@ -611,7 +611,7 @@ def status(ctx: click.Context, work_dir: str, detail: bool) -> None:
         problem_items = [
             (item_id, item)
             for item_id, item in items
-            if item.status in ("failed", "failed_qa", "started")
+            if item.status in ("failed", "started")
         ]
         for item_id, item in problem_items:
             err = item.error_message or ""
@@ -1097,7 +1097,7 @@ def glossary_export_cmd(
 @click.option(
     "--retry-failed",
     is_flag=True,
-    help="Re-enter a completed stage to retry only failed/failed_qa chunks.",
+    help="Re-enter a completed stage to retry only failed chunks.",
 )
 @click.pass_context
 def translate(
@@ -1115,9 +1115,11 @@ def translate(
     By default translates all untranslated chunks in sequential order.
     Use --spine, --chunk, or --from/--to to limit the range.
 
-    On QA failure after retries, the pipeline halts.  Fix the issue
-    (swap model, edit glossary, adjust config) and re-run to continue.
-    Failed and failed_qa chunks are retried automatically on re-run.
+    QA is advisory and non-blocking: when a chunk still has high-severity
+    issues after the QA-fix retries, the best attempt is kept, the chunk is
+    marked completed, and the run continues.  Per-attempt artifacts are saved
+    for review.  Failed chunks (infrastructure errors, not QA) are retried
+    automatically on re-run.
     """
     if force and retry_failed:
         raise click.ClickException("--force and --retry-failed are mutually exclusive.")

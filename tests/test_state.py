@@ -156,13 +156,6 @@ class TestItemOperations:
         assert state.items["translate:003.015"].status == "failed"
         assert state.items["translate:003.015"].error_message == "QA check failed"
 
-    def test_mark_item_failed_qa(self, work_dir: Path):
-        state = load_state(work_dir)
-        mark_item_failed(
-            work_dir, state, "translate", "003.015", "length ratio", status="failed_qa"
-        )
-        assert state.items["translate:003.015"].status == "failed_qa"
-
     def test_iter_pending_items(self, work_dir: Path):
         state = load_state(work_dir)
         all_ids = ["001", "002", "003", "004"]
@@ -305,12 +298,6 @@ class TestHasFailedItems:
         mark_item_completed(work_dir, state, "classify", "001")
         mark_item_failed(work_dir, state, "classify", "002", "LLM error")
         assert has_failed_items(state, "classify")
-
-    def test_has_failed_qa(self, work_dir: Path):
-        """A failed_qa item returns True."""
-        state = load_state(work_dir)
-        mark_item_failed(work_dir, state, "translate", "001.002", "QA fail", status="failed_qa")
-        assert has_failed_items(state, "translate")
 
     def test_other_stage_not_affected(self, work_dir: Path):
         """Failed items in one stage don't affect another."""

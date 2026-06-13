@@ -108,6 +108,24 @@ All stages are idempotent and crash-resumable via `state.json`.
 - `ExtractedMention` — Raw LLM extraction result before entity linking
 - `Chunk` / `TranslatedChunk` — Source and translated text segments
 
+## Git — DO NOT TOUCH
+
+- **NEVER run any git command that changes repository, index, or working-tree
+  state.** This includes (non-exhaustive): `git add`, `git rm`, `git mv`,
+  `git restore`, `git reset`, `git checkout`/`git switch`, `git stash`
+  (including `pop`/`apply`/`drop`), `git commit`, `git merge`, `git rebase`,
+  `git cherry-pick`, `git revert`, `git clean`, `git read-tree`, `git push`,
+  `git pull`, `git fetch`, branch/tag/config edits, or hook changes.
+- The user manages staging, stashing, and commits manually. Do not stage,
+  unstage, or re-stage files. Do not "tidy up" git state, ever.
+- Read-only inspection is allowed (`git status`, `git diff`, `git log`,
+  `git show`, `git cat-file`) — but NEVER as a setup for a state-changing
+  command, and never use `git stash` to "peek" at other states.
+- Verifying things against another commit/blob must be done read-only (e.g.
+  `git show <ref>:<path> | <tool>`), never by mutating the index or stash.
+- If a task seems to require a git state change, STOP and ask the user to do
+  it themselves.
+
 ## Conventions
 
 - Each pipeline module has a corresponding test file (`glossary.py` -> `test_glossary.py`)

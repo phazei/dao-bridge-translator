@@ -33,20 +33,24 @@ from dao_bridge.state import (
     mark_stage_completed,
 )
 from dao_bridge.translate import (
+    QAIssue,
     QAResponse,
     TranslationProgress,
     _enumerate_chunk_ids,
     _extract_analysis,
     _filter_chunk_range,
     _load_rolling_summaries,
+    _run_qa,
     _save_rolling_summaries,
     _strip_analysis,
     _update_rolling_summary,
     build_pass1_messages,
     build_pass2_messages,
+    build_qa_fix_messages,
     build_qa_messages,
     load_overlap,
     programmatic_qa_check,
+    qa_fix_chunk,
     render_glossary,
     render_rolling_summary,
     run_translate_stage,
@@ -702,8 +706,10 @@ class TestBuildQAMessages:
         and translation."""
         work_dir = _setup_work_dir(tmp_path)
         config = _make_config(work_dir)
+        glossary = _make_glossary()
 
-        result = build_qa_messages("original source", "final translation", config)
+        # Source has no glossary surface forms, so no glossary message is added.
+        result = build_qa_messages("original source", "final translation", glossary, config)
 
         # Exactly 2 messages: system + user.
         assert len(result) == 2
@@ -713,19 +719,34 @@ class TestBuildQAMessages:
         # User message contains both source and translation.
         assert "original source" in result[1]["content"]
         assert "final translation" in result[1]["content"]
-        assert "Assess the translation" in result[1]["content"]
+        assert "Assess the" in result[1]["content"]
 
-    def test_no_overlap_or_glossary(self, tmp_path: Path):
-        """QA messages contain only source, translation, and QA prompt."""
+    def test_no_rolling_summary_or_overlap(self, tmp_path: Path):
+        """QA messages contain no rolling summary or overlap continuity."""
         work_dir = _setup_work_dir(tmp_path)
         config = _make_config(work_dir)
+        glossary = _make_glossary()
 
-        result = build_qa_messages("src", "translation", config)
+        result = build_qa_messages("src", "translation", glossary, config)
         all_content = " ".join(m["content"] for m in result)
 
-        assert "GLOSSARY" not in all_content
         assert "STORY SO FAR" not in all_content
         assert "preceding" not in all_content.lower()
+
+    def test_glossary_terms_injected_when_relevant(self, tmp_path: Path):
+        """Matching glossary terms are injected as an approved-names guard."""
+        work_dir = _setup_work_dir(tmp_path)
+        config = _make_config(work_dir)
+        glossary = _make_glossary()
+
+        # "グァラル" matches the place surface form -> glossary message added.
+        result = build_qa_messages("グァラル の街", "Guaral translation", glossary, config)
+        all_content = " ".join(m["content"] for m in result)
+
+        assert "APPROVED" in all_content
+        assert "Guaral" in all_content
+        # The glossary is delivered as a primed user/assistant exchange.
+        assert any(m["role"] == "assistant" for m in result)
 
 
 # =========================================================================
@@ -1066,7 +1087,7 @@ class TestQAFlow:
         translation = "This is a reasonable length translation for the test."
         mock_client = _make_mock_client(_mock_completion(translation))
         mock_client.complete_json.return_value = QAResponse(
-            result="fail", issues=["Missing paragraphs"]
+            result="fail", issues=[QAIssue(severity="high", issue="Missing paragraphs")]
         )
 
         chunk = _make_chunk(text="これは合理的な長さのテスト翻訳です。テストのための文章。")
@@ -1076,6 +1097,29 @@ class TestQAFlow:
 
         assert result.qa_result == "fail"
         assert "Missing paragraphs" in result.qa_issues
+
+    def test_llm_judge_low_severity_passes(self, tmp_path: Path):
+        """Only low-severity issues -> chunk passes, issues not surfaced as failures."""
+        work_dir = _setup_work_dir(tmp_path)
+        config = _make_config(work_dir)
+        config.translation_phase.double_pass = False
+        config.translation_phase.qa_check = True
+        config.translation_phase.rolling_summary = False
+
+        translation = "This is a reasonable length translation for the test."
+        mock_client = _make_mock_client(_mock_completion(translation))
+        mock_client.complete_json.return_value = QAResponse(
+            result="fail", issues=[QAIssue(severity="low", issue="word choice nuance")]
+        )
+
+        chunk = _make_chunk(text="これは合理的な長さのテスト翻訳です。テストのための文章。")
+        glossary = _make_glossary()
+
+        result = translate_chunk(chunk, config, glossary, None, [], mock_client)
+
+        # Low-severity issues never force a failure.
+        assert result.qa_result == "pass"
+        assert result.qa_issues == []
 
     def test_programmatic_short_skips_llm(self, tmp_path: Path):
         """Programmatic check catches too-short output — no LLM QA call."""
@@ -1117,6 +1161,172 @@ class TestQAFlow:
 
         assert result.qa_result == "fail"
         assert "unparseable JSON" in result.qa_issues[0]
+
+
+# =========================================================================
+# _run_qa helper
+# =========================================================================
+
+
+class TestRunQA:
+    """Tests for the _run_qa() severity-gating helper."""
+
+    def test_high_severity_fails(self, tmp_path: Path):
+        work_dir = _setup_work_dir(tmp_path)
+        config = _make_config(work_dir)
+        glossary = _make_glossary()
+
+        mock_client = _make_mock_client()
+        mock_client.complete_json.return_value = QAResponse(
+            result="fail", issues=[QAIssue(severity="high", issue="Missing paragraphs")]
+        )
+
+        source = "これは合理的な長さのテスト翻訳です。テストのための文章。"
+        translation = "This is a reasonable length translation for the test."
+        qa_result, issues = _run_qa(
+            "0001.001", source, translation, glossary, mock_client, config
+        )
+
+        assert qa_result == "fail"
+        assert issues == ["Missing paragraphs"]
+
+    def test_only_low_severity_passes(self, tmp_path: Path):
+        work_dir = _setup_work_dir(tmp_path)
+        config = _make_config(work_dir)
+        glossary = _make_glossary()
+
+        mock_client = _make_mock_client()
+        mock_client.complete_json.return_value = QAResponse(
+            result="fail", issues=[QAIssue(severity="low", issue="word choice")]
+        )
+
+        source = "これは合理的な長さのテスト翻訳です。テストのための文章。"
+        translation = "This is a reasonable length translation for the test."
+        qa_result, issues = _run_qa(
+            "0001.001", source, translation, glossary, mock_client, config
+        )
+
+        assert qa_result == "pass"
+        assert issues == []
+
+    def test_unparseable_json_fails(self, tmp_path: Path):
+        work_dir = _setup_work_dir(tmp_path)
+        config = _make_config(work_dir)
+        glossary = _make_glossary()
+
+        mock_client = _make_mock_client()
+        mock_client.complete_json.side_effect = LLMStructuredOutputError("nope")
+
+        source = "これは合理的な長さのテスト翻訳です。テストのための文章。"
+        translation = "This is a reasonable length translation for the test."
+        qa_result, issues = _run_qa(
+            "0001.001", source, translation, glossary, mock_client, config
+        )
+
+        assert qa_result == "fail"
+        assert "unparseable JSON" in issues[0]
+
+    def test_programmatic_short_circuits_llm(self, tmp_path: Path):
+        work_dir = _setup_work_dir(tmp_path)
+        config = _make_config(work_dir)
+        glossary = _make_glossary()
+
+        mock_client = _make_mock_client()
+
+        # Long source, tiny translation -> programmatic fail, no LLM call.
+        source = "これは長い文章です。" * 30
+        qa_result, issues = _run_qa(
+            "0001.001", source, "No.", glossary, mock_client, config
+        )
+
+        assert qa_result == "fail"
+        assert "short" in issues[0]
+        mock_client.complete_json.assert_not_called()
+
+
+# =========================================================================
+# QA-fix pass
+# =========================================================================
+
+
+class TestBuildQAFixMessages:
+    """Tests for build_qa_fix_messages()."""
+
+    def test_contains_source_translation_and_issues(self, tmp_path: Path):
+        work_dir = _setup_work_dir(tmp_path)
+        config = _make_config(work_dir)
+        glossary = _make_glossary()
+
+        result = build_qa_fix_messages(
+            "original source",
+            "broken translation",
+            ["Boilerplate leaked: 'visit our site'"],
+            glossary,
+            config,
+        )
+
+        assert result[0]["role"] == "system"
+        user_content = result[-1]["content"]
+        assert "original source" in user_content
+        assert "broken translation" in user_content
+        assert "Boilerplate leaked: 'visit our site'" in user_content
+
+    def test_glossary_injected_when_relevant(self, tmp_path: Path):
+        work_dir = _setup_work_dir(tmp_path)
+        config = _make_config(work_dir)
+        glossary = _make_glossary()
+
+        result = build_qa_fix_messages(
+            "グァラル の街", "Guaral text", ["issue"], glossary, config
+        )
+        all_content = " ".join(m["content"] for m in result)
+
+        assert "APPROVED" in all_content
+        assert "Guaral" in all_content
+
+
+class TestQAFixChunk:
+    """Tests for qa_fix_chunk()."""
+
+    def test_fix_passes_and_carries_prior_pass1(self, tmp_path: Path):
+        work_dir = _setup_work_dir(tmp_path)
+        config = _make_config(work_dir)
+        config.translation_phase.rolling_summary = False
+        glossary = _make_glossary()
+
+        chunk = _make_chunk(text="これは合理的な長さのテスト翻訳です。テストのための文章。")
+        prior = _make_translated_chunk(
+            chunk_id=chunk.chunk_id,
+            source_text=chunk.text,
+            translated_text="Broken with leaked boilerplate.",
+            pass1_translation="Original pass 1 text.",
+            qa_result="fail",
+            qa_issues=["Boilerplate leaked: 'x'"],
+        )
+
+        fixed = "This is a reasonable length corrected translation for the test."
+        mock_client = _make_mock_client(_mock_completion(fixed))
+        # QA on the fixed text passes.
+        mock_client.complete_json.return_value = QAResponse(result="pass", issues=[])
+
+        result = qa_fix_chunk(
+            chunk=chunk,
+            prior=prior,
+            issues=prior.qa_issues,
+            config=config,
+            glossary=glossary,
+            overlap=None,
+            rolling_summaries=[],
+            llm_client=mock_client,
+        )
+
+        assert result.translated_text == fixed
+        assert result.qa_result == "pass"
+        assert result.qa_issues == []
+        # Prior Pass 1 text is carried over for record continuity.
+        assert result.pass1_translation == "Original pass 1 text."
+        # Caller overwrites total_attempts; the fix itself reports 1.
+        assert result.total_attempts == 1
 
 
 # =========================================================================
@@ -1322,29 +1532,14 @@ class TestRunTranslateStage:
         assert result["error"] is None
 
     @patch("dao_bridge.translate.LLMClient")
-    def test_failed_qa_chunks_retried(self, mock_llm_cls, tmp_path: Path):
-        """Chunks with 'failed_qa' status are retried on re-run (no --force)."""
-        work_dir, config, state, manifest = _setup_stage_test(tmp_path, spines=[(1, 1)])
-
-        # Pre-mark as failed_qa.
-        mark_item_failed(work_dir, state, "translate", "0001.001", "QA failed", status="failed_qa")
-
-        mock_client = _make_mock_client(_mock_completion("Translated."))
-        mock_llm_cls.return_value = mock_client
-
-        result = run_translate_stage(work_dir, config, state, manifest)
-
-        assert result["completed"] == 1
-        assert result["error"] is None
-
-    @patch("dao_bridge.translate.LLMClient")
-    def test_qa_failure_halts_pipeline(self, mock_llm_cls, tmp_path: Path):
-        """QA failure after retries halts the pipeline and saves translation."""
+    def test_qa_failure_is_non_blocking(self, mock_llm_cls, tmp_path: Path):
+        """Persistent QA failure does NOT halt the pipeline: the best attempt
+        is kept, the chunk is marked completed, and the run continues."""
         work_dir, config, state, manifest = _setup_stage_test(tmp_path, spines=[(1, 2)])
         config.translation_phase.qa_check = True
         config.translation_phase.qa_max_retries = 1
 
-        # Return short translation to trigger programmatic QA fail.
+        # Return short translation to trigger programmatic QA fail on every attempt.
         mock_client = _make_mock_client(_mock_completion("No."))
         mock_llm_cls.return_value = mock_client
 
@@ -1357,17 +1552,59 @@ class TestRunTranslateStage:
 
         result = run_translate_stage(work_dir, config, state, manifest)
 
-        # Pipeline should have halted at the first chunk.
-        assert result["failed_chunk"] == "0001.001"
-        assert "QA failed" in result["error"]
-        assert result["completed"] == 0
+        # Pipeline runs to completion; nothing halts.
+        assert result.get("failed_chunk") is None
+        assert result["error"] is None
+        assert result["completed"] == 2
 
-        # Translation file should still be saved.
-        assert translation_path(work_dir, "0001.001").exists()
+        # The kept (best) translation is still saved, with qa_result == "fail".
+        for cid in ["0001.001", "0001.002"]:
+            tp = translation_path(work_dir, cid)
+            assert tp.exists()
+            saved = TranslatedChunk.model_validate_json(tp.read_text(encoding="utf-8"))
+            assert saved.qa_result == "fail"
 
-        # State should show failed_qa.
+        # State marks the chunks completed (not failed) so they are not retried.
         reloaded = load_state(work_dir)
-        assert reloaded.items["translate:0001.001"].status == "failed_qa"
+        assert reloaded.items["translate:0001.001"].status == "completed"
+        assert reloaded.items["translate:0001.002"].status == "completed"
+
+    @patch("dao_bridge.translate.LLMClient")
+    def test_qa_fix_pass_recovers_chunk(self, mock_llm_cls, tmp_path: Path):
+        """Attempt 1 fails QA, the QA-fix pass passes -> attempt 2 is selected
+        and the run stops early without a third attempt."""
+        work_dir, config, state, manifest = _setup_stage_test(tmp_path, spines=[(1, 1)])
+        config.translation_phase.double_pass = False
+        config.translation_phase.qa_check = True
+        config.translation_phase.qa_max_retries = 2
+        config.translation_phase.rolling_summary = False
+
+        long_text = "これは合理的な長さのテスト翻訳です。テストのための文章。" * 3
+        c = _make_chunk("0001.001", 1, 1, long_text)
+        _write_chunk_file(work_dir, c)
+
+        good = "This is a reasonable length translation for the test. " * 3
+        # complete() is called once per attempt (Pass 1, then QA-fix).
+        mock_client = _make_mock_client([_mock_completion(good), _mock_completion(good)])
+        # First QA verdict fails (high), second (after fix) passes.
+        mock_client.complete_json.side_effect = [
+            QAResponse(result="fail", issues=[QAIssue(severity="high", issue="repetition loop")]),
+            QAResponse(result="pass", issues=[]),
+        ]
+        mock_llm_cls.return_value = mock_client
+
+        result = run_translate_stage(work_dir, config, state, manifest)
+
+        assert result["completed"] == 1
+        assert result["error"] is None
+
+        saved = TranslatedChunk.model_validate_json(
+            translation_path(work_dir, "0001.001").read_text(encoding="utf-8")
+        )
+        assert saved.qa_result == "pass"
+        assert saved.selected_attempt == 2
+        # Stopped after attempt 2 — only two QA verdicts consumed.
+        assert mock_client.complete_json.call_count == 2
 
     @patch("dao_bridge.translate.LLMClient")
     def test_chunk_range_filter(self, mock_llm_cls, tmp_path: Path):
@@ -1533,8 +1770,8 @@ class TestEndOfRunSummary:
         assert result["total_tokens"] > 0
 
     @patch("dao_bridge.translate.LLMClient")
-    def test_qa_halt_summary(self, mock_llm_cls, tmp_path: Path):
-        """QA halt returns failure details in summary."""
+    def test_qa_failure_kept_summary(self, mock_llm_cls, tmp_path: Path):
+        """A QA-failing chunk (with no retries) is kept and counted as completed."""
         work_dir, config, state, manifest = _setup_stage_test(tmp_path, spines=[(1, 1)])
         config.translation_phase.qa_check = True
         config.translation_phase.qa_max_retries = 0
@@ -1549,9 +1786,17 @@ class TestEndOfRunSummary:
 
         result = run_translate_stage(work_dir, config, state, manifest)
 
-        assert result["completed"] == 0
-        assert result["failed_chunk"] == "0001.001"
-        assert "QA failed" in result["error"]
+        # Non-blocking: the chunk is kept and the run completes.
+        assert result["completed"] == 1
+        assert result["error"] is None
+        assert result.get("failed_chunk") is None
+
+        # The kept record reflects the only (failing) attempt.
+        saved = TranslatedChunk.model_validate_json(
+            translation_path(work_dir, "0001.001").read_text(encoding="utf-8")
+        )
+        assert saved.qa_result == "fail"
+        assert saved.selected_attempt == 1
 
 
 # =========================================================================

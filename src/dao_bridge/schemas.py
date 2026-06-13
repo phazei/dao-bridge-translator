@@ -253,6 +253,7 @@ class TranslatedChunk(BaseModel):
     qa_result: Literal["pass", "fail"] | None = None  # None if QA disabled
     qa_issues: list[str] = []
     total_attempts: int  # count of full chunk translation attempts
+    selected_attempt: int = 1  # which attempt this saved record came from
     overlap_chunk_id: str | None = None
     summary_generated: str | None = None
     token_usage: dict = {}  # {prompt_tokens, completion_tokens, total_tokens}

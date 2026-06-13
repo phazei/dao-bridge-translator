@@ -137,6 +137,12 @@ dao-bridge run --work-dir ./work --retry-failed
 `classify`, `chunk`, `glossary-build`, `glossary-cluster`,
 `glossary-reconcile`, `translate`, `assemble`, and `run`.
 
+Note that `--retry-failed` only re-runs items with a genuine `failed` status
+(e.g. infrastructure or LLM errors). A chunk that produced a translation but
+did not pass QA is kept as `completed` and is **not** retried -- QA is
+non-blocking, so it never marks a chunk failed. To redo a QA-imperfect chunk,
+use `--force` (optionally scoped with `--chunk`, `--from`, or `--to`).
+
 ### Glossary Flow
 
 The glossary uses an **entity-centric** model. Each `GlossaryEntity` owns one
@@ -203,9 +209,16 @@ The `translate` command runs a multi-pass translation pipeline for each chunk:
    the previous chunk, and rolling narrative summary for continuity.
 2. **Pass 2** (optional) -- Revision pass comparing the draft against the
    original, with instructions to improve naturalness and accuracy.
-3. **QA** (optional) -- Programmatic length-ratio check plus LLM-based quality
-   assessment.  On QA failure after retries, the pipeline halts for manual
-   intervention.
+3. **QA** (optional) -- A programmatic length-ratio check plus an LLM-based
+   defect detector that rates each issue `high` or `low` severity. Only
+   `high`-severity issues (dropped content, repetition loops, refusals,
+   reversed meaning, leaked boilerplate) count as failures; `low`-severity
+   stylistic notes never fail a chunk. On a failure, a targeted **QA-fix
+   pass** corrects the specific defects in the existing translation (up to
+   `qa_max_retries` attempts). QA is **non-blocking**: if no attempt clears
+   all high-severity issues, the best attempt (fewest issues) is kept, a
+   warning is logged, the failed attempts are saved as artifacts for review,
+   and the run continues.
 
 Rolling summaries are generated after each chunk for story continuity across
 the book.

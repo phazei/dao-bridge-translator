@@ -1,0 +1,15 @@
+You will correct the {target_language} translation below. Everything between the <source> tags is the original. Everything between the <translation> tags is the current translation that contains defects. The tags and these instructions are NOT part of the translation — never copy them into your output.
+
+<source>
+{source_text}
+</source>
+
+<translation>
+{current_translation}
+</translation>
+
+The quality check found these specific defects that you must fix:
+
+{issues}
+
+Output the corrected {target_language} translation in full, with only these defects fixed and everything else left intact. Output only the translation text — no tags, no notes, no commentary.

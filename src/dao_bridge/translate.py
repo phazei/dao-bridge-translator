@@ -93,11 +93,27 @@ class QAResult:
     source: Literal["programmatic", "llm"] = "llm"
 
 
+class QAIssue(BaseModel):
+    """A single QA issue with a severity rating.
+
+    ``severity`` gates whether the issue forces a failure:
+
+    - ``"high"`` — a real defect that breaks the translation (dropped or
+      skipped content, refusal, repetition loop, reversed/garbled meaning,
+      or untranslated author/publisher notes leaking into the output).
+    - ``"low"`` — a stylistic or nuance observation that should NOT fail the
+      chunk (word choice, phrasing, minor imagery differences).
+    """
+
+    severity: Literal["high", "low"] = "low"
+    issue: str
+
+
 class QAResponse(BaseModel):
     """Pydantic model for the LLM QA assessment JSON response."""
 
     result: Literal["pass", "fail"]
-    issues: list[str] = []
+    issues: list[QAIssue] = []
 
 
 @dataclass
@@ -584,13 +600,16 @@ def build_pass2_messages(
 def build_qa_messages(
     source_text: str,
     final_translation: str,
+    glossary: Glossary,
     config: AppConfig,
 ) -> list[dict]:
     """Build a fresh message list for QA assessment.
 
-    Contains only the source text and the final translation — no overlap,
-    glossary, or rolling summary.  The QA judge only needs to compare
-    source against output.
+    Contains the source text, the final translation, and the glossary terms
+    relevant to this chunk.  The glossary lets the judge recognise canonical
+    names (e.g. a deliberately chosen nickname rendering) so it does not
+    mistake them for hallucinated proper nouns.  No overlap or rolling summary
+    is included — the judge only compares source against output.
 
     Parameters
     ----------
@@ -598,13 +617,15 @@ def build_qa_messages(
         Original source text for the chunk.
     final_translation:
         The final translation to assess (Pass 2 or Pass 1).
+    glossary:
+        Per-book glossary; relevant entries are injected as reference.
     config:
         Application config.
 
     Returns
     -------
     list[dict]
-        OpenAI chat-format message list (system + user).
+        OpenAI chat-format message list (system + optional glossary + user).
     """
     source_lang = resolve_language_name(config.languages.source)
     target_lang = resolve_language_name(config.languages.target)
@@ -615,6 +636,22 @@ def build_qa_messages(
         target_language=target_lang,
     )
 
+    messages: list[dict] = [{"role": "system", "content": system_content}]
+
+    # Inject the glossary terms relevant to this chunk (filtered by source
+    # text).  These names are authoritative — never flag them as errors.
+    glossary_text = render_glossary(glossary, source_text, "relevant")
+    if glossary_text:
+        glossary_content = (
+            "The following glossary terms are the APPROVED translations for "
+            "this book. Treat every name and rendering below as correct by "
+            "definition. Never flag a translation that matches this glossary "
+            "as a hallucination, misspelling, or wrong name.\n"
+            f"{glossary_text}"
+        )
+        messages.append({"role": "user", "content": glossary_content})
+        messages.append({"role": "assistant", "content": "Understood."})
+
     user_template = _load_prompt_template("translate_qa_user.txt")
     user_content = user_template.format(
         source_language=source_lang,
@@ -622,11 +659,89 @@ def build_qa_messages(
         source_text=source_text,
         translated_text=final_translation,
     )
+    messages.append({"role": "user", "content": user_content})
 
-    return [
-        {"role": "system", "content": system_content},
-        {"role": "user", "content": user_content},
-    ]
+    return messages
+
+
+def build_qa_fix_messages(
+    source_text: str,
+    current_translation: str,
+    issues: list[str],
+    glossary: Glossary,
+    config: AppConfig,
+) -> list[dict]:
+    """Build the message list for a targeted QA-fix pass.
+
+    Unlike Pass 1 (which translates from scratch) or Pass 2 (which polishes
+    on the assumption the text is already correct), this pass is given the
+    existing translation plus the specific high-severity defects the QA judge
+    found.  It operates in one of two modes depending on the defect:
+
+    - **Surgical** (boilerplate leak, repetition): minimal edits to the prose.
+    - **Regenerate** (refusal, missing content): translate from source, since
+      there is no good prose to preserve.
+
+    The glossary is injected (with a "these names are approved" guard) so that
+    when the pass regenerates content it uses the correct canonical names and
+    never "corrects" a name that is already right.  Rolling summary and overlap
+    are deliberately omitted — continuity is irrelevant to a corrective edit.
+
+    Parameters
+    ----------
+    source_text:
+        Original source text for the chunk.
+    current_translation:
+        The translation that failed QA (the text the judge assessed).
+    issues:
+        The high-severity issue descriptions to fix.
+    glossary:
+        Per-book glossary; relevant entries are injected as approved names.
+    config:
+        Application config.
+
+    Returns
+    -------
+    list[dict]
+        OpenAI chat-format message list (system + optional glossary + user).
+    """
+    source_lang = resolve_language_name(config.languages.source)
+    target_lang = resolve_language_name(config.languages.target)
+
+    system_template = _load_prompt_template("translate_qa_fix.txt")
+    system_content = system_template.format(
+        source_language=source_lang,
+        target_language=target_lang,
+    )
+
+    messages: list[dict] = [{"role": "system", "content": system_content}]
+
+    # Inject the glossary terms relevant to this chunk so regenerated content
+    # uses the approved names and existing correct names are left untouched.
+    glossary_text = render_glossary(glossary, source_text, "relevant")
+    if glossary_text:
+        glossary_content = (
+            "The following glossary terms are the APPROVED translations for "
+            "this book. Use these exact renderings for any name or term you "
+            "translate or correct, and never change a name that already "
+            "matches this glossary.\n"
+            f"{glossary_text}"
+        )
+        messages.append({"role": "user", "content": glossary_content})
+        messages.append({"role": "assistant", "content": "Understood."})
+
+    issues_block = "\n".join(f"- {issue}" for issue in issues)
+    user_template = _load_prompt_template("translate_qa_fix_user.txt")
+    user_content = user_template.format(
+        source_language=source_lang,
+        target_language=target_lang,
+        source_text=source_text,
+        current_translation=current_translation,
+        issues=issues_block,
+    )
+    messages.append({"role": "user", "content": user_content})
+
+    return messages
 
 
 # ---------------------------------------------------------------------------
@@ -726,6 +841,54 @@ def _merge_token_usage(base: dict, addition: dict) -> dict:
     return merged
 
 
+def _run_qa(
+    chunk_id: str,
+    source_text: str,
+    final_text: str,
+    glossary: Glossary,
+    llm_client: LLMClient,
+    config: AppConfig,
+) -> tuple[Literal["pass", "fail"] | None, list[str]]:
+    """Assess a translation and return ``(qa_result, high_severity_issues)``.
+
+    Programmatic checks run first.  If they pass, the LLM judge is consulted.
+    Only HIGH-severity issues force a ``"fail"``; low-severity observations are
+    logged but pass.  Returns the list of high-severity issue strings (empty on
+    pass).
+    """
+    tp = config.translation_phase
+
+    prog_result = programmatic_qa_check(source_text, final_text, config)
+    if prog_result is not None:
+        return prog_result.result, list(prog_result.issues)
+
+    messages = build_qa_messages(source_text, final_text, glossary, config)
+    try:
+        qa_resp: QAResponse = llm_client.complete_json(  # type: ignore[assignment]
+            messages,
+            QAResponse,
+            max_retries=3,
+            temperature=tp.qa_temperature,
+            context_label=f"{chunk_id}:qa",
+        )
+    except LLMStructuredOutputError:
+        return "fail", ["QA assessment returned unparseable JSON after retries"]
+
+    high_issues = [i for i in qa_resp.issues if i.severity == "high"]
+    low_issues = [i for i in qa_resp.issues if i.severity != "high"]
+    if low_issues:
+        logger.info(
+            "Chunk %s QA: %d high / %d low-severity issue(s). Low notes: %s",
+            chunk_id,
+            len(high_issues),
+            len(low_issues),
+            "; ".join(i.issue for i in low_issues),
+        )
+    if high_issues:
+        return "fail", [i.issue for i in high_issues]
+    return "pass", []
+
+
 def translate_chunk(
     chunk: Chunk,
     config: AppConfig,
@@ -739,7 +902,8 @@ def translate_chunk(
 
     Performs one translation attempt (Pass 1, optionally Pass 2, optionally
     QA, optionally summary).  Does **not** handle retries — the caller
-    (:func:`run_translate_stage`) manages retry logic on QA failure.
+    (:func:`run_translate_stage`) manages retry logic, running a targeted
+    QA-fix pass (:func:`qa_fix_chunk`) when QA reports high-severity issues.
 
     Parameters
     ----------
@@ -798,28 +962,9 @@ def translate_chunk(
     qa_issues: list[str] = []
 
     if tp.qa_check:
-        # Programmatic checks first.
-        prog_result = programmatic_qa_check(chunk.text, final_text, config)
-        if prog_result is not None:
-            qa_result_val = prog_result.result
-            qa_issues = prog_result.issues
-        else:
-            # LLM judge — fresh conversation with source + translation only.
-            # Token usage is tracked automatically by the client.
-            messages = build_qa_messages(chunk.text, final_text, config)
-            try:
-                qa_resp: QAResponse = llm_client.complete_json(  # type: ignore[assignment]
-                    messages,
-                    QAResponse,
-                    max_retries=3,
-                    temperature=tp.qa_temperature,
-                    context_label=f"{chunk.chunk_id}:qa",
-                )
-                qa_result_val = qa_resp.result
-                qa_issues = qa_resp.issues
-            except LLMStructuredOutputError:
-                qa_result_val = "fail"
-                qa_issues = ["QA assessment returned unparseable JSON after retries"]
+        qa_result_val, qa_issues = _run_qa(
+            chunk.chunk_id, chunk.text, final_text, glossary, llm_client, config
+        )
 
     # --- Rolling summary ---
     summary_text: str | None = None
@@ -845,6 +990,82 @@ def translate_chunk(
         qa_result=qa_result_val,
         qa_issues=qa_issues,
         total_attempts=1,  # caller increments across retries
+        overlap_chunk_id=overlap.chunk_id if overlap else None,
+        summary_generated=summary_text,
+        token_usage=token_usage,
+        model_used=model_used,
+        duration_seconds=round(duration, 2),
+    )
+
+
+def qa_fix_chunk(
+    chunk: Chunk,
+    prior: TranslatedChunk,
+    issues: list[str],
+    config: AppConfig,
+    glossary: Glossary,
+    overlap: TranslatedChunk | None,
+    rolling_summaries: list[dict],
+    llm_client: LLMClient,
+    summary_client: LLMClient | None = None,
+) -> TranslatedChunk:
+    """Run a targeted QA-fix pass on a translation that failed QA.
+
+    Unlike :func:`translate_chunk` (which retranslates from scratch), this
+    takes the *existing* translation plus the specific high-severity issues and
+    asks the model to surgically correct only those defects.  The corrected
+    text is then re-assessed by QA.  Returns a fresh, internally-consistent
+    :class:`TranslatedChunk` whose every field derives from this fix attempt.
+    """
+    tp = config.translation_phase
+    start_time = time.monotonic()
+
+    llm_client.reset_token_usage()
+    s_client = summary_client or llm_client
+    if s_client is not llm_client:
+        s_client.reset_token_usage()
+
+    # --- QA-fix pass ---
+    messages = build_qa_fix_messages(
+        chunk.text, prior.translated_text, issues, glossary, config
+    )
+    result = llm_client.complete(messages)
+    fixed_text = result.text.strip()
+    model_used = result.model or llm_client.config.model
+
+    # --- Re-assess ---
+    qa_result_val: Literal["pass", "fail"] | None = None
+    qa_issues: list[str] = []
+    if tp.qa_check:
+        qa_result_val, qa_issues = _run_qa(
+            chunk.chunk_id, chunk.text, fixed_text, glossary, llm_client, config
+        )
+
+    # --- Rolling summary (only when the fixed text passes) ---
+    summary_text: str | None = None
+    if tp.rolling_summary and qa_result_val != "fail":
+        summary_text = generate_summary(
+            fixed_text, chunk.chunk_id, rolling_summaries, s_client, config
+        )
+
+    token_usage = llm_client.total_token_usage
+    if s_client is not llm_client:
+        token_usage = _merge_token_usage(token_usage, s_client.total_token_usage)
+
+    duration = time.monotonic() - start_time
+
+    return TranslatedChunk(
+        chunk_id=chunk.chunk_id,
+        source_text=chunk.text,
+        # Carry the prior attempt's Pass 1 text so the record stays meaningful;
+        # the fix operates on the final text, not Pass 1.
+        pass1_translation=prior.pass1_translation,
+        pass1_analysis=prior.pass1_analysis,
+        translated_text=fixed_text,
+        pass_count=prior.pass_count,
+        qa_result=qa_result_val,
+        qa_issues=qa_issues,
+        total_attempts=1,  # caller sets the real attempt number
         overlap_chunk_id=overlap.chunk_id if overlap else None,
         summary_generated=summary_text,
         token_usage=token_usage,
@@ -1064,16 +1285,24 @@ def run_translate_stage(
 
         rolling_summaries = _load_rolling_summaries(work_dir)
 
-        # Translation attempts (1 + qa_max_retries).
+        # Attempt 1 is a full translation; subsequent attempts are targeted
+        # QA-fix passes that correct the high-severity issues in the best
+        # translation so far.  max_attempts = 1 + qa_max_retries (QA on).
         max_attempts = 1 + (tp.qa_max_retries if tp.qa_check else 0)
-        final_tc: TranslatedChunk | None = None
+
+        best_tc: TranslatedChunk | None = None  # fewest high-severity issues so far
+        last_tc: TranslatedChunk | None = None  # most recent attempt (for QA-fix input)
 
         for attempt in range(1, max_attempts + 1):
             if progress_cb is not None:
+                if attempt == 1:
+                    pass_name = "Pass 1"
+                else:
+                    pass_name = f"QA-fix (attempt {attempt})"
                 progress_cb(
                     TranslationProgress(
                         chunk_id=chunk_id,
-                        pass_name=f"Pass 1 (attempt {attempt})" if attempt > 1 else "Pass 1",
+                        pass_name=pass_name,
                         tokens_so_far=total_tokens,
                         chunks_completed=completed_count,
                         chunks_total=len(target_ids),
@@ -1081,15 +1310,29 @@ def run_translate_stage(
                 )
 
             try:
-                tc = translate_chunk(
-                    chunk=chunk,
-                    config=config,
-                    glossary=glossary,
-                    overlap=overlap,
-                    rolling_summaries=rolling_summaries,
-                    llm_client=translate_client,
-                    summary_client=summary_client,
-                )
+                if attempt == 1:
+                    tc = translate_chunk(
+                        chunk=chunk,
+                        config=config,
+                        glossary=glossary,
+                        overlap=overlap,
+                        rolling_summaries=rolling_summaries,
+                        llm_client=translate_client,
+                        summary_client=summary_client,
+                    )
+                else:
+                    assert last_tc is not None
+                    tc = qa_fix_chunk(
+                        chunk=chunk,
+                        prior=last_tc,
+                        issues=last_tc.qa_issues,
+                        config=config,
+                        glossary=glossary,
+                        overlap=overlap,
+                        rolling_summaries=rolling_summaries,
+                        llm_client=translate_client,
+                        summary_client=summary_client,
+                    )
             except Exception as exc:
                 # Infrastructure error.
                 error = f"Translation failed: {exc}"
@@ -1104,32 +1347,39 @@ def run_translate_stage(
                     "total_chunks": len(target_ids),
                 }
 
-            tc_with_attempts = TranslatedChunk(**{**tc.model_dump(), "total_attempts": attempt})
-            final_tc = tc_with_attempts
+            tc = TranslatedChunk(
+                **{**tc.model_dump(), "total_attempts": attempt, "selected_attempt": attempt}
+            )
+            last_tc = tc
 
+            # Keep-best: an attempt with zero high-severity issues is a pass —
+            # adopt it and stop early.  Otherwise retain the attempt with the
+            # fewest high-severity issues (ties resolved by the latest attempt).
             if tc.qa_result != "fail":
-                # Passed (or QA disabled).
+                best_tc = tc
                 break
 
-            # QA failed — save failed artifact and log.
+            if best_tc is None or len(tc.qa_issues) <= len(best_tc.qa_issues):
+                best_tc = tc
+
+            # Save the failed attempt as an audit artifact.
             fail_num = next_failed_attempt(work_dir, chunk_id, sw)
             fail_path = failed_translation_path(work_dir, chunk_id, fail_num, sw)
             fail_path.parent.mkdir(parents=True, exist_ok=True)
-            atomic_write(fail_path, tc_with_attempts.model_dump_json(indent=2))
-            logger.info(
-                "Saved failed translation attempt to %s",
-                fail_path.name,
-            )
+            atomic_write(fail_path, tc.model_dump_json(indent=2))
 
             logger.warning(
-                "Chunk %s QA failed (attempt %d/%d): %s",
+                "Chunk %s QA failed (attempt %d/%d, high:%d): %s — saved %s",
                 chunk_id,
                 attempt,
                 max_attempts,
+                len(tc.qa_issues),
                 "; ".join(tc.qa_issues),
+                fail_path.name,
             )
 
-        assert final_tc is not None
+        assert best_tc is not None
+        final_tc = best_tc
 
         # Save translation.
         t_dir = translation_dir(work_dir, chunk.spine_index, sw)
@@ -1144,34 +1394,23 @@ def run_translate_stage(
             )
             _save_rolling_summaries(work_dir, rolling_summaries)
 
-        # Handle final QA result.
+        # Handle final QA result.  QA is advisory and NON-halting: if no attempt
+        # cleared all high-severity issues, we keep the best attempt (fewest
+        # high-severity issues), log a warning, and continue the run.  The
+        # per-attempt failed artifacts remain on disk for later review.
         if final_tc.qa_result == "fail":
-            # All retries exhausted — halt pipeline.
             error_msg = "; ".join(final_tc.qa_issues)
-            mark_item_failed(
-                work_dir,
-                state,
-                _STAGE,
+            logger.warning(
+                "Chunk %s unresolved after %d attempt(s) — keeping best (attempt %d, "
+                "high:%d) and continuing. Issues: %s",
                 chunk_id,
-                error_msg,
-                status="failed_qa",
-            )
-            logger.error(
-                "Chunk %s failed QA after %d attempts — halting pipeline. Issues: %s",
-                chunk_id,
-                final_tc.total_attempts,
+                last_tc.total_attempts if last_tc else 0,
+                final_tc.selected_attempt,
+                len(final_tc.qa_issues),
                 error_msg,
             )
-            return {
-                "completed": completed_count,
-                "total_tokens": total_tokens,
-                "failed_chunk": chunk_id,
-                "error": f"QA failed: {error_msg}",
-                "avg_time": (total_duration / completed_count if completed_count > 0 else 0),
-                "total_chunks": len(target_ids),
-            }
 
-        # Success.
+        # Accept the chunk (passed, or QA-failed-but-kept).
         mark_item_completed(work_dir, state, _STAGE, chunk_id)
         completed_count += 1
         chunk_tokens = final_tc.token_usage.get("total_tokens", 0)

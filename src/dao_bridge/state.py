@@ -55,7 +55,7 @@ StageName = Literal[
     "rebuild",
 ]
 
-ItemStatus = Literal["pending", "started", "completed", "failed", "failed_qa"]
+ItemStatus = Literal["pending", "started", "completed", "failed"]
 
 
 # ---------------------------------------------------------------------------
@@ -237,12 +237,10 @@ def mark_item_failed(
     stage: StageName,
     item_id: str,
     error: str = "",
-    *,
-    status: ItemStatus = "failed",
 ) -> None:
-    """Mark an individual item as failed (or failed_qa)."""
+    """Mark an individual item as failed."""
     key = _item_key(stage, item_id)
-    state.items[key] = ItemState(status=status, error_message=error, completed_at=_now())
+    state.items[key] = ItemState(status="failed", error_message=error, completed_at=_now())
     save_state(work_dir, state)
 
 
@@ -261,7 +259,7 @@ def iter_pending_items(state: PipelineState, stage: StageName, item_ids: list[st
     """Return item IDs from *item_ids* that are not yet completed.
 
     Items with status ``"completed"`` are skipped; everything else
-    (pending, started, failed, failed_qa, or not present) is included.
+    (pending, started, failed, or not present) is included.
     """
     result = []
     for item_id in item_ids:
@@ -274,14 +272,14 @@ def iter_pending_items(state: PipelineState, stage: StageName, item_ids: list[st
 
 
 def has_failed_items(state: PipelineState, stage: StageName) -> bool:
-    """Return *True* if *stage* has any items with ``failed`` or ``failed_qa`` status.
+    """Return *True* if *stage* has any items with ``failed`` status.
 
     Useful for ``--retry-failed`` to check whether there is work to do
     before re-entering a completed stage.
     """
     prefix = f"{stage}:"
     for key, item in state.items.items():
-        if key.startswith(prefix) and item.status in ("failed", "failed_qa"):
+        if key.startswith(prefix) and item.status == "failed":
             return True
     return False
 

@@ -1759,10 +1759,27 @@ def glossary_cluster(
         llm_pairs: list[tuple[str, str]] = []
         if cluster_config.auto_merge_enabled:
             for pair in candidate_list:
-                if score_candidate_confidence(candidates[pair]) == ClusterConfidence.HIGH:
+                confidence = score_candidate_confidence(candidates[pair], cluster_config)
+                if confidence == ClusterConfidence.HIGH:
                     high_pairs.append(pair)
+                elif confidence == ClusterConfidence.LOW:
+                    # LOW only occurs with embeddings on: weak embedding-only
+                    # semantic neighbours. Drop outright — neither auto-merged
+                    # nor sent to the LLM (keeps batch volume sane).
+                    continue
                 else:
                     llm_pairs.append(pair)
+        elif cluster_config.embedding_enabled:
+            # Auto-merge off but embeddings on: nothing auto-merges, but still
+            # drop LOW (weak embedding-only) pairs so the wide embedding net does
+            # not inflate LLM batch volume. Scorer is consulted only for the
+            # LOW/not-LOW decision here.
+            for pair in candidate_list:
+                if score_candidate_confidence(candidates[pair], cluster_config) == (
+                    ClusterConfidence.LOW
+                ):
+                    continue
+                llm_pairs.append(pair)
         else:
             llm_pairs = list(candidate_list)
 

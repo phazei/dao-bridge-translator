@@ -26,6 +26,7 @@ from dao_bridge.glossary import (
 )
 from dao_bridge.glossary_clustering import (
     HEURISTIC_ALIAS_OVERLAP,
+    HEURISTIC_EMBEDDING,
     HEURISTIC_JW,
     HEURISTIC_SHARED_READING,
     HEURISTIC_SOURCE_SUBSTRING,
@@ -2408,23 +2409,25 @@ class TestScoreCandidateConfidence:
 
 
 class TestScorerKnownFalsePositiveBaseline:
-    """Regression baseline: documents TODAY's unsafe HIGH behaviour.
+    """Regression baseline: the string-only scorer's unsafe HIGH behaviour.
 
-    The string-only scorer cannot distinguish "qualifier means same entity"
-    from "qualifier means a distinct rank". Both emit containment + JW + same
-    category and score HIGH. This is a KNOWN false-positive source (see the
-    addendum in build_phases/glossary-cluster-evidence-and-auto-merge.md and the
-    warning on score_candidate_confidence).
+    With embeddings OFF the string-only scorer cannot distinguish "qualifier
+    means same entity" from "qualifier means a distinct rank". Both emit
+    containment + JW + same category and score HIGH. This is a KNOWN
+    false-positive source (see the addendum in
+    build_phases/glossary-cluster-evidence-and-auto-merge.md and the note on
+    score_candidate_confidence).
 
-    The embeddings phase is EXPECTED to change these assertions from HIGH to
-    MEDIUM once an embedding signal corroborates (or overrides) the string
-    heuristics. Flipping them then is an intentional, visible change — not a
-    silent regression.
+    Phase 2A (embeddings) corroborates with cosine: the SAME string evidence,
+    with a depressed cosine, now scores MEDIUM. Both behaviours are asserted
+    here — the OFF path preserves the (unsafe) Phase 1 baseline; the ON path
+    proves the corroboration fix.
     """
 
-    def test_quasi_immortal_emperor_currently_scores_high(self):
+    def test_quasi_immortal_emperor_scores_high_embeddings_off(self):
         """准仙帝/Quasi-Immortal Emperor vs 仙帝/Immortal Emperor are DISTINCT
-        adjacent realms, yet today's scorer says HIGH (wrong)."""
+        adjacent realms, yet the string-only scorer says HIGH (the known,
+        unsafe Phase 1 baseline — preserved when embeddings are OFF)."""
         glossary = Glossary(
             entities=[
                 _make_entity(
@@ -2447,8 +2450,27 @@ class TestScorerKnownFalsePositiveBaseline:
         # + high JW + same category.
         assert HEURISTIC_SOURCE_SUBSTRING in ev.heuristics
         assert HEURISTIC_TRANSLATION_CONTAINMENT in ev.heuristics
-        # KNOWN-UNSAFE: scores HIGH today. Embeddings phase should make MEDIUM.
+        # Embeddings OFF — Phase 1 baseline preserved: scores HIGH (unsafe).
+        # No config argument: exercises the single-arg backward-compat path.
         assert score_candidate_confidence(ev) == ClusterConfidence.HIGH
+        # Same result when config is supplied with embeddings explicitly off.
+        off_config = GlossaryClusterConfig(embedding_enabled=False)
+        assert score_candidate_confidence(ev, off_config) == ClusterConfidence.HIGH
+
+    def test_quasi_immortal_emperor_scores_medium_embeddings_on(self):
+        """The 2A fix: same string evidence (containment + JW + same category),
+        but a depressed cosine demotes it from HIGH to MEDIUM so the LLM
+        adjudicates the adjacent-realm pair."""
+        ev = Evidence(
+            heuristics={
+                HEURISTIC_SOURCE_SUBSTRING,
+                HEURISTIC_TRANSLATION_CONTAINMENT,
+            },
+            same_category=True,
+            cosine=0.70,  # below embedding_auto_merge_min_cosine (0.86)
+        )
+        on_config = GlossaryClusterConfig(embedding_enabled=True)
+        assert score_candidate_confidence(ev, on_config) == ClusterConfidence.MEDIUM
 
 
 # ---------------------------------------------------------------------------
@@ -2753,3 +2775,282 @@ class TestAutoMergeIntegration:
         # Loser of the HIGH auto-merge is gone; t003 survives.
         assert "t003" in ids
         assert len(result.entities) == 2
+
+
+# ---------------------------------------------------------------------------
+# Phase 2A — embedding text assembly (pure-logic, no sentence-transformers)
+# ---------------------------------------------------------------------------
+
+
+class TestEntityEmbeddingText:
+    """entity_embedding_text assembles enriched text, dropping empty parts.
+
+    Pure string assembly — must NOT import sentence_transformers.
+    """
+
+    def test_includes_category_name_sources_translations_summary_hints(self):
+        from dao_bridge.glossary_embeddings import entity_embedding_text
+
+        entity = _make_entity(
+            "c001",
+            "character",
+            "Abel",
+            [
+                {
+                    "source": "アベル",
+                    "translation": "Abel",
+                    "context_hints": ["fugitive", "ties to royalty"],
+                }
+            ],
+            summary="A fugitive traveling under the name Abel.",
+        )
+        text = entity_embedding_text(entity)
+        assert "character" in text
+        assert "Abel" in text
+        assert "アベル" in text
+        assert "A fugitive traveling under the name Abel." in text
+        assert "fugitive" in text
+        assert "ties to royalty" in text
+
+    def test_drops_empty_parts_no_dangling_separators(self):
+        from dao_bridge.glossary_embeddings import entity_embedding_text
+
+        # No summary, no hints — those parts must be dropped entirely.
+        entity = _make_entity(
+            "c001",
+            "character",
+            "Abel",
+            [{"source": "アベル", "translation": "Abel"}],
+        )
+        text = entity_embedding_text(entity)
+        assert ".." not in text  # no empty ". ." segments
+        assert not text.startswith(". ")
+        assert not text.endswith(". ")
+        assert text  # non-empty
+
+
+# ---------------------------------------------------------------------------
+# Phase 2A — confidence scoring with embeddings
+# ---------------------------------------------------------------------------
+
+
+class TestScoreCandidateConfidenceEmbeddings:
+    """Cosine-corroborated scoring rules (embeddings ON)."""
+
+    @staticmethod
+    def _on() -> GlossaryClusterConfig:
+        # Explicit thresholds so these tests assert the SCORING RULES, not the
+        # tuned-per-model config defaults (which can change without breaking the
+        # rule contract).
+        return GlossaryClusterConfig(
+            embedding_enabled=True,
+            embedding_candidate_threshold=0.55,
+            embedding_auto_merge_min_cosine=0.86,
+            embedding_low_confidence_max_cosine=0.55,
+        )
+
+    def test_embedding_only_low_cosine_is_low(self):
+        """Only the embedding heuristic fired + cosine below the LOW floor."""
+        ev = Evidence(
+            heuristics={HEURISTIC_EMBEDDING},
+            same_category=True,
+            cosine=0.50,  # < embedding_low_confidence_max_cosine (0.55 here)
+        )
+        assert score_candidate_confidence(ev, self._on()) == ClusterConfidence.LOW
+
+    def test_embedding_only_mid_cosine_is_medium_not_low(self):
+        """Embedding-only but cosine at/above the LOW floor -> MEDIUM (to LLM)."""
+        ev = Evidence(
+            heuristics={HEURISTIC_EMBEDDING},
+            same_category=True,
+            cosine=0.60,  # >= LOW floor (0.55), < auto floor (0.86)
+        )
+        assert score_candidate_confidence(ev, self._on()) == ClusterConfidence.MEDIUM
+
+    def test_containment_jw_same_category_low_cosine_medium(self):
+        """The 准仙帝/仙帝 fix: strong string evidence + low cosine -> MEDIUM."""
+        ev = Evidence(
+            heuristics={HEURISTIC_SOURCE_SUBSTRING, HEURISTIC_TRANSLATION_CONTAINMENT},
+            same_category=True,
+            cosine=0.70,  # < embedding_auto_merge_min_cosine (0.86)
+        )
+        assert score_candidate_confidence(ev, self._on()) == ClusterConfidence.MEDIUM
+
+    def test_containment_jw_same_category_high_cosine_high(self):
+        """Strong string evidence + corroborating high cosine -> HIGH."""
+        ev = Evidence(
+            heuristics={HEURISTIC_SOURCE_SUBSTRING, HEURISTIC_TRANSLATION_CONTAINMENT},
+            same_category=True,
+            cosine=0.90,  # >= embedding_auto_merge_min_cosine (0.86)
+        )
+        assert score_candidate_confidence(ev, self._on()) == ClusterConfidence.HIGH
+
+    def test_strong_embedding_plus_one_strong_string_same_category_high(self):
+        """Strong embedding (high cosine) + one strong string signal -> HIGH."""
+        ev = Evidence(
+            heuristics={HEURISTIC_EMBEDDING, HEURISTIC_SOURCE_SUBSTRING},
+            same_category=True,
+            cosine=0.88,
+        )
+        assert score_candidate_confidence(ev, self._on()) == ClusterConfidence.HIGH
+
+    def test_high_string_evidence_none_cosine_demoted_to_medium(self):
+        """Would be HIGH on strings, but cosine is None (no embedding row)
+        -> demoted to MEDIUM, never LOW (string evidence still merits LLM)."""
+        ev = Evidence(
+            heuristics={HEURISTIC_SOURCE_SUBSTRING, HEURISTIC_TRANSLATION_CONTAINMENT},
+            same_category=True,
+            cosine=None,
+        )
+        assert score_candidate_confidence(ev, self._on()) == ClusterConfidence.MEDIUM
+
+    def test_strong_string_different_category_high_cosine_still_medium(self):
+        """same_category is still required for HIGH even with high cosine."""
+        ev = Evidence(
+            heuristics={HEURISTIC_SOURCE_SUBSTRING, HEURISTIC_TRANSLATION_CONTAINMENT},
+            same_category=False,
+            cosine=0.95,
+        )
+        assert score_candidate_confidence(ev, self._on()) == ClusterConfidence.MEDIUM
+
+
+class TestScoreCandidateConfidenceOffPathInvariant:
+    """Backward-compat / None-safety contract: embeddings OFF == Phase 1."""
+
+    def test_off_path_never_returns_low_and_ignores_cosine(self):
+        """With embeddings off (config None or disabled), the scorer never
+        returns LOW and never consults cosine — even if cosine is set."""
+        off = GlossaryClusterConfig(embedding_enabled=False)
+        shapes = [
+            Evidence(),
+            Evidence(heuristics={HEURISTIC_JW}, jw_score=0.5),
+            # Cosine set to a LOW-tier value, but OFF path must ignore it.
+            Evidence(heuristics={HEURISTIC_EMBEDDING}, cosine=0.10),
+            Evidence(
+                heuristics={HEURISTIC_SOURCE_SUBSTRING, HEURISTIC_SHARED_READING},
+                same_category=True,
+                cosine=0.10,
+            ),
+        ]
+        for ev in shapes:
+            # None config -> Phase 1 path.
+            assert score_candidate_confidence(ev) != ClusterConfidence.LOW
+            # Explicit disabled config -> identical.
+            assert score_candidate_confidence(ev, off) != ClusterConfidence.LOW
+
+    def test_off_path_high_unchanged_with_cosine_present(self):
+        """A 2+ strong string signal + same-category pair stays HIGH on the OFF
+        path regardless of any cosine value (cosine must not be consulted)."""
+        off = GlossaryClusterConfig(embedding_enabled=False)
+        ev = Evidence(
+            heuristics={HEURISTIC_SOURCE_SUBSTRING, HEURISTIC_TRANSLATION_CONTAINMENT},
+            same_category=True,
+            cosine=0.01,  # would force MEDIUM on the ON path; ignored when off
+        )
+        assert score_candidate_confidence(ev, off) == ClusterConfidence.HIGH
+        assert score_candidate_confidence(ev) == ClusterConfidence.HIGH
+
+
+# ---------------------------------------------------------------------------
+# Phase 2A — embedding candidate generation (requires sentence-transformers)
+# ---------------------------------------------------------------------------
+
+
+class TestEmbeddingCandidateGeneration:
+    """Embedding-sourced candidate generation + cosine population.
+
+    These load a real model, so skip when sentence-transformers is absent.
+    """
+
+    def test_adds_candidates_above_threshold_and_populates_cosine(self):
+        pytest.importorskip("sentence_transformers")
+        glossary = Glossary(
+            entities=[
+                _make_entity(
+                    "c001",
+                    "character",
+                    "Abel",
+                    [{"source": "アベル", "translation": "Abel"}],
+                    summary="A fugitive emperor traveling under the name Abel.",
+                ),
+                _make_entity(
+                    "c002",
+                    "character",
+                    "Vincent Volakia",
+                    [{"source": "ヴィンセント", "translation": "Vincent Volakia"}],
+                    summary="The emperor of Vollachia, ruling under the name Vincent.",
+                ),
+            ]
+        )
+        config = GlossaryClusterConfig(
+            embedding_enabled=True,
+            # Force every pair to clear the candidate threshold so the test does
+            # not depend on a specific model's exact cosine.
+            embedding_candidate_threshold=-1.0,
+        )
+        cands = generate_cluster_candidates(glossary, config)
+        pair = ("c001", "c002")
+        assert pair in cands
+        assert HEURISTIC_EMBEDDING in cands[pair].heuristics
+        # Cosine populated on the pair.
+        assert cands[pair].cosine is not None
+        assert -1.0 <= cands[pair].cosine <= 1.0
+
+    def test_embeddings_off_leaves_cosine_none(self):
+        """Embeddings disabled -> no embedding heuristic, cosine stays None."""
+        glossary = Glossary(
+            entities=[
+                _make_entity(
+                    "c001", "character", "Abel", [{"source": "アベル", "translation": "Abel"}]
+                ),
+                _make_entity(
+                    "c002",
+                    "character",
+                    "Abel-chan",
+                    [{"source": "アベルちゃん", "translation": "Abel-chan"}],
+                ),
+            ]
+        )
+        cands = generate_cluster_candidates(glossary, GlossaryClusterConfig())
+        for ev in cands.values():
+            assert ev.cosine is None
+            assert HEURISTIC_EMBEDDING not in ev.heuristics
+
+    def test_compute_entity_embeddings_aligned_and_normalized(self):
+        pytest.importorskip("sentence_transformers")
+        import numpy as np
+
+        from dao_bridge.glossary_embeddings import compute_entity_embeddings
+
+        glossary = Glossary(
+            entities=[
+                _make_entity(
+                    "c001", "character", "Abel", [{"source": "アベル", "translation": "Abel"}]
+                ),
+                _make_entity(
+                    "c002",
+                    "place",
+                    "Vollachia",
+                    [{"source": "ヴォラキア", "translation": "Vollachia"}],
+                ),
+            ]
+        )
+        entity_ids, emb = compute_entity_embeddings(
+            glossary, "paraphrase-multilingual-MiniLM-L12-v2"
+        )
+        assert entity_ids == ["c001", "c002"]
+        assert emb.shape[0] == 2
+        # Rows are L2-normalized (cosine == dot product).
+        norms = np.linalg.norm(emb, axis=1)
+        assert np.allclose(norms, 1.0, atol=1e-4)
+
+    def test_graceful_error_when_package_missing(self):
+        """If sentence-transformers is missing, _load_model raises a clear
+        RuntimeError pointing at the install extra."""
+        import dao_bridge.glossary_embeddings as ge
+
+        # Simulate the package being unavailable regardless of environment.
+        ge._model_cache.clear()
+        with patch.dict("sys.modules", {"sentence_transformers": None}):
+            with pytest.raises(RuntimeError, match=r"\[embeddings\]"):
+                ge._load_model("does-not-matter")

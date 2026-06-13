@@ -116,12 +116,73 @@ class GlossaryClusterConfig(BaseModel):
     False (the default), every candidate goes to the LLM regardless of
     confidence.
 
-    Defaults to False because the current string-only confidence scorer
-    produces false auto-merges on real data: containment + Jaro-Winkler fire
-    identically for "qualifier means the same entity" and "qualifier means a
-    distinct rank" (see score_candidate_confidence and the addendum in
-    build_phases/glossary-cluster-evidence-and-auto-merge.md). Enabling auto-merge
-    is only recommended once the scorer gains a corroborating embedding signal."""
+    AUTO-MERGE IS NOT PRODUCTION-SAFE WITHOUT ``embedding_enabled=True``. This
+    is a codified lesson, not a preference: the string-only confidence scorer
+    produced a 50% false-merge rate on real data (a live run on perfect-world-cn
+    produced 4 auto-merges, 2 of them wrong). Source/translation containment +
+    Jaro-Winkler fire identically for "qualifier means the same entity" (e.g.
+    ``Dark Huo Ling'er`` is an aspect of ``Huo Ling'er`` — correct) and
+    "qualifier means a distinct rank/thing" (e.g. ``准仙帝``/Quasi-Immortal
+    Emperor is a cultivation realm *just below* ``仙帝``/Immortal Emperor —
+    wrong). The other wrong merge was ``Huang`` vs ``Da Zhuang`` on a
+    coincidental Jaro-Winkler match. See score_candidate_confidence and the
+    addendum in build_phases/glossary-cluster-evidence-and-auto-merge.md.
+
+    Embedding corroboration (``Evidence.cosine``, populated when
+    ``embedding_enabled=True``) is what makes the HIGH tier trustworthy: cosine
+    distance separates the adjacent-realm and coincidental-match cases from
+    genuine aliases. The recommended (and only production-safe) combination is
+    ``embedding_enabled=True`` + ``auto_merge_enabled=True``. Enabling
+    ``auto_merge_enabled=True`` without ``embedding_enabled=True`` is
+    unsupported. The default stays False; flipping it is a user decision."""
+
+    embedding_enabled: bool = False
+    """When True, an embedding heuristic generates additional candidate pairs from
+    semantic similarity, and Evidence.cosine is populated for all candidate pairs
+    (including those found by string heuristics) to inform confidence scoring.
+
+    Requires the optional ``sentence-transformers`` dependency
+    (``pip install dao-bridge-translator[embeddings]``)."""
+
+    embedding_model: str = "Qwen/Qwen3-Embedding-0.6B"
+    """SentenceTransformers model name for the embedding heuristic.
+
+    Qwen3-Embedding-0.6B was selected after a model bake-off (see
+    scripts/probe_embeddings.py and build_phases/glossary-refactor-phase2.md):
+    it gave the cleanest separation between genuine aliases and
+    adjacent-but-distinct entities, kept all 'distinct' probe pairs comfortably
+    below the auto-merge floor (passing the acceptance gate), and was the
+    fastest on CPU (~100 ms/text on glossary-sized strings). MiniLM-L12 (the
+    initial placeholder) and multilingual-e5-large both FAILED the gate — e5 in
+    particular compresses all same-language pairs into a high, overlapping band.
+
+    The thresholds below are tuned to Qwen3's cosine scale. If you change the
+    model you MUST re-tune them with the probe script — cosine scales are NOT
+    portable across embedding models."""
+
+    embedding_candidate_threshold: float = 0.55
+    """Cosine similarity at/above which a pair becomes an embedding-sourced
+    candidate. Embedding candidates still go to the LLM unless corroborated by
+    string evidence. Tuned for Qwen3-Embedding-0.6B: the hardest genuine alias in
+    the probe (アベル/ヴィンセント, a cross-name identity reveal sharing no surface
+    text) scored ~0.60, while a coincidental distinct pair scored ~0.50, so 0.55
+    catches the former without admitting the latter."""
+
+    embedding_auto_merge_min_cosine: float = 0.82
+    """Minimum cosine for an embedding signal to corroborate a HIGH (auto-merge)
+    decision. Pairs below this cannot reach HIGH on string evidence alone once
+    embeddings are enabled. This is the gate-critical knob: it sits ABOVE the
+    highest adjacent-but-distinct probe pair (准仙帝/仙帝 at ~0.77 on Qwen3) with
+    margin, and below genuine same-entity aliases (~0.92), so the dangerous
+    adjacent-realm case is demoted to MEDIUM (LLM review) rather than
+    auto-merged. Re-verify this separation if you change the model."""
+
+    embedding_low_confidence_max_cosine: float = 0.50
+    """Embedding-only candidate pairs (no string heuristic fired) with cosine below
+    this are tiered LOW and auto-rejected without an LLM call. Prevents the wide
+    embedding net from inflating LLM batch volume with weak semantic neighbours.
+    Kept at/just below the candidate threshold so it never rejects a genuine but
+    low-scoring cross-name alias (which we still want the LLM to see)."""
 
 
 class GlossaryCrosscheckConfig(BaseModel):

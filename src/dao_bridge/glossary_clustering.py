@@ -42,6 +42,7 @@ HEURISTIC_TRANSLATION_CONTAINMENT = "translation_containment"
 HEURISTIC_SHARED_READING = "shared_reading"
 HEURISTIC_ALIAS_OVERLAP = "alias_overlap"
 HEURISTIC_JW = "jaro_winkler"
+HEURISTIC_EMBEDDING = "embedding"
 
 # JW magnitude that promotes the Jaro-Winkler signal to "strong" for auto-merge
 # scoring. Deliberately higher than the candidate-generation threshold (0.75):
@@ -78,10 +79,13 @@ class Evidence:
     """For translation-containment matches: the entity_id whose translation
     CONTAINS the other's. None if not applicable or bidirectional."""
 
-    # Reserved for embeddings (NOT populated by this phase). Documented here so
-    # the shape is stable when embeddings land.
+    # Populated by the embedding heuristic when GlossaryClusterConfig
+    # .embedding_enabled is True (Phase 2A); None when embeddings are off or the
+    # pair has no embedding row.
     cosine: float | None = None
-    """Cosine similarity from an embedding heuristic. Always None in this phase."""
+    """Cosine similarity from the embedding heuristic. Populated for ALL candidate
+    pairs (string- and embedding-sourced) when ``embedding_enabled`` is True;
+    ``None`` when embeddings are disabled."""
 
 
 Candidates = dict[CandidatePair, Evidence]
@@ -387,6 +391,59 @@ def _containment_direction_translation(
 # ---------------------------------------------------------------------------
 
 
+def _add_embedding_candidates(
+    glossary: Glossary,
+    config: GlossaryClusterConfig,
+    evidence: dict[CandidatePair, Evidence],
+) -> None:
+    """Add embedding-sourced candidate pairs and populate ``ev.cosine``.
+
+    Mutates *evidence* in place:
+
+    1. Compute embeddings + the full pairwise cosine matrix once.
+    2. For every entity pair with cosine >= ``embedding_candidate_threshold``,
+       add the pair and tag ``HEURISTIC_EMBEDDING``.
+    3. For EVERY pair already in *evidence* (string- or embedding-sourced),
+       populate ``ev.cosine`` from the matrix. This is the key step: the cosine
+       score corroborates or contradicts string evidence during scoring, even
+       for pairs that the string heuristics found.
+
+    Candidate extraction is vectorized — ``cos`` is a numpy array, so the
+    upper-triangle threshold is applied with numpy masking rather than a pure
+    Python O(n^2) loop (which would be paid 3-4x per clustering invocation).
+    """
+    import numpy as np
+
+    from dao_bridge.glossary_embeddings import (
+        compute_entity_embeddings,
+        cosine_matrix,
+    )
+
+    if len(glossary.entities) < 2:
+        return
+
+    entity_ids, emb = compute_entity_embeddings(glossary, config.embedding_model)
+    cos = cosine_matrix(emb)
+    index_of = {eid: i for i, eid in enumerate(entity_ids)}
+
+    # New embedding-sourced candidates — vectorized upper-triangle threshold.
+    iu, ju = np.triu_indices(len(entity_ids), k=1)
+    mask = cos[iu, ju] >= config.embedding_candidate_threshold
+    for i, j in zip(iu[mask], ju[mask], strict=False):
+        pair = _ordered_pair(entity_ids[i], entity_ids[j])
+        if pair[0] == pair[1]:
+            continue
+        evidence[pair].heuristics.add(HEURISTIC_EMBEDDING)
+
+    # Populate cosine for ALL candidate pairs (string- or embedding-sourced).
+    # Only pairs already in `evidence` are looked up, so this loop is over the
+    # candidate set (small), not the full O(n^2) matrix.
+    for (id_a, id_b), ev in evidence.items():
+        ia, ib = index_of.get(id_a), index_of.get(id_b)
+        if ia is not None and ib is not None:
+            ev.cosine = float(cos[ia][ib])
+
+
 def generate_cluster_candidates(
     glossary: Glossary,
     config: GlossaryClusterConfig,
@@ -400,6 +457,13 @@ def generate_cluster_candidates(
     Category is treated as a soft signal — cross-category pairs are allowed so
     that e.g. ``character`` vs ``title`` merges can be evaluated by the LLM.
     Same-category simply provides supporting evidence.
+
+    When ``config.embedding_enabled`` is True, an additional embedding heuristic
+    (Phase 2A) generates semantic candidate pairs the string heuristics cannot
+    reach and populates ``Evidence.cosine`` for *every* candidate pair (string-
+    or embedding-sourced) so the confidence scorer gains a corroborating signal.
+    When embeddings are disabled, behavior is identical to Phase 1 and every
+    ``Evidence.cosine`` stays ``None``.
 
     The return is a ``dict`` keyed by the same canonically ordered ``(a, b)``
     pairs as before, so existing consumers (``if not candidates``,
@@ -425,6 +489,17 @@ def generate_cluster_candidates(
         _jw_similarity_candidates(glossary, threshold=config.jw_threshold),
         HEURISTIC_JW,
     )
+
+    # Embedding heuristic (Phase 2A) — semantic candidate generation + cosine
+    # corroboration. Only runs when explicitly enabled; degrades gracefully via
+    # the lazy import in glossary_embeddings. Embeddings are recomputed every
+    # iteration on purpose: after a merge the surviving entity's embedding text
+    # changes, which is what surfaces transitive semantic merges (see the
+    # "recompute-per-iteration is intentional" note in
+    # build_phases/glossary-refactor-phase2.md). Do NOT hoist this out of the
+    # per-iteration candidate generation.
+    if config.embedding_enabled:
+        _add_embedding_candidates(glossary, config, evidence)
 
     # Annotate same_category, JW magnitude, and containment direction for the
     # pairs we already have. This is annotation of an authoritative pair set,
@@ -454,22 +529,53 @@ def generate_cluster_candidates(
 # ---------------------------------------------------------------------------
 
 
-def score_candidate_confidence(evidence: Evidence) -> ClusterConfidence:
+def score_candidate_confidence(
+    evidence: Evidence,
+    config: GlossaryClusterConfig | None = None,
+) -> ClusterConfidence:
     """Tier a candidate pair from its recorded evidence.
-
-    HIGH (auto-merge) requires multiple strong, agreeing signals AND same
-    category. Everything else is MEDIUM (LLM confirmation). This phase never
-    returns LOW.
 
     Reads evidence only — performs no entity comparison, no recomputation.
 
-    .. warning::
+    Two behavior modes, gated on whether embeddings are enabled:
 
-        This string-only scorer is **known to produce false auto-merges on real
-        data** and ``auto_merge_enabled`` defaults to False because of it. The
-        "2+ strong signals AND same category" rule cannot tell apart two cases
-        that fire identical evidence (source/translation containment + a high
-        Jaro-Winkler score + shared category):
+    **Embeddings OFF (Phase 1 path).** When *config* is ``None`` or
+    ``config.embedding_enabled`` is False, scoring is byte-for-byte Phase 1: HIGH
+    requires "2+ strong string signals AND same category", everything else is
+    MEDIUM, and LOW is never returned. ``Evidence.cosine`` is never consulted on
+    this path. This is the backward-compatibility contract; every existing
+    single-argument caller (and the Phase 1 unit tests) keeps working unchanged.
+
+    **Embeddings ON (Phase 2A path).** ``Evidence.cosine`` corroborates or
+    contradicts the string evidence:
+
+    1. *Embedding-only weak pairs -> LOW (auto-reject).* If the only heuristic is
+       ``HEURISTIC_EMBEDDING`` (no string signal) and
+       ``cosine < embedding_low_confidence_max_cosine``, return LOW so the pair
+       is dropped before partitioning without an LLM call.
+    2. *HIGH requires embedding corroboration.* The "2+ strong signals AND same
+       category" rule additionally requires
+       ``cosine >= embedding_auto_merge_min_cosine``. This is the fix for the
+       ``准仙帝``/``仙帝`` false merge: it has containment + high JW + same
+       category (HIGH under the string-only scorer), but its cosine is depressed
+       by the adjacent-realm summaries, so it drops to MEDIUM and goes to the
+       LLM. A pair that would have been HIGH on strings but has ``cosine is
+       None`` or low cosine is demoted to MEDIUM (not LOW — string evidence still
+       merits LLM review).
+    3. *Embedding as a strong signal.* A
+       ``cosine >= embedding_auto_merge_min_cosine`` counts as one strong signal
+       toward the "2+" tally, so a strong embedding + one strong string signal +
+       same category can reach HIGH (subject to rule 2, satisfied by
+       construction).
+    4. Everything else -> MEDIUM.
+
+    .. note::
+
+        The embedding signal exists because the string-only scorer is **known to
+        produce false auto-merges on real data** (it defaulted ``auto_merge_enabled``
+        to False). The "2+ strong signals AND same category" rule cannot tell
+        apart two cases that fire identical string evidence (source/translation
+        containment + a high Jaro-Winkler score + shared category):
 
         - "qualifier means the SAME entity" — e.g. ``Dark Huo Ling'er`` is an
           aspect of ``Huo Ling'er`` (a correct merge), and
@@ -480,14 +586,13 @@ def score_candidate_confidence(evidence: Evidence) -> ClusterConfidence:
         A live run on perfect-world-cn produced 4 auto-merges, 2 of them wrong
         (the Quasi-/Immortal Emperor case above, and ``Huang`` vs ``Da Zhuang``
         on a coincidental JW match). See the addendum in
-        ``build_phases/glossary-cluster-evidence-and-auto-merge.md``.
-
-        Therefore HIGH is **not trusted by default**. The scorer is intended to
-        gain a corroborating embedding signal (``Evidence.cosine``) in the
-        embeddings phase — embedding distance distinguishes the adjacent-realm
-        and unrelated-character cases — before ``auto_merge_enabled=True`` is
-        recommended.
+        ``build_phases/glossary-cluster-evidence-and-auto-merge.md``. Embedding
+        distance (``Evidence.cosine``) distinguishes the adjacent-realm and
+        unrelated-character cases, which is why ``auto_merge_enabled=True`` is
+        only production-safe alongside ``embedding_enabled=True``.
     """
+    embedding_enabled = config is not None and config.embedding_enabled
+
     strong = {
         HEURISTIC_SOURCE_SUBSTRING,
         HEURISTIC_TRANSLATION_CONTAINMENT,
@@ -503,9 +608,44 @@ def score_candidate_confidence(evidence: Evidence) -> ClusterConfidence:
     if high_jw:
         strong_count += 1
 
-    if strong_count >= 2 and evidence.same_category:
+    # Rule 0 — embeddings disabled: Phase 1 path. Never consults cosine, never
+    # returns LOW. Byte-for-byte Phase 1 behaviour.
+    if not embedding_enabled:
+        if strong_count >= 2 and evidence.same_category:
+            return ClusterConfidence.HIGH
+        return ClusterConfidence.MEDIUM
+
+    # --- Embeddings ON below. All cosine comparisons are guarded by both
+    # `embedding_enabled` (true here) AND `ev.cosine is not None` to avoid a
+    # `None >= float` TypeError. ---
+
+    # Rule 1 — embedding-only weak pairs -> LOW (auto-reject).
+    only_embedding = evidence.heuristics == {HEURISTIC_EMBEDDING}
+    if (
+        only_embedding
+        and evidence.cosine is not None
+        and evidence.cosine < config.embedding_low_confidence_max_cosine
+    ):
+        return ClusterConfidence.LOW
+
+    # Rule 3 — a strong embedding (cosine at/above the auto-merge floor) counts
+    # as one strong signal toward the "2+" tally, alongside the string signals.
+    # Cosine is populated for every candidate pair, so this applies whether the
+    # pair was embedding-sourced or string-sourced.
+    strong_cosine = (
+        evidence.cosine is not None
+        and evidence.cosine >= config.embedding_auto_merge_min_cosine
+    )
+    if strong_cosine:
+        strong_count += 1
+
+    # Rule 2 — HIGH requires 2+ strong signals, same category, AND embedding
+    # corroboration (cosine at/above the auto-merge floor). Otherwise demote to
+    # MEDIUM (string evidence still merits LLM review — never LOW here).
+    if strong_count >= 2 and evidence.same_category and strong_cosine:
         return ClusterConfidence.HIGH
 
+    # Rule 4 — everything else.
     return ClusterConfidence.MEDIUM
 
 

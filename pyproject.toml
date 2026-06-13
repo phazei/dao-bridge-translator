@@ -41,6 +41,10 @@ dev = [
     "pytest-cov>=5.0",
     "ruff>=0.4",
 ]
+embeddings = [
+    "sentence-transformers>=3.0",
+    "numpy>=1.24",
+]
 
 [project.scripts]
 dao-bridge = "dao_bridge.cli:cli"

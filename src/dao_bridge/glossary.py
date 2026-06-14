@@ -933,9 +933,19 @@ def _recompress_summaries_only(
     entity's ``summary``, clears ``summary_compress_done``, and runs only the
     compression pass.  Observations are left intact (they are the input).
 
+    This is a **full restart** of the compression pass: every non-user
+    summary is nulled and recomputed, regardless of how many were already
+    done.  It is therefore usable to restart an *interrupted* compression
+    (a prior aborted ``--force-summaries`` or a crashed deferred pass) — the
+    only precondition is that extraction has produced a build output to
+    recompress.  To merely *resume* the remaining summaries (skip the ones
+    already done), run a plain ``glossary-build`` instead, which self-heals
+    an interrupted compression.
+
     Raises ``RuntimeError`` when summary compression is not enabled in config
     (there are no observations to compress in that case — the naive
-    concatenation path never accumulates them).
+    concatenation path never accumulates them), or when no build output exists
+    yet (extraction has not produced anything to recompress).
     """
     if not config.glossary.summary_compress_enabled:
         raise RuntimeError(
@@ -944,22 +954,28 @@ def _recompress_summaries_only(
             "to recompress)."
         )
 
-    if not is_stage_completed(state, stage):
-        raise RuntimeError(
-            "Glossary build is not completed — run 'dao-bridge glossary-build' first "
-            "before using --force-summaries."
-        )
-
+    # The real precondition is a build output to recompress — NOT a "completed"
+    # coarse stage flag.  An interrupted compression leaves the stage "running"
+    # (see reopen_stage below), and rejecting that state is exactly what
+    # prevented restarting a half-finished summary pass.  Operate on whatever
+    # extraction has produced; this command never re-extracts.
     bp = glossary_build_path(work_dir)
     if not bp.exists():
         raise RuntimeError(
-            "Glossary build output not found. Run 'dao-bridge glossary-build' first."
+            "Glossary build has not produced output yet — run "
+            "'dao-bridge glossary-build' first before using --force-summaries."
         )
 
     glossary = _load_glossary(work_dir, bp)
     glossary.book_id = manifest.book_id
     glossary.book_metadata = manifest.metadata
     meta = _load_build_meta(work_dir)
+
+    # Reopen the stage before mutating summaries so the coarse flag stays honest:
+    # while compression is in progress the stage is "running", and an interrupt
+    # mid-pass leaves it running + summary_compress_done=False (which a later
+    # plain run/glossary-build will resume) rather than falsely "completed".
+    reopen_stage(work_dir, state, stage)
 
     # Null summaries for all non-user entities so the pass recomputes them.
     reset_count = 0
@@ -978,6 +994,10 @@ def _recompress_summaries_only(
 
     # Build output changed → downstream cluster/reconcile are now stale.
     _invalidate_downstream_stages(work_dir, state, stage)
+
+    # Compression finished (compress_entity_summaries set summary_compress_done):
+    # the stage is now honestly complete again.
+    mark_stage_completed(work_dir, state, stage)
 
     logger.info("Summary recompression complete.")
     return glossary
@@ -1659,6 +1679,41 @@ def glossary_build(
         reopen_stage(work_dir, state, stage)
 
     if not force and not retry_failed and not targeted and is_stage_completed(state, stage):
+        # The coarse stage flag means "extraction batches done".  When summary
+        # compression is enabled it is part of this stage but tracked separately
+        # via meta.summary_compress_done (it runs as a deferred tail pass).  An
+        # interrupted compression (e.g. an aborted --force-summaries) can leave
+        # the stage flagged "completed" while most summaries are still null, so
+        # don't skip in that case — resume the compression pass instead.
+        if config.glossary.summary_compress_enabled and not _load_build_meta(
+            work_dir
+        ).summary_compress_done:
+            logger.info(
+                "Glossary build extraction is complete but summary compression is "
+                "unfinished — resuming compression pass."
+            )
+            reopen_stage(work_dir, state, stage)
+            glossary = _load_glossary(work_dir, glossary_build_path(work_dir))
+            glossary.book_id = manifest.book_id
+            glossary.book_metadata = manifest.metadata
+            meta = _load_build_meta(work_dir)
+            compress_entity_summaries(
+                work_dir,
+                config,
+                glossary,
+                meta,
+                save_path=glossary_build_path(work_dir),
+            )
+            # Downstream cluster/reconcile may have been built over the
+            # incomplete (null-summary) glossary, so they are now stale.
+            _invalidate_downstream_stages(work_dir, state, stage)
+            mark_stage_completed(work_dir, state, stage)
+            logger.info(
+                "Glossary build complete: %d entities (compression resumed)",
+                len(glossary.entities),
+            )
+            return glossary
+
         logger.info("Glossary build already completed — skipping (use --force to re-run)")
         return _load_glossary(work_dir, glossary_build_path(work_dir))
 

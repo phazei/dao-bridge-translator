@@ -51,10 +51,12 @@ from dao_bridge.schemas import (
 )
 from dao_bridge.state import (
     PipelineState,
+    is_stage_completed,
     load_state,
     mark_item_completed,
     mark_stage_completed,
     mark_stage_started,
+    save_state,
 )
 from dao_bridge.workdir import (
     atomic_write,
@@ -1473,6 +1475,280 @@ class TestGlossaryBuildSummaryCompression:
 
         with pytest.raises(RuntimeError, match="summary_compress_enabled"):
             glossary_build(work, config, state, force_summaries=True)
+
+    def test_force_summaries_no_build_output_errors(self, tmp_path):
+        """Without a build output there is nothing to recompress."""
+        work = _setup_work_dir(tmp_path)
+        config = _make_config(work)
+        config.glossary.summary_compress_enabled = True
+        state = load_state(work)
+        _mark_prior_stages_complete(work, state)
+        _make_manifest(work, n_spines=1, chunks_per_spine=1)
+        _write_chunks(work, n_spines=1, chunks_per_spine=1, tokens_per_chunk=500)
+        # No glossary_build.json on disk (extraction never ran).
+        assert not glossary_build_path(work).exists()
+
+        with pytest.raises(RuntimeError, match="has not produced output"):
+            glossary_build(work, config, state, force_summaries=True)
+
+    def test_force_summaries_restarts_interrupted_running_stage(self, tmp_path):
+        """--force-summaries restarts compression even when the stage is
+        ``running`` from an interrupted prior pass (the regression: it used to
+        reject any non-``completed`` stage)."""
+        work = _setup_work_dir(tmp_path)
+        config = _make_config(work)
+        state = load_state(work)
+        self._build_then_gut_compression(work, config, state)
+
+        # Simulate the interrupted-mid-pass state: stage "running", done flag
+        # already cleared by _build_then_gut_compression.
+        state.stages["glossary_build"].status = "running"
+        save_state(work, state)
+        assert not is_stage_completed(state, "glossary_build")
+        meta = _load_build_meta(work)
+        assert meta.summary_compress_done is False
+
+        with patch("dao_bridge.glossary.LLMClient") as mock_llm_cls:
+            client = MagicMock()
+
+            def _only_compress(messages, response_model=None, **kwargs):
+                assert response_model is GlossarySummaryCompressResponse
+                return GlossarySummaryCompressResponse(summary="Restarted.")
+
+            client.complete_json.side_effect = _only_compress
+            mock_llm_cls.return_value = client
+            glossary = glossary_build(work, config, state, force_summaries=True)
+
+        subaru = next(e for e in glossary.entities if e.canonical_name == "Subaru")
+        assert subaru.summary == "Restarted."
+        # The pass finished, so the stage is honestly completed again.
+        assert is_stage_completed(state, "glossary_build")
+        assert _load_build_meta(work).summary_compress_done is True
+
+    def test_force_summaries_renulls_already_done_summaries(self, tmp_path):
+        """--force-summaries is a full restart: an entity that already has a
+        summary is re-nulled and recomputed (not resume-skipped)."""
+        work = _setup_work_dir(tmp_path)
+        config = _make_config(work)
+        state = load_state(work)
+        self._build_then_gut_compression(work, config, state)
+
+        # Give the entity a pre-existing summary so we can prove it is redone.
+        bp = glossary_build_path(work)
+        glossary = _load_glossary(work, bp)
+        subaru = next(e for e in glossary.entities if e.canonical_name == "Subaru")
+        subaru.summary = "Stale summary that must be replaced."
+        _save_glossary(work, glossary, bp)
+
+        with patch("dao_bridge.glossary.LLMClient") as mock_llm_cls:
+            client = MagicMock()
+            client.complete_json.side_effect = lambda *a, **k: GlossarySummaryCompressResponse(
+                summary="Freshly recomputed."
+            )
+            mock_llm_cls.return_value = client
+            glossary = glossary_build(work, config, state, force_summaries=True)
+
+        subaru = next(e for e in glossary.entities if e.canonical_name == "Subaru")
+        assert subaru.summary == "Freshly recomputed."
+        # An LLM call was made for the entity (it was not resume-skipped).
+        assert client.complete_json.call_count == 1
+
+    def _build_then_gut_compression(self, work, config, state):
+        """Build a glossary, then simulate an interrupted compression pass.
+
+        Leaves the project in the inconsistent state an aborted
+        ``--force-summaries`` produces: stage flag still ``completed``,
+        ``summary_compress_done=False``, and the entity summary nulled while its
+        observations remain.
+        """
+        config.glossary.summary_compress_enabled = True
+        config.glossary_phase.target_tokens_per_call = 600
+        config.glossary_phase.min_batch_tokens = 100
+        _mark_prior_stages_complete(work, state)
+        _make_manifest(work, n_spines=1, chunks_per_spine=2)
+        _write_chunks(work, n_spines=1, chunks_per_spine=2, tokens_per_chunk=500)
+
+        batch1 = _mock_extraction_response(
+            mentions=[
+                {
+                    "source": "スバル",
+                    "translation": "Subaru",
+                    "category": "character",
+                    "summary_update": "First.",
+                }
+            ]
+        )
+        batch2 = _mock_extraction_response(
+            mentions=[
+                {
+                    "source": "スバル",
+                    "translation": "Subaru",
+                    "category": "character",
+                    "summary_update": "Second.",
+                }
+            ]
+        )
+        with patch("dao_bridge.glossary.LLMClient") as mock_llm_cls:
+            mock_llm_cls.return_value = _dispatching_client(
+                [batch1, batch2], compress_summary="Initial compressed."
+            )
+            glossary_build(work, config, state, force=True)
+
+        # Simulate the aborted --force-summaries: gut the summary, clear the
+        # done flag, but leave the coarse stage flag at "completed".
+        bp = glossary_build_path(work)
+        glossary = _load_glossary(work, bp)
+        subaru = next(e for e in glossary.entities if e.canonical_name == "Subaru")
+        subaru.summary = None
+        _save_glossary(work, glossary, bp)
+        meta = _load_build_meta(work)
+        meta.summary_compress_done = False
+        _save_build_meta(work, meta)
+        assert is_stage_completed(state, "glossary_build")  # stale "completed"
+
+    def test_run_resumes_unfinished_compression_instead_of_skipping(self, tmp_path):
+        """A plain build over an interrupted compression resumes it, not skip."""
+        work = _setup_work_dir(tmp_path)
+        config = _make_config(work)
+        state = load_state(work)
+        self._build_then_gut_compression(work, config, state)
+
+        # A plain run (no flags) must NOT early-return; it must recompress.
+        with patch("dao_bridge.glossary.LLMClient") as mock_llm_cls:
+            client = MagicMock()
+
+            def _only_compress(messages, response_model=None, **kwargs):
+                assert response_model is GlossarySummaryCompressResponse
+                return GlossarySummaryCompressResponse(summary="Resumed compressed.")
+
+            client.complete_json.side_effect = _only_compress
+            mock_llm_cls.return_value = client
+            glossary = glossary_build(work, config, state)
+            assert client.complete_json.call_count == 1
+
+        subaru = next(e for e in glossary.entities if e.canonical_name == "Subaru")
+        assert subaru.summary == "Resumed compressed."
+        meta = _load_build_meta(work)
+        assert meta.summary_compress_done is True
+        assert is_stage_completed(state, "glossary_build")
+
+    def test_run_invalidates_downstream_when_resuming_compression(self, tmp_path):
+        """Resuming compression marks cluster/reconcile stale (they may have run
+        over null summaries)."""
+        work = _setup_work_dir(tmp_path)
+        config = _make_config(work)
+        state = load_state(work)
+        self._build_then_gut_compression(work, config, state)
+
+        # Pretend downstream stages had run over the gutted glossary.
+        mark_stage_completed(work, state, "glossary_cluster")
+        mark_stage_completed(work, state, "glossary_reconcile")
+
+        with patch("dao_bridge.glossary.LLMClient") as mock_llm_cls:
+            client = MagicMock()
+            client.complete_json.return_value = GlossarySummaryCompressResponse(
+                summary="Resumed."
+            )
+            mock_llm_cls.return_value = client
+            glossary_build(work, config, state)
+
+        assert not is_stage_completed(state, "glossary_cluster")
+        assert not is_stage_completed(state, "glossary_reconcile")
+
+    def test_completed_compression_still_skips(self, tmp_path):
+        """A fully-complete build (compression done) early-returns without LLM."""
+        work = _setup_work_dir(tmp_path)
+        config = _make_config(work)
+        config.glossary.summary_compress_enabled = True
+        state = load_state(work)
+        _mark_prior_stages_complete(work, state)
+        _make_manifest(work, n_spines=1, chunks_per_spine=1)
+        _write_chunks(work, n_spines=1, chunks_per_spine=1, tokens_per_chunk=500)
+
+        resp = _mock_extraction_response(
+            mentions=[
+                {
+                    "source": "スバル",
+                    "translation": "Subaru",
+                    "category": "character",
+                    "summary_update": "A boy.",
+                }
+            ]
+        )
+        with patch("dao_bridge.glossary.LLMClient") as mock_llm_cls:
+            client = MagicMock()
+            client.complete_json.return_value = resp
+            mock_llm_cls.return_value = client
+            glossary_build(work, config, state, force=True)
+
+        assert _load_build_meta(work).summary_compress_done is True
+
+        # Second plain run: no LLM client should ever be constructed.
+        with patch("dao_bridge.glossary.LLMClient") as mock_llm_cls:
+            glossary_build(work, config, state)
+            mock_llm_cls.assert_not_called()
+
+    def test_disabled_completed_build_skips_without_resume(self, tmp_path):
+        """Compression disabled: a completed build always skips immediately."""
+        work = _setup_work_dir(tmp_path)
+        config = _make_config(work)  # compression disabled
+        state = load_state(work)
+        _mark_prior_stages_complete(work, state)
+        _make_manifest(work, n_spines=1, chunks_per_spine=1)
+        _write_chunks(work, n_spines=1, chunks_per_spine=1, tokens_per_chunk=500)
+
+        resp = _mock_extraction_response(
+            mentions=[{"source": "ス", "translation": "S", "category": "character"}]
+        )
+        with patch("dao_bridge.glossary.LLMClient") as mock_llm_cls:
+            client = MagicMock()
+            client.complete_json.return_value = resp
+            mock_llm_cls.return_value = client
+            glossary_build(work, config, state, force=True)
+
+        with patch("dao_bridge.glossary.LLMClient") as mock_llm_cls:
+            glossary_build(work, config, state)
+            mock_llm_cls.assert_not_called()
+
+    def test_force_summaries_marks_stage_completed(self, tmp_path):
+        """--force-summaries leaves the stage honestly completed afterwards."""
+        work = _setup_work_dir(tmp_path)
+        config = _make_config(work)
+        state = load_state(work)
+        self._build_then_gut_compression(work, config, state)
+
+        with patch("dao_bridge.glossary.LLMClient") as mock_llm_cls:
+            client = MagicMock()
+            client.complete_json.return_value = GlossarySummaryCompressResponse(
+                summary="Forced."
+            )
+            mock_llm_cls.return_value = client
+            glossary_build(work, config, state, force_summaries=True)
+
+        assert is_stage_completed(state, "glossary_build")
+        assert _load_build_meta(work).summary_compress_done is True
+
+    def test_force_summaries_interrupt_leaves_resumable_state(self, tmp_path):
+        """If --force-summaries fails mid-pass, the stage is not 'completed' so a
+        later run resumes it."""
+        work = _setup_work_dir(tmp_path)
+        config = _make_config(work)
+        state = load_state(work)
+        self._build_then_gut_compression(work, config, state)
+        # Re-give the entity a summary so reopen+gut path runs cleanly; the
+        # helper already nulled it, which is fine — force-summaries nulls anyway.
+
+        with patch(
+            "dao_bridge.glossary.compress_entity_summaries",
+            side_effect=RuntimeError("boom"),
+        ):
+            with pytest.raises(RuntimeError, match="boom"):
+                glossary_build(work, config, state, force_summaries=True)
+
+        # Stage must NOT be 'completed' (it was reopened to 'running' before the
+        # failing pass) and compression is still flagged unfinished.
+        assert not is_stage_completed(state, "glossary_build")
+        assert _load_build_meta(work).summary_compress_done is False
 
 
 # ---------------------------------------------------------------------------

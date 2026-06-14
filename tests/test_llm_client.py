@@ -85,6 +85,101 @@ class TestComplete:
 
 
 # ---------------------------------------------------------------------------
+# context_label on start/success log lines
+# ---------------------------------------------------------------------------
+
+
+def _renders_literally_on_console(message: str, expected_prefix: str) -> bool:
+    """Return whether *message* renders with *expected_prefix* through a
+    markup-enabled Rich console (mimics the live console handler).
+
+    A bare ``[summary:<id>]`` would be parsed as a style tag and dropped; the
+    escaped form must survive as literal text.
+    """
+    from io import StringIO
+
+    from rich.console import Console
+
+    buf = StringIO()
+    Console(file=buf, force_terminal=False, markup=True, width=200).print(message)
+    return buf.getvalue().startswith(expected_prefix)
+
+
+class TestContextLabel:
+    @patch("dao_bridge.llm_client.openai.OpenAI")
+    def test_label_on_start_and_success_lines(self, mock_openai_cls, caplog):
+        mock_client = MagicMock()
+        mock_openai_cls.return_value = mock_client
+        mock_client.chat.completions.create.return_value = _mock_response("ok")
+
+        client = LLMClient(ModelConfig(model="test-model"))
+        with caplog.at_level("INFO", logger="dao_bridge"):
+            client.complete(
+                [{"role": "user", "content": "hi"}],
+                context_label="0014.b3",
+            )
+
+        start = next(m for m in caplog.messages if "LLM request start" in m)
+        success = next(m for m in caplog.messages if "LLM request success" in m)
+        # Batch IDs are not tag-like, so they are not escaped and render as-is.
+        assert start.startswith("[0014.b3] ")
+        assert success.startswith("[0014.b3] ")
+        assert _renders_literally_on_console(start, "[0014.b3] ")
+
+    @patch("dao_bridge.llm_client.openai.OpenAI")
+    def test_summary_label_is_escaped_and_renders_literally(self, mock_openai_cls, caplog):
+        mock_client = MagicMock()
+        mock_openai_cls.return_value = mock_client
+        mock_client.chat.completions.create.return_value = _mock_response("ok")
+
+        client = LLMClient(ModelConfig(model="test-model"))
+        with caplog.at_level("INFO", logger="dao_bridge"):
+            client.complete(
+                [{"role": "user", "content": "hi"}],
+                context_label="summary:place_000001",
+            )
+
+        start = next(m for m in caplog.messages if "LLM request start" in m)
+        # The colon-form label is tag-like, so it is escaped in the raw record...
+        assert start.startswith("\\[summary:place_000001] ")
+        # ...and therefore survives Rich markup rendering on the console.
+        assert _renders_literally_on_console(start, "[summary:place_000001] ")
+
+    @patch("dao_bridge.llm_client.openai.OpenAI")
+    def test_no_label_no_prefix(self, mock_openai_cls, caplog):
+        mock_client = MagicMock()
+        mock_openai_cls.return_value = mock_client
+        mock_client.chat.completions.create.return_value = _mock_response("ok")
+
+        client = LLMClient(ModelConfig(model="test-model"))
+        with caplog.at_level("INFO", logger="dao_bridge"):
+            client.complete([{"role": "user", "content": "hi"}])
+
+        start = next(m for m in caplog.messages if "LLM request start" in m)
+        assert start.startswith("LLM request start")
+
+    @patch("dao_bridge.llm_client.openai.OpenAI")
+    def test_complete_json_forwards_label_to_start_line(self, mock_openai_cls, caplog):
+        mock_client = MagicMock()
+        mock_openai_cls.return_value = mock_client
+        mock_client.chat.completions.create.return_value = _mock_response(
+            '{"name": "x", "value": 1}'
+        )
+
+        client = LLMClient(ModelConfig(model="test-model"))
+        with caplog.at_level("INFO", logger="dao_bridge"):
+            client.complete_json(
+                [{"role": "user", "content": "hi"}],
+                response_model=SimpleResponse,
+                context_label="summary:character_000007",
+            )
+
+        start = next(m for m in caplog.messages if "LLM request start" in m)
+        assert start.startswith("\\[summary:character_000007] ")
+        assert _renders_literally_on_console(start, "[summary:character_000007] ")
+
+
+# ---------------------------------------------------------------------------
 # Retry on transient errors
 # ---------------------------------------------------------------------------
 

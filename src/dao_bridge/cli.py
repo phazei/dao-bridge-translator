@@ -168,11 +168,20 @@ def _run_glossary_build_with_progress(
     state,
     force: bool = False,
     retry_failed: bool = False,
+    force_summaries: bool = False,
     target_spine: int | None = None,
     target_batch: str | None = None,
     verbose: bool = False,
 ):
     """Run glossary-build wrapped in a Rich Progress bar.
+
+    The single task follows the whole stage across both sub-phases: extraction
+    batches (``phase="extract"``) and the deferred summary-compression pass
+    (``phase="compress"``).  On a phase switch the task is reset and relabelled
+    ("Building glossary" -> "Compressing summaries") with a fresh total.
+
+    ``force_summaries`` runs the Phase 2B recompression-only path through the
+    same bar (it reports only the ``"compress"`` phase).
 
     Returns the :class:`Glossary` from :func:`glossary_build`.
     """
@@ -189,7 +198,7 @@ def _run_glossary_build_with_progress(
 
     progress = Progress(
         SpinnerColumn(),
-        TextColumn("Building glossary"),
+        TextColumn("{task.description}"),
         BarColumn(bar_width=20),
         MofNCompleteColumn(),
         TextColumn("{task.fields[item]}", style="bold"),
@@ -200,16 +209,39 @@ def _run_glossary_build_with_progress(
         refresh_per_second=2,
     )
 
+    current_phase: list[str | None] = [None]
+
     def _on_progress(p: GlossaryBuildProgress) -> None:
-        if task_id is not None:
-            # Extract sub-batch index from item_id (e.g. "0003.b2" -> "b2").
+        if task_id is None:
+            return
+        # Compression reports entity IDs (no ".bN" suffix); extraction reports
+        # spine-aligned batch IDs (e.g. "0003.b2").
+        if p.phase == "extract":
             _dot, batch_part = p.item_id.rsplit(".", 1)
+            of_batch = f"of {batch_part[0]}{p.spine_batch_count}"
+        else:
+            of_batch = ""
+
+        if p.phase != current_phase[0]:
+            # Phase switched: reset the task for the new phase.  Rich's reset()
+            # CLEARS every custom field, so each one (item, of_batch) must be
+            # re-supplied here or the next render raises KeyError.
+            current_phase[0] = p.phase
+            progress.reset(
+                task_id,
+                total=p.items_total,
+                completed=1,
+                description=p.phase_label,
+                item=p.item_id,
+                of_batch=of_batch,
+            )
+        else:
             progress.update(
                 task_id,
                 total=p.items_total,
                 advance=1,
                 item=p.item_id,
-                of_batch=f"of {batch_part[0]}{p.spine_batch_count}",
+                of_batch=of_batch,
             )
 
     task_id = None
@@ -228,6 +260,7 @@ def _run_glossary_build_with_progress(
                 state,
                 force=force,
                 retry_failed=retry_failed,
+                force_summaries=force_summaries,
                 target_spine=target_spine,
                 target_batch=target_batch,
                 on_progress=_on_progress,
@@ -922,10 +955,14 @@ def glossary_build_cmd(
     state = load_state(work)
 
     if force_summaries:
-        from dao_bridge.glossary import glossary_build
-
         try:
-            glossary = glossary_build(work, config, state, force_summaries=True)
+            glossary = _run_glossary_build_with_progress(
+                work=work,
+                config=config,
+                state=state,
+                force_summaries=True,
+                verbose=ctx.obj["verbose"],
+            )
         except RuntimeError as exc:
             raise click.ClickException(str(exc)) from exc
         click.echo(

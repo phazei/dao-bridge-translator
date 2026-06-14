@@ -14,6 +14,29 @@ from rich.console import Console
 from rich.logging import RichHandler
 
 
+class _PlainMarkupFormatter(logging.Formatter):
+    """File formatter that undoes Rich-escaping of bracket tokens.
+
+    The console handler has ``markup=True``, so
+    :func:`dao_bridge.llm_client._context_prefix` escapes the ``[label]`` token
+    (``rich.markup.escape`` inserts a backslash before the ``[``) to stop Rich
+    from parsing it as a style tag and dropping it.  On the console Rich strips
+    that backslash automatically; the plain-text file handler would otherwise
+    keep it (``\\[summary:<id>]``).
+
+    ``rich.markup.escape`` only ever inserts ``\\`` immediately before a ``[``
+    that opens a tag-like token, so reversing exactly ``\\[`` -> ``[`` is its
+    precise inverse.  This is deliberately targeted: a blanket
+    ``rich.markup.render().plain`` would also eat arbitrary markup-like text in
+    messages (e.g. ``something [not a tag] here`` or raw LLM responses), which
+    would lose content in ``run.log``.  Intentional styled tags elsewhere (e.g.
+    ``[bold]`` in :mod:`dao_bridge.state`) are left as-is, unchanged from before.
+    """
+
+    def format(self, record: logging.LogRecord) -> str:
+        return super().format(record).replace("\\[", "[")
+
+
 def _make_utf8_console() -> Console:
     """Create a Rich Console that writes UTF-8 to stdout.
 
@@ -72,7 +95,7 @@ def setup_logging(work_dir: Path, verbose: bool = False) -> logging.Logger:
     file_handler = logging.FileHandler(log_file, encoding="utf-8")
     file_handler.setLevel(logging.DEBUG)
     file_handler.setFormatter(
-        logging.Formatter(
+        _PlainMarkupFormatter(
             "%(asctime)s | %(levelname)-8s | %(name)s.%(module)s | %(message)s",
             datefmt="%Y-%m-%d %H:%M:%S",
         )

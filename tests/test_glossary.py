@@ -1289,6 +1289,49 @@ class TestCompressEntitySummariesPass:
         assert done.summary == "already done"
         assert pending.summary == "new summary"
 
+    def test_on_progress_fires_per_entity(self, tmp_path):
+        """on_progress fires for every entity that needs compression, including
+        bootstrap and resume-skipped ones."""
+        work = _setup_work_dir(tmp_path)
+        config = _make_config(work)
+        config.glossary.summary_compress_enabled = True
+        # LLM-compressed (2 obs), bootstrap (1 obs), already-done (resume-skip).
+        ent_llm = _make_entity(entity_id="character_000001", summary=None)
+        ent_llm.summary_observations = [
+            SummaryObservation(chunk_id="0001.001", text="a"),
+            SummaryObservation(chunk_id="0001.002", text="b"),
+        ]
+        ent_boot = _make_entity(entity_id="character_000002", summary=None)
+        ent_boot.summary_observations = [SummaryObservation(chunk_id="0002.001", text="solo")]
+        ent_done = _make_entity(entity_id="character_000003", summary="already")
+        ent_done.summary_observations = [
+            SummaryObservation(chunk_id="0003.001", text="c"),
+            SummaryObservation(chunk_id="0003.002", text="d"),
+        ]
+        glossary = Glossary(entities=[ent_llm, ent_boot, ent_done], book_id="test-book")
+        bp = glossary_build_path(work)
+        _save_glossary(work, glossary, bp)
+
+        seen: list[str] = []
+        with patch("dao_bridge.glossary.LLMClient") as mock_llm_cls:
+            mock_client = MagicMock()
+            mock_client.complete_json.return_value = _compress_response("x")
+            mock_llm_cls.return_value = mock_client
+            compress_entity_summaries(
+                work,
+                config,
+                glossary,
+                _BuildMeta(),
+                save_path=bp,
+                on_progress=lambda eid: seen.append(eid),
+            )
+
+        assert seen == [
+            "character_000001",
+            "character_000002",
+            "character_000003",
+        ]
+
 
 def _dispatching_client(extraction_responses, compress_summary="Compressed."):
     """A MagicMock LLM client whose complete_json dispatches by response_model.
@@ -3852,3 +3895,60 @@ class TestGlossaryIntegration:
         # All three stage output files should coexist.
         assert glossary_build_path(work).exists()
         assert glossary_cluster_path(work).exists()
+
+
+class TestGlossaryBuildProgressWrapper:
+    """The CLI progress wrapper follows both build sub-phases on one task."""
+
+    def test_phase_switch_resets_without_keyerror(self, tmp_path):
+        """Switching extract -> compress must reset the task while re-supplying
+        every custom field (item, of_batch); a missing field raises
+        ``KeyError: 'item'`` on the next render."""
+        from dao_bridge.cli import _run_glossary_build_with_progress
+        from dao_bridge.glossary import GlossaryBuildProgress
+
+        captured: dict[str, object] = {}
+
+        def fake_build(work, config, state, *, on_progress=None, **kwargs):
+            # Extraction batches.
+            on_progress(
+                GlossaryBuildProgress(
+                    item_id="0001.b1", spine_batch_count=2, items_total=2
+                )
+            )
+            on_progress(
+                GlossaryBuildProgress(
+                    item_id="0001.b2", spine_batch_count=2, items_total=2
+                )
+            )
+            # Deferred compression pass (phase switch).
+            on_progress(
+                GlossaryBuildProgress(
+                    item_id="character_000001",
+                    spine_batch_count=0,
+                    items_total=3,
+                    phase="compress",
+                    phase_label="Compressing summaries",
+                )
+            )
+            on_progress(
+                GlossaryBuildProgress(
+                    item_id="character_000002",
+                    spine_batch_count=0,
+                    items_total=3,
+                    phase="compress",
+                    phase_label="Compressing summaries",
+                )
+            )
+            captured["glossary"] = MagicMock(entities=[])
+            return captured["glossary"]
+
+        with patch("dao_bridge.glossary.glossary_build", fake_build):
+            result = _run_glossary_build_with_progress(
+                work=tmp_path,
+                config=MagicMock(),
+                state=MagicMock(),
+            )
+
+        # No KeyError raised during rendering means the reset re-supplied fields.
+        assert result is captured["glossary"]

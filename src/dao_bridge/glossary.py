@@ -239,14 +239,53 @@ def _load_all_chunks(work_dir: Path, manifest) -> list[Chunk]:
 
 @dataclass
 class GlossaryBuildProgress:
-    """Passed to the *on_progress* callback after each sub-batch completes."""
+    """Passed to the *on_progress* callback after each work item completes.
+
+    Covers both build sub-phases so a single progress bar can follow the whole
+    stage: extraction batches (``phase="extract"``) and the deferred summary
+    compression pass (``phase="compress"``).
+    """
 
     item_id: str
-    """Spine-aligned item ID, e.g. ``"0003.b2"``."""
+    """Work-item ID: a spine-aligned batch (e.g. ``"0003.b2"``) during
+    extraction, or an entity ID (e.g. ``"place_000001"``) during compression."""
     spine_batch_count: int
-    """Total sub-batches for this spine item (e.g. 5)."""
+    """Total sub-batches for this spine item (e.g. 5).  Unused for compression."""
     items_total: int
-    """Total work items across all spines."""
+    """Total work items in the current phase."""
+    phase: str = "extract"
+    """Current sub-phase: ``"extract"`` or ``"compress"``."""
+    phase_label: str = "Building glossary"
+    """Human-readable label for the current phase."""
+
+
+def _compress_progress_adapter(
+    on_progress: Callable[[GlossaryBuildProgress], None] | None,
+    items_total: int,
+) -> Callable[[str], None] | None:
+    """Adapt a :class:`GlossaryBuildProgress` callback to the compression pass.
+
+    ``compress_entity_summaries`` emits a bare ``entity_id`` per entity; the
+    build progress bar speaks :class:`GlossaryBuildProgress`.  This wraps the
+    former into the latter, tagging every emit as the ``"compress"`` phase so
+    the CLI can switch the single shared task to a "Compressing summaries" bar.
+    Returns ``None`` when there is no callback to forward to.
+    """
+    if on_progress is None:
+        return None
+
+    def _emit(entity_id: str) -> None:
+        on_progress(
+            GlossaryBuildProgress(
+                item_id=entity_id,
+                spine_batch_count=0,
+                items_total=items_total,
+                phase="compress",
+                phase_label="Compressing summaries",
+            )
+        )
+
+    return _emit
 
 
 @dataclass
@@ -925,6 +964,7 @@ def _recompress_summaries_only(
     state: PipelineState,
     stage: str,
     manifest,
+    on_progress: Callable[[GlossaryBuildProgress], None] | None = None,
 ) -> Glossary:
     """Implement ``glossary-build --force-summaries`` (Phase 2B maintenance).
 
@@ -990,7 +1030,14 @@ def _recompress_summaries_only(
     _save_build_meta(work_dir, meta)
 
     logger.info("Recompressing summaries for %d entities (--force-summaries)", reset_count)
-    compress_entity_summaries(work_dir, config, glossary, meta, save_path=bp)
+    compress_entity_summaries(
+        work_dir,
+        config,
+        glossary,
+        meta,
+        save_path=bp,
+        on_progress=_compress_progress_adapter(on_progress, len(glossary.entities)),
+    )
 
     # Build output changed → downstream cluster/reconcile are now stale.
     _invalidate_downstream_stages(work_dir, state, stage)
@@ -1648,7 +1695,9 @@ def glossary_build(
     # Phase 2B maintenance op: recompress summaries from existing observations
     # without re-running extraction.  Handled before any normal build flow.
     if force_summaries:
-        return _recompress_summaries_only(work_dir, config, state, stage, manifest)
+        return _recompress_summaries_only(
+            work_dir, config, state, stage, manifest, on_progress=on_progress
+        )
 
     # Determine if this is a targeted (partial) run.
     targeted = target_batch is not None or target_spine is not None
@@ -1703,6 +1752,9 @@ def glossary_build(
                 glossary,
                 meta,
                 save_path=glossary_build_path(work_dir),
+                on_progress=_compress_progress_adapter(
+                    on_progress, len(glossary.entities)
+                ),
             )
             # Downstream cluster/reconcile may have been built over the
             # incomplete (null-summary) glossary, so they are now stale.
@@ -1924,6 +1976,9 @@ def glossary_build(
                     glossary,
                     meta,
                     save_path=glossary_build_path(work_dir),
+                    on_progress=_compress_progress_adapter(
+                        on_progress, len(glossary.entities)
+                    ),
                 )
             mark_stage_completed(work_dir, state, stage)
 

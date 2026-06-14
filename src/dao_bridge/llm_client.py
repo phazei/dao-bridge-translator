@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 
 import openai
 from pydantic import BaseModel, ValidationError
+from rich.markup import escape as _rich_escape
 
 from dao_bridge.config import LLMConfig, ModelConfig
 
@@ -70,6 +71,20 @@ def _error_code(exc: Exception) -> str | None:
             if isinstance(nested_code, str) and nested_code:
                 return nested_code
     return None
+
+
+def _context_prefix(context_label: str | None) -> str:
+    """Build a ``"[label] "`` log prefix that survives Rich markup rendering.
+
+    The console handler has ``markup=True``, so a bare ``[summary:<id>]`` would
+    be parsed as a style tag and silently dropped.  Escaping the whole bracket
+    token makes Rich render it literally on the console; the file handler's
+    formatter strips the escape so ``run.log`` stays clean (see
+    :mod:`dao_bridge.logging`).
+    """
+    if not context_label:
+        return ""
+    return _rich_escape(f"[{context_label}]") + " "
 
 
 def _should_retry(exc: Exception) -> bool:
@@ -141,6 +156,7 @@ class LLMClient:
         messages: list[dict],
         max_tokens: int | None = None,
         temperature: float | None = None,
+        context_label: str | None = None,
     ) -> CompletionResult:
         """Multi-turn chat completion with automatic retries on transient errors.
 
@@ -151,11 +167,16 @@ class LLMClient:
             ``[{"role": "system"|"user"|"assistant", "content": "..."}]``.
         max_tokens:
             Optional maximum completion tokens.
+        context_label:
+            Optional caller-provided label (e.g. batch ID, ``summary:<id>``)
+            prefixed onto the request start/success/retry log lines so the
+            console and run.log show what each call is for.
 
         Returns
         -------
         CompletionResult
         """
+        ctx = _context_prefix(context_label)
         kwargs: dict = {
             "model": self.config.model,
             "messages": messages,
@@ -170,7 +191,8 @@ class LLMClient:
         for attempt in range(1, self.llm_config.max_retries + 1):
             attempt_started = time.monotonic()
             logger.info(
-                "LLM request start (%d/%d): model=%s timeout=%.1fs messages=%d",
+                "%sLLM request start (%d/%d): model=%s timeout=%.1fs messages=%d",
+                ctx,
                 attempt,
                 self.llm_config.max_retries,
                 self.config.model,
@@ -191,7 +213,8 @@ class LLMClient:
                     for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
                         self._total_token_usage[key] += usage.get(key, 0)
                 logger.info(
-                    "LLM request success (%d/%d): model=%s elapsed=%.2fs finish=%s",
+                    "%sLLM request success (%d/%d): model=%s elapsed=%.2fs finish=%s",
+                    ctx,
                     attempt,
                     self.llm_config.max_retries,
                     response.model or self.config.model,
@@ -208,7 +231,9 @@ class LLMClient:
                 elapsed = time.monotonic() - attempt_started
                 if not _should_retry(exc):
                     logger.error(
-                        "LLM request failed without retry (%d/%d): model=%s elapsed=%.2fs error=%s",
+                        "%sLLM request failed without retry (%d/%d): "
+                        "model=%s elapsed=%.2fs error=%s",
+                        ctx,
                         attempt,
                         self.llm_config.max_retries,
                         self.config.model,
@@ -219,7 +244,9 @@ class LLMClient:
                 last_error = exc
                 wait = self.llm_config.retry_backoff_seconds * (2 ** (attempt - 1))
                 logger.warning(
-                    "Transient LLM error (attempt %d/%d): model=%s elapsed=%.2fs error=%s — retrying in %.1fs",
+                    "%sTransient LLM error (attempt %d/%d): "
+                    "model=%s elapsed=%.2fs error=%s — retrying in %.1fs",
+                    ctx,
                     attempt,
                     self.llm_config.max_retries,
                     self.config.model,
@@ -274,7 +301,7 @@ class LLMClient:
         LLMStructuredOutputError
             After *max_retries* consecutive failures.
         """
-        ctx = f"[{context_label}] " if context_label else ""
+        ctx = _context_prefix(context_label)
         schema_json = json.dumps(response_model.model_json_schema(), indent=2)
         schema_instruction = (
             "\n\nRespond with JSON matching this schema:\n"
@@ -302,6 +329,7 @@ class LLMClient:
                 conversation,
                 max_tokens=max_tokens,
                 temperature=temperature,
+                context_label=context_label,
             )
             raw_text = result.text.strip()
 

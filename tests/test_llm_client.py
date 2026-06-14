@@ -373,6 +373,158 @@ class TestCompleteJsonRetry:
 
 
 # ---------------------------------------------------------------------------
+# complete_json — example-instance shape injection
+# ---------------------------------------------------------------------------
+
+# Marker substring of the injected output-shape instruction (see complete_json).
+_SHAPE_MARKER = "Return ONLY a JSON object of exactly this shape"
+
+
+def _recording_create(responses):
+    """A create() side_effect that snapshots the *newest* user-message content
+    of each call, in order.
+
+    ``complete_json`` mutates one conversation list in place and resends it, so
+    inspecting ``call_args_list`` afterwards shows the final state for every
+    call.  Snapshotting at call time captures what each attempt actually sent.
+    The newest user turn is the original prompt (attempt 1) or the corrective
+    message (retries).
+
+    Returns ``(side_effect, sent)`` where ``sent`` is populated as calls happen.
+    """
+    sent: list[str] = []
+    response_iter = iter(responses)
+
+    def _side_effect(*args, **kwargs):
+        messages = kwargs["messages"]
+        user_msgs = [m["content"] for m in messages if m["role"] == "user"]
+        sent.append(user_msgs[-1] if user_msgs else "")
+        return next(response_iter)
+
+    return _side_effect, sent
+
+
+class _ArrayResponse(BaseModel):
+    titles: list[str]
+
+
+class _NestedItem(BaseModel):
+    label: str
+    flag: bool
+
+
+class _NestedResponse(BaseModel):
+    items: list[_NestedItem]
+    count: int
+
+
+class TestExampleInstruction:
+    """The injected output-shape instruction is an example *instance*, not the
+    raw model_json_schema() envelope (which some models echo back verbatim)."""
+
+    def test_example_instance_builder_scalar_fields(self):
+        from dao_bridge.llm_client import _example_instance
+
+        ex = _example_instance(SimpleResponse)
+        assert ex == {"name": "...", "value": 0}
+
+    def test_example_instance_builder_array_field(self):
+        from dao_bridge.llm_client import _example_instance
+
+        ex = _example_instance(_ArrayResponse)
+        assert ex == {"titles": ["..."]}
+
+    def test_example_instance_builder_recurses_into_nested_models(self):
+        from dao_bridge.llm_client import _example_instance
+
+        ex = _example_instance(_NestedResponse)
+        assert ex == {"items": [{"label": "...", "flag": True}], "count": 0}
+
+    def test_example_instruction_has_no_schema_envelope(self):
+        """The injected hint must not contain the schema envelope keys that
+        models echo back ('properties'/'required'/'$defs')."""
+        from dao_bridge.llm_client import _example_instruction
+
+        for model in (SimpleResponse, _ArrayResponse, _NestedResponse):
+            instr = _example_instruction(model)
+            assert '"properties"' not in instr
+            assert '"required"' not in instr
+            assert "$defs" not in instr
+
+
+class TestShapeInjection:
+    @patch("dao_bridge.llm_client.openai.OpenAI")
+    def test_shape_example_injected_on_first_request(self, mock_openai_cls):
+        """An example instance (not the schema) is appended to the request."""
+        mock_client = MagicMock()
+        mock_openai_cls.return_value = mock_client
+        side_effect, sent = _recording_create([_mock_response('{"name": "test", "value": 1}')])
+        mock_client.chat.completions.create.side_effect = side_effect
+
+        client = LLMClient(ModelConfig(model="test-model"))
+        client.complete_json(
+            [{"role": "user", "content": "give me data"}],
+            response_model=SimpleResponse,
+        )
+
+        assert len(sent) == 1
+        assert _SHAPE_MARKER in sent[0]
+        # The example instance is present...
+        assert '"name"' in sent[0]
+        assert '"value"' in sent[0]
+        # ...but NOT the schema envelope the models echo.
+        assert '"properties"' not in sent[0]
+        assert '"required"' not in sent[0]
+
+    @patch("dao_bridge.llm_client.openai.OpenAI")
+    def test_retries_do_not_reappend_shape(self, mock_openai_cls):
+        """The shape hint is injected once (on the original prompt); corrective
+        retry turns carry the error, not another copy of the shape."""
+        mock_client = MagicMock()
+        mock_openai_cls.return_value = mock_client
+        side_effect, sent = _recording_create(
+            [
+                _mock_response("not json"),  # parse fail
+                _mock_response('{"name": "ok", "value": 3}'),  # success
+            ]
+        )
+        mock_client.chat.completions.create.side_effect = side_effect
+
+        client = LLMClient(ModelConfig(model="test-model"))
+        result = client.complete_json(
+            [{"role": "user", "content": "give me data"}],
+            response_model=SimpleResponse,
+            max_retries=3,
+        )
+
+        assert result.value == 3
+        assert len(sent) == 2
+        # Shape hint on the first turn only.
+        assert _SHAPE_MARKER in sent[0]
+        assert _SHAPE_MARKER not in sent[1]
+
+    @patch("dao_bridge.llm_client.openai.OpenAI")
+    def test_array_response_example_is_an_array_not_schema(self, mock_openai_cls):
+        """Array-valued models get an array example, not the schema envelope
+        (qwen3.6 echoes even array schemas)."""
+        mock_client = MagicMock()
+        mock_openai_cls.return_value = mock_client
+        side_effect, sent = _recording_create([_mock_response('{"titles": ["A", "B"]}')])
+        mock_client.chat.completions.create.side_effect = side_effect
+
+        client = LLMClient(ModelConfig(model="test-model"))
+        result = client.complete_json(
+            [{"role": "user", "content": "translate"}],
+            response_model=_ArrayResponse,
+        )
+
+        assert result.titles == ["A", "B"]
+        assert _SHAPE_MARKER in sent[0]
+        assert '"titles"' in sent[0]
+        assert '"properties"' not in sent[0]
+
+
+# ---------------------------------------------------------------------------
 # complete_json — retry counter reset scenario
 # ---------------------------------------------------------------------------
 

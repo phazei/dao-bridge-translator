@@ -12,10 +12,9 @@ time, with review.
 This is a problem inventory, **not** an approved implementation plan. Each item
 below should be discussed and scoped before any code is written.
 
-**Progress:** Issue 4 (state-tracking bug, Option A) and Issue 3 (compression
-progress bar + console labels) are now **RESOLVED** — see their sections.
-Issues 1 (nicknames) and 2 (schema echo) remain open; Issue 2 is the next
-pickup.
+**Progress:** Issue 4 (state-tracking bug, Option A), Issue 3 (compression
+progress bar + console labels), and Issue 2 (schema echo) are now **RESOLVED** —
+see their sections. Issue 1 (nicknames) remains open and is the next pickup.
 
 ## Test setup used
 
@@ -100,11 +99,43 @@ came from a *partial* build and was never validated across the whole book.
 
 ---
 
-## Issue 2 — Summary-compress schema echo (regression from the 2B tightening)
+## Issue 2 — Summary-compress schema echo (regression from the 2B tightening) — RESOLVED
 
 **Where:** `GlossarySummaryCompressResponse` (`schemas.py`), the auto-schema
 injection in `LLMClient.complete_json` (`llm_client.py`), the compress call in
 `compress_entity_summary` (`glossary.py`).
+
+**Status: FIXED.** `complete_json` now injects a concrete **example instance** of
+the response model (e.g. `{"summary": "..."}`), generated from the Pydantic
+model, instead of the raw `model_json_schema()` envelope. The echo happened
+because the model parroted the *schema envelope*
+(`{"properties": ..., "required": ...}`) — itself valid JSON missing every field.
+An example instance has no envelope to echo. See "Resolution".
+
+**Live reproduction (qwen3.6-35b-a3b-mtp, 6 trials each, faithful prompt + the
+exact injected schema):** *worse* than the doc's earlier ~7% estimate — it was
+**deterministic**: WITH injection, 0/6 OK (6/6 echoed the schema, copying its
+`description` verbatim); WITHOUT injection, 6/6 OK.
+
+**Multi-model + multi-shape investigation (later finding that broadened the
+fix):** the bug is **model-specific** and **not limited to single-field models**.
+Tested 4 models × 3 response shapes (1-field compress, 2-field reconcile,
+array-valued toc), 6 trials each, WITH schema injection (OK count):
+
+| model | 1-field | 2-field | array |
+|---|---|---|---|
+| gemma-4-26b-a4b-it | 6/6 | 6/6 | 6/6 |
+| gemma-4-31b-it | 6/6 | 6/6 | 6/6 |
+| qwen3.6-35b-a3b-mtp | 0/6 | 1/6 | **0/6** |
+| qwen3.6-27b | 6/6 | **0/6** | 6/6 |
+
+Takeaways: both Gemma models are immune (they ignore the schema); the Qwen3.6
+family echoes — and `35b-mtp` echoes **arrays too**, disproving the earlier
+"arrays are safe" / "single-field only" claims. Injecting an **example
+instance** instead was 6/6 across **every** model and shape. End-to-end through
+the real (fixed) `complete_json` with `max_retries=1` (so any first-attempt echo
+raises): gemma 5/5 all shapes; `35b-mtp` 5/5 compress, 4/5 reconcile (one
+non-echo blip), 5/5 toc; `27b` 5/5 all shapes.
 
 **Symptoms observed:** during the deferred compression pass, **every** multi-
 observation entity failed validation on the first attempt with
@@ -130,26 +161,38 @@ prompt. With the dueling "here's the schema" + "return one field" instructions,
 the model parrots the schema back. The old two-field `{changed, summary}` shape
 was structurally distinct from its schema and incidentally avoided this.
 
-**Peer risk:** `GlossarySpeechMergeResponse` is also a single required field
-(`consolidated_speech_style`) and likely has the same latent bug; it's just less
-exercised (only fires in reconcile for characters with multiple speech notes).
-List/array single-field models (`GlossaryClusterResponse.decisions`,
-`TocTranslationResponse.titles`) are safe — an array is unmistakable from a
-schema object.
+**Affected call sites (all `complete_json` callers, not just single-field):**
+the reconcile surface-form and entity-conflict calls (`GlossaryReconcileResponse`,
+2 fields) echo heavily on `qwen3.6-27b` (0/6) and `35b-mtp` (1/6) — this is the
+"reconcile" symptom seen live. `GlossarySpeechMergeResponse` (single field) was
+the latent peer. The array models (`GlossaryClusterResponse.decisions`,
+`TocTranslationResponse.titles`) are **not** safe either on `35b-mtp`. Because
+the example-instance fix lives in `complete_json`, **every** caller is fixed at
+once with no per-call-site changes.
 
-**Fix directions discussed (pick/scope later):**
-- Add an opt-in to `complete_json` to **skip the auto-injected schema** for a
-  call whose prompt already fully specifies the output shape (the compress prompt
-  does, with a literal `{"summary": "..."}` example). Re-add the schema only on
-  retry so a genuinely misbehaving model still gets corrective guidance.
-- Alternative: make `summary` optional with the existing join-fallback (removes
-  the hard failure but silently degrades to naive concatenation when echoed —
-  bad if the echo rate is high).
+**Resolution (implemented):** inject an example *instance*, not the schema
+envelope (chosen over making `summary` optional, which would silently degrade to
+naive concatenation when echoed). The model can't echo a schema envelope that
+was never shown to it, and weaker prompts/models still get concrete shape
+guidance.
 
-**Status:** a `skip_schema_injection` approach was prototyped and observed to
-eliminate the retries on a live `--force-summaries` run (zero validation
-failures in `run.log`), but that code was discarded. Needs to be redone with
-tests and review.
+- **`complete_json` (`llm_client.py`).** Injects
+  `_example_instruction(response_model)` — a JSON example built by
+  `_example_instance()`, which walks `model.model_fields`: scalars →
+  `"..."`/`0`/`0.0`/`True`, `list[X]` → `[example(X)]`, `Optional[X]`/unions →
+  first non-None member, and **recurses into nested `BaseModel` subclasses** (so
+  `GlossaryClusterResponse` → `{"decisions": [{...}]}`). The example stays in
+  sync with the schema automatically (still Pydantic-driven).
+
+**Tests added (all passing):**
+- `tests/test_llm_client.py`: `TestExampleInstruction` (the builder handles
+  scalars, arrays, and nested models; the injected hint contains no
+  `properties`/`required`/`$defs` envelope keys) and `TestShapeInjection` (an
+  example instance — not the schema — is appended; the hint is injected once and
+  retries carry only the error; array models get an array example).
+
+`ruff check` on touched files clean (only the pre-existing `resolved_sf` /
+`mock_llm_cls` / `I001` warnings); full suite **804 passed**.
 
 ---
 
@@ -361,8 +404,10 @@ every entity that has observations has a non-null summary.
 
 ## Suggested order of work (for discussion, not committed)
 
-1. **Issue 2** (schema echo) — highest impact, smallest change; restores
-   compression to ~zero retries. Add tests.
+1. ~~**Issue 2** (schema echo)~~ — **DONE** (example-instance injection in
+   `complete_json`; see Issue 2 "Resolution"). Fixes the echo across all callers
+   and all response shapes on the affected models (compress, speech-merge, and
+   the reconcile calls); tests added.
 2. ~~**Issue 4** (`run` skipping unfinished compression)~~ — **DONE** (Option A,
    see Issue 4 "Resolution"). Stage flag now honors compression; resumes on a
    stale flag; tests added.
@@ -376,11 +421,9 @@ every entity that has observations has a non-null summary.
 
 Each item: one focused change, shown and reviewed before moving on.
 
-**Remaining open:** Issue 1 (nicknames) and Issue 2 (schema echo). Issue 2 is
-still unaddressed — note the `complete_json validation failure (1/3): summary
-Field required` lines that still appear once per multi-observation entity during
-compression (visible in the Issue 3 live sample above); each costs one extra
-round-trip. It is independent of the Issue 3 work and should be the next pickup.
+**Remaining open:** Issue 1 (nicknames) only — it is the next pickup. (The
+`complete_json validation failure (1/3): summary Field required` lines visible in
+the Issue 3 live sample above are now gone; see Issue 2 "Resolution".)
 
 ## Verification conventions
 

@@ -13,7 +13,9 @@ from __future__ import annotations
 import json
 import logging
 import time
+import types
 from dataclasses import dataclass, field
+from typing import Union, get_args, get_origin
 
 import openai
 from pydantic import BaseModel, ValidationError
@@ -96,6 +98,69 @@ def _should_retry(exc: Exception) -> bool:
         return _error_code(exc) != "insufficient_quota"
 
     return True
+
+
+def _example_value(annotation: object) -> object:
+    """A placeholder example value for a single field annotation.
+
+    Used to build an example *instance* of a response model (see
+    :func:`_example_instruction`).  Recurses into ``list``/``set``/``tuple``
+    element types and into nested :class:`~pydantic.BaseModel` subclasses so
+    array- and object-valued fields produce a realistic shape.
+    """
+    # Unwrap Optional[...] / unions (both typing.Union and PEP 604 ``X | Y``):
+    # use the first non-None member.
+    origin = get_origin(annotation)
+    if origin is Union or origin is types.UnionType:
+        args = [a for a in get_args(annotation) if a is not type(None)]
+        return _example_value(args[0]) if args else "..."
+
+    if origin in (list, set, tuple):
+        inner_args = get_args(annotation)
+        inner = inner_args[0] if inner_args else str
+        return [_example_value(inner)]
+
+    if origin in (dict,):
+        return {"...": "..."}
+
+    if isinstance(annotation, type) and issubclass(annotation, BaseModel):
+        return _example_instance(annotation)
+
+    if annotation is int:
+        return 0
+    if annotation is float:
+        return 0.0
+    if annotation is bool:
+        return True
+
+    # str, Literal, enums, datetime, and anything unrecognized -> string hint.
+    return "..."
+
+
+def _example_instance(model: type[BaseModel]) -> dict:
+    """Build a JSON-serializable example instance of *model* from its fields."""
+    return {name: _example_value(field.annotation) for name, field in model.model_fields.items()}
+
+
+def _example_instruction(model: type[BaseModel]) -> str:
+    """Build the output-shape instruction injected into the prompt.
+
+    Injects a concrete example *instance* (e.g. ``{"summary": "..."}``) rather
+    than the raw ``model_json_schema()`` envelope.  The schema envelope
+    (``{"properties": ..., "required": ...}``) is itself valid JSON, and some
+    local models echo it back verbatim — valid JSON that is missing every
+    actual field, so it fails validation and forces a retry.  An example
+    instance has no schema envelope to parrot: the only JSON shape shown is the
+    answer shape.  The example is generated from the Pydantic model, so it
+    stays in sync with the schema automatically.
+    """
+    example = json.dumps(_example_instance(model), ensure_ascii=False, indent=2)
+    return (
+        "\n\nReturn ONLY a JSON object of exactly this shape, replacing the "
+        f"placeholder values with real content:\n```json\n{example}\n```\n"
+        "Return ONLY valid JSON, no other text. Do not return the schema; "
+        "return a filled-in object."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -273,9 +338,17 @@ class LLMClient:
     ) -> BaseModel:
         """Chat completion that returns a validated Pydantic model.
 
-        Injects a schema instruction into the last user message, parses the
-        JSON response, and validates it.  On parse / validation failure the
+        Injects an output-shape instruction into the last user message, parses
+        the JSON response, and validates it.  On parse / validation failure the
         error is appended to the conversation and the call is retried.
+
+        The injected instruction is a concrete **example instance** of
+        *response_model* (e.g. ``{"summary": "..."}``), generated from the
+        Pydantic model so it stays in sync with the schema.  This deliberately
+        avoids injecting the raw ``model_json_schema()`` envelope: that envelope
+        is itself valid JSON, and some local models echo it back verbatim —
+        valid JSON missing every actual field, which fails validation and
+        wastes a round-trip.  See :func:`_example_instruction`.
 
         Both parse failures and validation failures increment the
         consecutive failure counter.  A hard ceiling on total attempts
@@ -302,21 +375,16 @@ class LLMClient:
             After *max_retries* consecutive failures.
         """
         ctx = _context_prefix(context_label)
-        schema_json = json.dumps(response_model.model_json_schema(), indent=2)
-        schema_instruction = (
-            "\n\nRespond with JSON matching this schema:\n"
-            f"```json\n{schema_json}\n```\n"
-            "Return ONLY valid JSON, no other text."
-        )
+        shape_instruction = _example_instruction(response_model)
 
         # Deep-copy messages so we can mutate safely.
         conversation: list[dict] = [dict(m) for m in messages]
 
-        # Inject schema instruction into the last user message.
+        # Inject the output-shape instruction into the last user message.
         for i in range(len(conversation) - 1, -1, -1):
             if conversation[i]["role"] == "user":
                 conversation[i] = dict(conversation[i])
-                conversation[i]["content"] = conversation[i]["content"] + schema_instruction
+                conversation[i]["content"] = conversation[i]["content"] + shape_instruction
                 break
 
         consecutive_failures = 0

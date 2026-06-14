@@ -22,6 +22,7 @@ import functools
 import json
 import logging
 import re
+import shutil
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -78,6 +79,13 @@ _STAGE: Literal["translate"] = "translate"
 
 # Warn if rendered glossary exceeds this many tokens (in "all" mode).
 _GLOSSARY_TOKEN_WARNING_THRESHOLD = 5000
+
+# Spine classifications eligible for rolling-summary generation.  These are the
+# narrative-capable item types: prologues/afterwords are classified as
+# frontmatter/backmatter, so they are included.  Non-narrative types
+# (illustration, toc_auto, toc_authored, unknown) are excluded — summarizing
+# them produces noise or invites the model to regurgitate prior context.
+_SUMMARY_CLASSIFICATIONS = frozenset({"chapter", "frontmatter", "backmatter"})
 
 # ---------------------------------------------------------------------------
 # Internal types
@@ -284,32 +292,51 @@ def render_glossary(glossary: Glossary, chunk_text: str, mode: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-def render_rolling_summary(summaries: list[dict], max_tokens: int) -> str:
-    """Render the sliding window of rolling summaries for prompt injection.
+def render_rolling_summary(
+    summaries: list[dict], max_tokens: int, current_chunk_id: str
+) -> str:
+    """Render the sliding window of prior rolling summaries for prompt injection.
 
-    Iterates from newest to oldest, accumulating entries until the token
-    budget is exhausted.  The result is returned in chronological order.
+    Only entries *strictly before* ``current_chunk_id`` are considered, so a
+    re-run of an early chunk (or a stale on-disk file that still holds
+    later-chunk entries) can never leak future plot backward into an earlier
+    chunk.  Because chunk IDs are zero-padded ``NNNN.MMM`` they sort
+    chronologically, so a plain string comparison is correct here.
+
+    Eligible entries are sorted chronologically, then accumulated newest-first
+    until the token budget is exhausted, and finally emitted in chronological
+    order inside a ``<rolling_summary>`` block.  Adjacent summaries are
+    separated by a ``---`` rule so they are visually distinct (and to signal a
+    possible — not guaranteed — narrative break between chunks).
 
     Parameters
     ----------
     summaries:
-        List of ``{"chunk_id": str, "summary": str}`` dicts.
+        List of ``{"chunk_id": str, "summary": str}`` dicts (any order).
     max_tokens:
         Maximum total tokens to include.
+    current_chunk_id:
+        The chunk being processed; only summaries for strictly-earlier chunks
+        are included.
 
     Returns
     -------
     str
-        Formatted summary block, or empty string if no summaries.
+        Formatted summary block, or empty string if no eligible summaries.
     """
-    if not summaries:
+    # Keep only strictly-prior entries, sorted chronologically.
+    eligible = sorted(
+        (e for e in summaries if e["chunk_id"] < current_chunk_id),
+        key=lambda e: e["chunk_id"],
+    )
+    if not eligible:
         return ""
 
     # Walk backwards from newest, accumulating until budget exhausted.
     selected: list[dict] = []
     running_tokens = 0
 
-    for entry in reversed(summaries):
+    for entry in reversed(eligible):
         entry_text = f"[{entry['chunk_id']}] {entry['summary']}"
         entry_tokens = count_tokens(entry_text)
         if running_tokens + entry_tokens > max_tokens and selected:
@@ -320,11 +347,10 @@ def render_rolling_summary(summaries: list[dict], max_tokens: int) -> str:
     # Restore chronological order.
     selected.reverse()
 
-    lines = ["\nSTORY SO FAR (rolling summary)", ""]
-    for entry in selected:
-        lines.append(f"[{entry['chunk_id']}] {entry['summary']}")
+    entry_blocks = [f"[{entry['chunk_id']}] {entry['summary']}" for entry in selected]
+    body = "\n---\n".join(entry_blocks)
 
-    return "\n".join(lines)
+    return f"\nStory So Far:\n<rolling_summary>\n{body}\n</rolling_summary>"
 
 
 # ---------------------------------------------------------------------------
@@ -507,7 +533,9 @@ def build_pass1_messages(
 
     # Render rolling summary.
     if tp.rolling_summary and rolling_summaries:
-        summary_text = render_rolling_summary(rolling_summaries, tp.summary_max_tokens)
+        summary_text = render_rolling_summary(
+            rolling_summaries, tp.summary_max_tokens, chunk.chunk_id
+        )
     else:
         summary_text = ""
 
@@ -765,14 +793,19 @@ def _save_rolling_summaries(work_dir: Path, summaries: list[dict]) -> None:
 
 
 def _update_rolling_summary(summaries: list[dict], chunk_id: str, summary: str) -> list[dict]:
-    """Add or overwrite a summary entry for *chunk_id*."""
-    # Overwrite if exists.
+    """Add or overwrite a summary entry for *chunk_id*.
+
+    The result is kept sorted by ``chunk_id`` so the persisted file is always
+    in chronological order (human-readable and canonical).
+    """
+    # Overwrite if exists, else append.
     for i, entry in enumerate(summaries):
         if entry["chunk_id"] == chunk_id:
             summaries[i] = {"chunk_id": chunk_id, "summary": summary}
-            return summaries
-    # Append.
-    summaries.append({"chunk_id": chunk_id, "summary": summary})
+            break
+    else:
+        summaries.append({"chunk_id": chunk_id, "summary": summary})
+    summaries.sort(key=lambda e: e["chunk_id"])
     return summaries
 
 
@@ -812,7 +845,7 @@ def generate_summary(
 
     # Render prior summaries with the same sliding window.
     if rolling_summaries:
-        prior_text = render_rolling_summary(rolling_summaries, tp.summary_max_tokens)
+        prior_text = render_rolling_summary(rolling_summaries, tp.summary_max_tokens, chunk_id)
     else:
         prior_text = ""
 
@@ -897,6 +930,7 @@ def translate_chunk(
     rolling_summaries: list[dict],
     llm_client: LLMClient,
     summary_client: LLMClient | None = None,
+    enable_summary: bool = True,
 ) -> TranslatedChunk:
     """Translate a single chunk through the full pipeline.
 
@@ -922,6 +956,10 @@ def translate_chunk(
     summary_client:
         LLM client for summary generation.  Falls back to *llm_client*
         if ``None``.
+    enable_summary:
+        When ``False``, skip rolling-summary generation entirely (no LLM
+        call, ``summary_generated`` left ``None``).  Used to suppress
+        summaries for non-narrative spine items (illustrations, TOCs).
 
     Returns
     -------
@@ -968,7 +1006,7 @@ def translate_chunk(
 
     # --- Rolling summary ---
     summary_text: str | None = None
-    if tp.rolling_summary and qa_result_val != "fail":
+    if enable_summary and tp.rolling_summary and qa_result_val != "fail":
         summary_text = generate_summary(
             final_text, chunk.chunk_id, rolling_summaries, s_client, config
         )
@@ -1008,6 +1046,7 @@ def qa_fix_chunk(
     rolling_summaries: list[dict],
     llm_client: LLMClient,
     summary_client: LLMClient | None = None,
+    enable_summary: bool = True,
 ) -> TranslatedChunk:
     """Run a targeted QA-fix pass on a translation that failed QA.
 
@@ -1043,7 +1082,7 @@ def qa_fix_chunk(
 
     # --- Rolling summary (only when the fixed text passes) ---
     summary_text: str | None = None
-    if tp.rolling_summary and qa_result_val != "fail":
+    if enable_summary and tp.rolling_summary and qa_result_val != "fail":
         summary_text = generate_summary(
             fixed_text, chunk.chunk_id, rolling_summaries, s_client, config
         )
@@ -1220,6 +1259,17 @@ def run_translate_stage(
         reset_stage_items(work_dir, state, _STAGE, target_ids)
     elif force:
         reset_stage(work_dir, state, _STAGE)
+        # A full --force is a clean slate: drop prior translations and the
+        # rolling summary so no stale (or future-chunk) context leaks into the
+        # re-run.  Targeted re-runs above deliberately preserve both.
+        translations_root = work_dir / "translations"
+        if translations_root.exists():
+            shutil.rmtree(translations_root)
+            logger.info("Removed translations/ for full --force re-run")
+        rolling_path = summary_path(work_dir)
+        if rolling_path.exists():
+            rolling_path.unlink()
+            logger.info("Removed rolling_summary.json for full --force re-run")
     elif retry_failed:
         reopen_stage(work_dir, state, _STAGE)
 
@@ -1285,6 +1335,15 @@ def run_translate_stage(
 
         rolling_summaries = _load_rolling_summaries(work_dir)
 
+        # Only narrative-capable spine items contribute to the rolling summary.
+        spine_item = next(
+            (si for si in manifest.spine if si.spine_index == chunk.spine_index), None
+        )
+        enable_summary = (
+            spine_item is not None
+            and spine_item.classification in _SUMMARY_CLASSIFICATIONS
+        )
+
         # Attempt 1 is a full translation; subsequent attempts are targeted
         # QA-fix passes that correct the high-severity issues in the best
         # translation so far.  max_attempts = 1 + qa_max_retries (QA on).
@@ -1319,6 +1378,7 @@ def run_translate_stage(
                         rolling_summaries=rolling_summaries,
                         llm_client=translate_client,
                         summary_client=summary_client,
+                        enable_summary=enable_summary,
                     )
                 else:
                     assert last_tc is not None
@@ -1332,6 +1392,7 @@ def run_translate_stage(
                         rolling_summaries=rolling_summaries,
                         llm_client=translate_client,
                         summary_client=summary_client,
+                        enable_summary=enable_summary,
                     )
             except Exception as exc:
                 # Infrastructure error.

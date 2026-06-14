@@ -62,6 +62,7 @@ from dao_bridge.workdir import (
     ensure_dirs,
     glossary_path,
     manifest_path,
+    summary_path,
     translation_path,
 )
 
@@ -383,7 +384,7 @@ class TestRenderRollingSummary:
     """Tests for render_rolling_summary()."""
 
     def test_empty_summaries_returns_empty_string(self):
-        result = render_rolling_summary([], max_tokens=2000)
+        result = render_rolling_summary([], max_tokens=2000, current_chunk_id="0001.005")
         assert result == ""
 
     def test_all_fit_within_budget(self):
@@ -392,9 +393,9 @@ class TestRenderRollingSummary:
             {"chunk_id": "0001.001", "summary": "Event A happened."},
             {"chunk_id": "0001.002", "summary": "Event B happened."},
         ]
-        result = render_rolling_summary(summaries, max_tokens=5000)
+        result = render_rolling_summary(summaries, max_tokens=5000, current_chunk_id="0001.003")
 
-        assert "STORY SO FAR" in result
+        assert "<rolling_summary>" in result
         assert "[0001.001]" in result
         assert "[0001.002]" in result
 
@@ -406,7 +407,7 @@ class TestRenderRollingSummary:
             {"chunk_id": "0001.003", "summary": "Short."},  # small
         ]
         # Budget is very tight — should only fit the newest entries.
-        result = render_rolling_summary(summaries, max_tokens=50)
+        result = render_rolling_summary(summaries, max_tokens=50, current_chunk_id="0001.004")
 
         assert "[0001.003]" in result
         # The oldest large entry should be excluded.
@@ -419,12 +420,71 @@ class TestRenderRollingSummary:
             {"chunk_id": "0001.002", "summary": "Second."},
             {"chunk_id": "0001.003", "summary": "Third."},
         ]
-        result = render_rolling_summary(summaries, max_tokens=5000)
+        result = render_rolling_summary(summaries, max_tokens=5000, current_chunk_id="0001.004")
 
         idx1 = result.index("[0001.001]")
         idx2 = result.index("[0001.002]")
         idx3 = result.index("[0001.003]")
         assert idx1 < idx2 < idx3
+
+    def test_excludes_current_and_future_entries(self):
+        """Only entries strictly before current_chunk_id are included.
+
+        Guards against the stale/re-run leak where a later chunk's summary
+        (e.g. from a prior --force run) is injected backward into an earlier
+        chunk.
+        """
+        summaries = [
+            {"chunk_id": "0001.001", "summary": "Prior event."},
+            {"chunk_id": "0001.002", "summary": "Current chunk event."},
+            {"chunk_id": "0005.003", "summary": "Future spoiler."},
+        ]
+        result = render_rolling_summary(summaries, max_tokens=5000, current_chunk_id="0001.002")
+
+        assert "[0001.001]" in result
+        assert "[0001.002]" not in result  # the current chunk itself
+        assert "[0005.003]" not in result  # a future chunk
+        assert "Future spoiler" not in result
+
+    def test_first_chunk_gets_no_prior_context(self):
+        """The very first chunk has no strictly-earlier entries -> empty."""
+        summaries = [
+            {"chunk_id": "0007.001", "summary": "Future content."},
+            {"chunk_id": "0010.005", "summary": "More future content."},
+        ]
+        result = render_rolling_summary(summaries, max_tokens=5000, current_chunk_id="0007.001")
+        assert result == ""
+
+    def test_handles_unsorted_input(self):
+        """An out-of-order input list is sorted before selection/output."""
+        summaries = [
+            {"chunk_id": "0001.003", "summary": "Third."},
+            {"chunk_id": "0001.001", "summary": "First."},
+            {"chunk_id": "0001.002", "summary": "Second."},
+        ]
+        result = render_rolling_summary(summaries, max_tokens=5000, current_chunk_id="0001.004")
+
+        idx1 = result.index("[0001.001]")
+        idx2 = result.index("[0001.002]")
+        idx3 = result.index("[0001.003]")
+        assert idx1 < idx2 < idx3
+
+    def test_entries_separated_by_rule(self):
+        """Adjacent summaries are separated by a --- rule."""
+        summaries = [
+            {"chunk_id": "0001.001", "summary": "First."},
+            {"chunk_id": "0001.002", "summary": "Second."},
+        ]
+        result = render_rolling_summary(summaries, max_tokens=5000, current_chunk_id="0001.003")
+        assert "\n---\n" in result
+
+    def test_wrapped_in_rolling_summary_tags(self):
+        """The block is wrapped in <rolling_summary>...</rolling_summary> tags."""
+        summaries = [{"chunk_id": "0001.001", "summary": "First."}]
+        result = render_rolling_summary(summaries, max_tokens=5000, current_chunk_id="0001.002")
+        assert "Story So Far:" in result
+        assert "<rolling_summary>" in result
+        assert "</rolling_summary>" in result
 
 
 # =========================================================================
@@ -523,7 +583,7 @@ class TestBuildPass1Messages:
         assert messages[0]["role"] == "system"
         assert "Translation guidelines" in messages[0]["content"]
         assert "GLOSSARY" not in messages[0]["content"]
-        assert "STORY SO FAR" not in messages[0]["content"]
+        assert "<rolling_summary>" not in messages[0]["content"]
 
     def test_last_message_is_source_text(self, tmp_path: Path):
         """The last message is always the user source text to translate."""
@@ -608,14 +668,15 @@ class TestBuildPass1Messages:
         config = _make_config(work_dir)
         chunk = _make_chunk()
         glossary = _make_glossary()
-        summaries = [{"chunk_id": "0001.001", "summary": "Something happened."}]
+        # Strictly-prior chunk so it is eligible for injection into 0001.001.
+        summaries = [{"chunk_id": "0000.001", "summary": "Something happened."}]
 
         messages = build_pass1_messages(chunk, glossary, None, summaries, config)
 
         # system, summary-user, summary-assistant, source-user
         assert len(messages) == 4
         assert messages[1]["role"] == "user"
-        assert "STORY SO FAR" in messages[1]["content"]
+        assert "<rolling_summary>" in messages[1]["content"]
         assert "Something happened" in messages[1]["content"]
         assert messages[2]["role"] == "assistant"
         assert messages[2]["content"] == "Understood."
@@ -630,7 +691,7 @@ class TestBuildPass1Messages:
         messages = build_pass1_messages(chunk, glossary, None, [], config)
 
         all_content = " ".join(m["content"] for m in messages)
-        assert "STORY SO FAR" not in all_content
+        assert "<rolling_summary>" not in all_content
 
     def test_full_context_message_order(self, tmp_path: Path):
         """With glossary, summary, and overlap all present, messages follow
@@ -639,7 +700,8 @@ class TestBuildPass1Messages:
         config = _make_config(work_dir)
         chunk = _make_chunk(text="ナツキ・スバルは言った。")
         glossary = _make_glossary()
-        summaries = [{"chunk_id": "0001.001", "summary": "Something happened."}]
+        # Strictly-prior chunk so it is eligible for injection into 0001.001.
+        summaries = [{"chunk_id": "0000.001", "summary": "Something happened."}]
         overlap = _make_translated_chunk(
             source_text="prev source", translated_text="prev translation"
         )
@@ -659,7 +721,7 @@ class TestBuildPass1Messages:
             "user",  # source text
         ]
         assert "GLOSSARY" in messages[1]["content"]
-        assert "STORY SO FAR" in messages[3]["content"]
+        assert "<rolling_summary>" in messages[3]["content"]
         assert "prev source" in messages[5]["content"]
         assert chunk.text in messages[7]["content"]
 
@@ -694,7 +756,7 @@ class TestBuildPass2Messages:
         all_content = " ".join(m["content"] for m in result)
 
         assert "GLOSSARY" not in all_content
-        assert "STORY SO FAR" not in all_content
+        assert "<rolling_summary>" not in all_content
         assert "preceding" not in all_content.lower()
 
 
@@ -730,7 +792,7 @@ class TestBuildQAMessages:
         result = build_qa_messages("src", "translation", glossary, config)
         all_content = " ".join(m["content"] for m in result)
 
-        assert "STORY SO FAR" not in all_content
+        assert "<rolling_summary>" not in all_content
         assert "preceding" not in all_content.lower()
 
     def test_glossary_terms_injected_when_relevant(self, tmp_path: Path):
@@ -1356,6 +1418,34 @@ class TestRollingSummary:
         assert result.summary_generated == "Summary of events."
         mock_summary.complete.assert_called_once()
 
+    def test_summary_skipped_when_enable_summary_false(self, tmp_path: Path):
+        """enable_summary=False suppresses the summary LLM call entirely."""
+        work_dir = _setup_work_dir(tmp_path)
+        config = _make_config(work_dir)
+        config.translation_phase.double_pass = False
+        config.translation_phase.qa_check = False
+        config.translation_phase.rolling_summary = True
+
+        mock_translate = _make_mock_client(_mock_completion("Translated text here."))
+        mock_summary = _make_mock_client(_mock_completion("Summary of events."))
+
+        chunk = _make_chunk()
+        glossary = _make_glossary()
+
+        result = translate_chunk(
+            chunk,
+            config,
+            glossary,
+            None,
+            [],
+            mock_translate,
+            mock_summary,
+            enable_summary=False,
+        )
+
+        assert result.summary_generated is None
+        mock_summary.complete.assert_not_called()
+
     def test_summary_not_generated_when_disabled(self, tmp_path: Path):
         """With rolling_summary disabled, no summary LLM call is made."""
         work_dir = _setup_work_dir(tmp_path)
@@ -1410,6 +1500,16 @@ class TestRollingSummary:
 
         assert len(result) == 2
         assert result[1]["chunk_id"] == "0001.002"
+
+    def test_update_keeps_list_sorted_by_chunk_id(self):
+        """The result is always sorted chronologically by chunk_id."""
+        summaries = [
+            {"chunk_id": "0001.003", "summary": "third"},
+            {"chunk_id": "0001.001", "summary": "first"},
+        ]
+        result = _update_rolling_summary(summaries, "0001.002", "second")
+
+        assert [e["chunk_id"] for e in result] == ["0001.001", "0001.002", "0001.003"]
 
     def test_rolling_summary_io(self, tmp_path: Path):
         """Save and load round-trip for rolling summaries."""
@@ -1745,6 +1845,73 @@ class TestRunTranslateStage:
         assert len(summaries) == 2
         assert summaries[0]["chunk_id"] == "0001.001"
         assert summaries[1]["chunk_id"] == "0001.002"
+
+    @patch("dao_bridge.translate.LLMClient")
+    def test_summary_skipped_for_non_narrative_classification(
+        self, mock_llm_cls, tmp_path: Path
+    ):
+        """Non-narrative spine items (e.g. illustration) get no rolling summary."""
+        work_dir, config, state, manifest = _setup_stage_test(tmp_path, spines=[(1, 1)])
+        config.translation_phase.rolling_summary = True
+        # Reclassify the spine as a non-narrative type and persist.
+        manifest.spine[0].classification = "illustration"
+        atomic_write(manifest_path(work_dir), manifest.model_dump_json(indent=2))
+
+        mock_client = _make_mock_client(_mock_completion("Translated."))
+        mock_llm_cls.return_value = mock_client
+
+        result = run_translate_stage(work_dir, config, state, manifest)
+
+        assert result["completed"] == 1
+        # No summary should have been generated or saved.
+        assert _load_rolling_summaries(work_dir) == []
+        # Exactly one LLM call (translation), none for a summary.
+        assert mock_client.complete.call_count == 1
+
+    @patch("dao_bridge.translate.LLMClient")
+    def test_full_force_clears_translations_and_rolling_summary(
+        self, mock_llm_cls, tmp_path: Path
+    ):
+        """A full --force wipes translations/ and rolling_summary.json."""
+        work_dir, config, state, manifest = _setup_stage_test(tmp_path, spines=[(1, 1)])
+
+        # Seed a stale translation file and a stale rolling summary.
+        mark_item_completed(work_dir, state, "translate", "0001.001")
+        _write_translation_file(work_dir, _make_translated_chunk("0001.001"))
+        stale = [{"chunk_id": "0099.001", "summary": "stale future plot"}]
+        _save_rolling_summaries(work_dir, stale)
+        assert summary_path(work_dir).exists()
+
+        mock_client = _make_mock_client(_mock_completion("Re-translated."))
+        mock_llm_cls.return_value = mock_client
+
+        run_translate_stage(work_dir, config, state, manifest, force=True)
+
+        # rolling_summary.json removed (config has rolling_summary disabled in
+        # _setup_stage_test, so it is not recreated).
+        assert not summary_path(work_dir).exists()
+        # The stale future-plot entry is gone.
+        assert _load_rolling_summaries(work_dir) == []
+
+    @patch("dao_bridge.translate.LLMClient")
+    def test_targeted_force_preserves_rolling_summary(self, mock_llm_cls, tmp_path: Path):
+        """A targeted range re-run must NOT wipe the rolling summary file."""
+        work_dir, config, state, manifest = _setup_stage_test(tmp_path, spines=[(1, 2)])
+
+        existing = [{"chunk_id": "0001.001", "summary": "prior event"}]
+        _save_rolling_summaries(work_dir, existing)
+
+        mock_client = _make_mock_client(_mock_completion("Re-translated."))
+        mock_llm_cls.return_value = mock_client
+
+        run_translate_stage(
+            work_dir, config, state, manifest, from_chunk="0001.002", to_chunk="0001.002"
+        )
+
+        # The pre-existing summary file is preserved for targeted re-runs.
+        assert summary_path(work_dir).exists()
+        summaries = _load_rolling_summaries(work_dir)
+        assert any(e["chunk_id"] == "0001.001" for e in summaries)
 
 
 # =========================================================================

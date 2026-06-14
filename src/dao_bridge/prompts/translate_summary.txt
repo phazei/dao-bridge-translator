@@ -1,9 +1,11 @@
-Summarize the key events in the translated passage below. Your summary will be used by a translator working on the next section of this novel to maintain narrative continuity.
+Summarize the key events in the translated passage provided in the user message below. Your summary will be used by a translator working on the next section of this novel to maintain narrative continuity.
 
 Guidelines:
+- Summarize ONLY the passage in the user message. The prior context inside the <rolling_summary> block below (if present) is there only to help you disambiguate names and references. NEVER copy, restate, or summarize that prior context — it is not the passage to summarize.
 - Under 200 words.
 - Focus on: key events, character actions, new information revealed, changes in setting or situation.
 - Do not include opinions, analysis, or commentary.
 - Write in present tense.
+- If the passage contains no narrative events — for example a copyright notice, format or device disclaimer, illustration/cover credit, dedication, advertisement, or other front/back matter — respond with a single short factual line describing what it is (e.g. "Copyright and publication notice.") or an empty response. Do NOT invent plot, and do NOT borrow events from the prior context.
 
 {prior_summaries}

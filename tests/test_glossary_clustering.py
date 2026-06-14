@@ -1639,8 +1639,10 @@ class TestGlossaryClusterIntegration:
         assert len(meta.merge_log) == 1
         assert meta.total_candidates_evaluated > 0
 
-    def test_on_progress_called_with_iteration_ids(self, tmp_path):
-        """on_progress receives iteration-level IDs (iter1, iter2, ...)."""
+    def test_on_progress_emits_cluster_progress(self, tmp_path):
+        """on_progress receives GlossaryClusterProgress with sane fields."""
+        from dao_bridge.glossary import GlossaryClusterProgress
+
         work, config, state = self._setup(tmp_path)
 
         mock_response = GlossaryClusterResponse(
@@ -1656,7 +1658,7 @@ class TestGlossaryClusterIntegration:
             ]
         )
 
-        progress_calls = []
+        progress_calls: list[GlossaryClusterProgress] = []
 
         with patch("dao_bridge.glossary.LLMClient") as MockClient:
             instance = MockClient.return_value
@@ -1666,13 +1668,77 @@ class TestGlossaryClusterIntegration:
                 work,
                 config,
                 state,
-                on_progress=lambda item_id: progress_calls.append(item_id),
+                on_progress=progress_calls.append,
             )
 
         assert len(progress_calls) > 0
-        # All progress IDs should be iteration-level.
-        for pid in progress_calls:
-            assert pid.startswith("iter")
+        for p in progress_calls:
+            assert isinstance(p, GlossaryClusterProgress)
+            assert 1 <= p.iteration <= p.max_iterations
+            assert p.max_iterations == config.glossary.cluster.max_iterations
+            # batch index never exceeds the iteration's batch total.
+            assert 1 <= p.batch <= p.batches_this_iteration
+            assert p.phase_label == f"Clustering iter{p.iteration}"
+            assert p.item_label
+
+    def test_on_progress_emits_one_per_llm_batch(self, tmp_path):
+        """With multiple LLM batches in an iteration, a per-batch progress event
+        fires for each (item label 'batch i/N')."""
+        from dao_bridge.glossary import GlossaryClusterProgress
+
+        work = _setup_work_dir(tmp_path)
+        config = _make_config(work)
+        # Force several small batches and a single iteration.
+        config.glossary.cluster.batch_size = 1
+        config.glossary.cluster.max_iterations = 1
+        config.glossary.cluster.auto_merge_enabled = False
+        state = load_state(work)
+        _mark_prior_stages_complete(work, state)
+
+        # Three unrelated entities whose names are JW-similar enough to be
+        # candidate pairs but which the LLM will decline to merge, so all
+        # candidate pairs survive as separate batches.
+        glossary = Glossary(
+            entities=[
+                _make_entity(
+                    "character_000001", "character", "Abel",
+                    [{"source": "アベル", "translation": "Abel"}],
+                ),
+                _make_entity(
+                    "character_000002", "character", "Abet",
+                    [{"source": "アベト", "translation": "Abet"}],
+                ),
+                _make_entity(
+                    "character_000003", "character", "Abel",
+                    [{"source": "アベル", "translation": "Abel"}],
+                ),
+            ]
+        )
+        _save_glossary(work, glossary, glossary_build_path(work))
+
+        # LLM always declines to merge (same_entity=False) so no batch is empty
+        # via merges and batch count stays stable.
+        decline = GlossaryClusterResponse(decisions=[])
+
+        batch_events: list[GlossaryClusterProgress] = []
+
+        with patch("dao_bridge.glossary.LLMClient") as MockClient:
+            instance = MockClient.return_value
+            instance.complete_json.return_value = decline
+            glossary_cluster(
+                work,
+                config,
+                state,
+                on_progress=batch_events.append,
+            )
+
+        per_batch = [p for p in batch_events if p.item_label.startswith("batch ")]
+        assert per_batch, "expected at least one per-batch progress event"
+        # batches_this_iteration is consistent and batch indices are within it.
+        n = per_batch[0].batches_this_iteration
+        assert n >= 2  # batch_size=1 over multiple candidate pairs
+        assert all(p.batches_this_iteration == n for p in per_batch)
+        assert {p.batch for p in per_batch} <= set(range(1, n + 1))
 
 
 # ---------------------------------------------------------------------------

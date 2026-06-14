@@ -3952,3 +3952,59 @@ class TestGlossaryBuildProgressWrapper:
 
         # No KeyError raised during rendering means the reset re-supplied fields.
         assert result is captured["glossary"]
+
+
+class TestGlossaryClusterProgressWrapper:
+    """The CLI cluster wrapper drives one bar across iterations/batches."""
+
+    def test_iteration_and_batch_progress_render(self, tmp_path):
+        """A multi-iteration, multi-batch sequence must render without error
+        (the 'item' task field is always supplied)."""
+        from dao_bridge.cli import _run_glossary_cluster_with_progress
+        from dao_bridge.glossary import GlossaryClusterProgress
+
+        captured: dict[str, object] = {}
+
+        def fake_cluster(work, config, state, *, on_progress=None, **kwargs):
+            # iter1: two batches.
+            on_progress(
+                GlossaryClusterProgress(
+                    iteration=1, max_iterations=3, batch=1,
+                    batches_this_iteration=2,
+                    phase_label="Clustering iter1", item_label="batch 1/2",
+                )
+            )
+            on_progress(
+                GlossaryClusterProgress(
+                    iteration=1, max_iterations=3, batch=2,
+                    batches_this_iteration=2,
+                    phase_label="Clustering iter1", item_label="batch 2/2",
+                )
+            )
+            # iter2: re-point total to a different batch count.
+            on_progress(
+                GlossaryClusterProgress(
+                    iteration=2, max_iterations=3, batch=1,
+                    batches_this_iteration=1,
+                    phase_label="Clustering iter2", item_label="batch 1/1",
+                )
+            )
+            # iter3: auto-merge-only iteration.
+            on_progress(
+                GlossaryClusterProgress(
+                    iteration=3, max_iterations=3, batch=1,
+                    batches_this_iteration=1,
+                    phase_label="Clustering iter3", item_label="auto-merges",
+                )
+            )
+            captured["glossary"] = MagicMock(entities=[])
+            return captured["glossary"]
+
+        with patch("dao_bridge.glossary.glossary_cluster", fake_cluster):
+            result = _run_glossary_cluster_with_progress(
+                work=tmp_path,
+                config=MagicMock(),
+                state=MagicMock(),
+            )
+
+        assert result is captured["glossary"]

@@ -352,6 +352,83 @@ def _run_glossary_reconcile_with_progress(
     return glossary
 
 
+def _run_glossary_cluster_with_progress(
+    *,
+    work: Path,
+    config: AppConfig,
+    state,
+    force: bool = False,
+    retry_failed: bool = False,
+    verbose: bool = False,
+):
+    """Run glossary-cluster wrapped in a Rich Progress bar.
+
+    Clustering nests iterations over batches; neither count is known up front
+    (iterations can stop early, batch counts depend on candidates generated each
+    iteration).  The single task re-points its total to the current iteration's
+    batch count and advances per LLM batch, relabelling "Clustering iterN" as
+    iterations progress.  Absolute ``completed``/``total`` are set via
+    ``update`` (not ``reset``), so no custom field needs re-supplying.
+
+    Returns the :class:`Glossary` from :func:`glossary_cluster`.
+    """
+    from rich.progress import (
+        BarColumn,
+        MofNCompleteColumn,
+        Progress,
+        SpinnerColumn,
+        TextColumn,
+        TimeElapsedColumn,
+    )
+
+    from dao_bridge.glossary import GlossaryClusterProgress, glossary_cluster
+
+    progress = Progress(
+        SpinnerColumn(),
+        TextColumn("{task.description}"),
+        BarColumn(bar_width=20),
+        MofNCompleteColumn(),
+        TextColumn("{task.fields[item]}", style="bold"),
+        TimeElapsedColumn(),
+        console=_make_utf8_console(),
+        transient=True,
+        refresh_per_second=2,
+    )
+
+    def _on_progress(p: GlossaryClusterProgress) -> None:
+        if task_id is None:
+            return
+        progress.update(
+            task_id,
+            description=p.phase_label,
+            total=p.batches_this_iteration,
+            completed=p.batch,
+            item=p.item_label,
+        )
+
+    task_id = None
+    with progress:
+        restore = _swap_logger_to_progress(progress, verbose=verbose)
+        try:
+            task_id = progress.add_task(
+                "Clustering glossary entities...",
+                total=None,
+                item="",
+            )
+            glossary = glossary_cluster(
+                work,
+                config,
+                state,
+                force=force,
+                retry_failed=retry_failed,
+                on_progress=_on_progress,
+            )
+        finally:
+            restore()
+
+    return glossary
+
+
 def _resolve_config(work_dir: Path) -> AppConfig:
     """Load config.yaml from the work directory."""
     cfg_path = work_dir / "config.yaml"
@@ -1023,21 +1100,14 @@ def glossary_cluster_cmd(
     config = _resolve_config(work)
     state = load_state(work)
 
-    from rich.progress import Progress
-
-    from dao_bridge.glossary import glossary_cluster
-
-    with Progress(transient=True) as progress:
-        task = progress.add_task("Clustering glossary entities...", total=None)
-
-        glossary = glossary_cluster(
-            work,
-            config,
-            state,
-            force=force,
-            retry_failed=retry_failed,
-            on_progress=lambda _: progress.advance(task),
-        )
+    glossary = _run_glossary_cluster_with_progress(
+        work=work,
+        config=config,
+        state=state,
+        force=force,
+        retry_failed=retry_failed,
+        verbose=ctx.obj["verbose"],
+    )
 
     click.echo(f"Glossary cluster complete: {len(glossary.entities)} entities.")
     click.echo(f"Report: {work / 'glossary_cluster_report.md'}")
@@ -1403,9 +1473,14 @@ def run(ctx: click.Context, work_dir: str, force: bool, retry_failed: bool) -> N
 
     # --- Stage 6: glossary-cluster ---
     def _glossary_cluster():
-        from dao_bridge.glossary import glossary_cluster
-
-        glossary = glossary_cluster(work, config, state, force=force, retry_failed=retry_failed)
+        glossary = _run_glossary_cluster_with_progress(
+            work=work,
+            config=config,
+            state=state,
+            force=force,
+            retry_failed=retry_failed,
+            verbose=ctx.obj["verbose"],
+        )
         click.echo(f"  {len(glossary.entities)} entities (after clustering)")
 
     _run_stage("glossary-cluster", _glossary_cluster)

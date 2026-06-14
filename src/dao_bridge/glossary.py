@@ -304,6 +304,33 @@ class GlossaryReconcileProgress:
     """Total items in this phase."""
 
 
+@dataclass
+class GlossaryClusterProgress:
+    """Passed to the *on_progress* callback during clustering.
+
+    Clustering nests two levels: outer **iterations** (capped at
+    ``max_iterations``, may stop early on convergence) and inner **batches** of
+    LLM-reviewed candidate pairs (``ceil(llm_pairs / batch_size)``), whose count
+    is known only once an iteration has generated its candidates.  The bar is
+    driven per LLM batch and re-pointed to a fresh per-iteration total at each
+    iteration; the iteration count is shown in the label.
+    """
+
+    iteration: int
+    """Current iteration number (1-based)."""
+    max_iterations: int
+    """Configured iteration cap (the upper bound; the run may stop earlier)."""
+    batch: int
+    """Batches completed in this iteration so far (including this one)."""
+    batches_this_iteration: int
+    """Total LLM batches in this iteration (>= 1; 1 for an auto-merge-only or
+    no-candidate iteration so the bar shows a completed tick rather than 0/0)."""
+    phase_label: str
+    """Human-readable iteration label, e.g. ``"Clustering iter2"``."""
+    item_label: str
+    """Short display label, e.g. ``"batch 3/7"`` or ``"auto-merges"``."""
+
+
 @dataclass(frozen=True)
 class _GlossaryBatch:
     """A deterministic glossary extraction batch covering contiguous chunks.
@@ -2003,7 +2030,7 @@ def glossary_cluster(
     *,
     force: bool = False,
     retry_failed: bool = False,
-    on_progress: Callable[[str], None] | None = None,
+    on_progress: Callable[[GlossaryClusterProgress], None] | None = None,
 ) -> Glossary:
     """Find and merge duplicate entities that build-time linking missed.
 
@@ -2044,8 +2071,8 @@ def glossary_cluster(
         If *True*, re-enter a completed stage to retry only failed
         iterations.  Preserves completed iteration state.
     on_progress:
-        Optional callback invoked with the iteration item ID (e.g.
-        ``"iter1"``) after each iteration is processed.
+        Optional callback invoked with a :class:`GlossaryClusterProgress`
+        after each LLM batch and at the end of each iteration.
 
     Returns
     -------
@@ -2154,16 +2181,33 @@ def glossary_cluster(
                 return entity
         return None
 
+    max_iters = cluster_config.max_iterations
+
+    def _emit_progress(
+        iteration: int, batch: int, batches_this_iteration: int, item_label: str
+    ) -> None:
+        if on_progress is None:
+            return
+        on_progress(
+            GlossaryClusterProgress(
+                iteration=iteration,
+                max_iterations=max_iters,
+                batch=batch,
+                batches_this_iteration=max(batches_this_iteration, 1),
+                phase_label=f"Clustering iter{iteration}",
+                item_label=item_label,
+            )
+        )
+
     # Iterative clustering loop.
     iteration = 0
-    for iteration in range(1, cluster_config.max_iterations + 1):
+    for iteration in range(1, max_iters + 1):
         item_id = f"iter{iteration}"
 
         # Skip completed iterations.
         pending = list(iter_pending_items(state, stage, [item_id]))
         if not pending:
-            if on_progress:
-                on_progress(item_id)
+            _emit_progress(iteration, 1, 1, "already done")
             continue
 
         mark_item_started(work_dir, state, stage, item_id)
@@ -2174,8 +2218,7 @@ def glossary_cluster(
         if not candidates:
             logger.debug("Clustering iteration %d: no candidates — stopping early", iteration)
             mark_item_completed(work_dir, state, stage, item_id)
-            if on_progress:
-                on_progress(item_id)
+            _emit_progress(iteration, 1, 1, "no candidates")
             break
 
         # Sort for deterministic processing order.
@@ -2287,6 +2330,7 @@ def glossary_cluster(
         batches: list[list[tuple[str, str]]] = []
         for start in range(0, len(llm_pairs), batch_size):
             batches.append(llm_pairs[start : start + batch_size])
+        num_batches = len(batches)
 
         try:
             for batch_idx, batch_pairs in enumerate(batches, 1):
@@ -2332,6 +2376,12 @@ def glossary_cluster(
                     context_label=f"cluster.{item_id}.batch{batch_idx}",
                 )
                 iteration_candidates += len(active_pairs)
+                _emit_progress(
+                    iteration,
+                    batch_idx,
+                    num_batches,
+                    f"batch {batch_idx}/{num_batches}",
+                )
 
                 # Execute merges directly from the original LLM
                 # decisions, resolving IDs on the fly through the remap
@@ -2454,8 +2504,15 @@ def glossary_cluster(
             _save_build_meta(work_dir, build_meta)
             raise
 
-        if on_progress:
-            on_progress(item_id)
+        # End-of-iteration tick: mark the bar complete for this iteration. When
+        # the iteration had no LLM batches (all auto-merged), surface that in
+        # the label rather than leaving a 0/0 bar.
+        if num_batches == 0:
+            _emit_progress(iteration, 1, 1, "auto-merges")
+        else:
+            _emit_progress(
+                iteration, num_batches, num_batches, f"batch {num_batches}/{num_batches}"
+            )
 
         logger.info(
             "Clustering iteration %d: %d candidates, %d merges",

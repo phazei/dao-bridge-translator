@@ -232,6 +232,25 @@ class GlossaryConfig(BaseModel):
     crosscheck: GlossaryCrosscheckConfig = Field(default_factory=GlossaryCrosscheckConfig)
     promote_on_complete: bool = False
 
+    summary_compress_enabled: bool = False
+    """When True, entity summaries are produced by an LLM compression pass at
+    the tail of glossary-build rather than naive concatenation (Phase 2B).
+
+    Under this mode the build batch loop accumulates raw per-chunk summary
+    observations on each entity (``summary_observations``) without touching the
+    published ``summary`` field; a single deferred pass then compresses each
+    entity's observations into one bounded, deduplicated, translation-focused
+    summary (O(entities) LLM calls, not O(mentions)). Compressed summaries also
+    improve embedding clustering (Phase 2A reads ``summary``).
+
+    When False (the default), ``merge_entity_summary`` uses the original
+    concatenation-with-dedup path and build behaviour is unchanged."""
+
+    summary_max_length: int = 500
+    """Target maximum character length for compressed entity summaries
+    (Phase 2B). The compression prompt is instructed to stay within this bound;
+    the pass also truncates as a safety net."""
+
 
 # ---------------------------------------------------------------------------
 # Glossary phase

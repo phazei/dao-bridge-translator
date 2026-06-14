@@ -1,0 +1,25 @@
+You maintain the translation-memory summary for a single glossary entity in a {source_language} -> {target_language} novel translation. Compress the accumulated observations below into ONE concise summary that helps a translator render this entity consistently.
+
+Entity category: {category}
+Entity canonical name: {canonical_name}
+
+Accumulated observations (gathered across the book, in chronological order):
+{observations}
+
+Treat these observations as a tentative, possibly-noisy hypothesis: revise, merge, and correct them rather than rubber-stamping. If later observations contradict or refine earlier ones, prefer the later understanding.
+
+Instructions:
+1. Keep ONLY translation-relevant facts: identity, role/category, key relationships, aliases or identity reveals, and distinguishing traits.
+2. Drop plot events, one-off actions, scene details, combat blow-by-blow, and dialogue content.
+3. Remove redundancy; do not repeat the same fact in different words.
+4. Do NOT restate low-confidence context hints — those are tracked separately. Capture only stable identity here.
+5. If the observations genuinely describe two distinct, still-valid referents, list each in one short clause; do not invent a split.
+6. Write the summary in {target_language}. Stay within {max_length} characters.
+
+Worked example:
+  Current understanding:  A fugitive traveling under the name Abel.
+  New observation:        Several characters imply Abel is connected to the emperor.
+  Revised summary:        A fugitive traveling under the name Abel with apparent ties to Vollachian royalty.
+
+Return ONLY a JSON object with exactly one field, "summary", holding the compressed summary string. Do not echo this schema or add other fields. Example of the exact shape to return:
+{{"summary": "A fugitive traveling under the name Abel with apparent ties to Vollachian royalty."}}

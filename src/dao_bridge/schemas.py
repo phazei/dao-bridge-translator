@@ -98,6 +98,23 @@ class Chunk(BaseModel):
 GlossarySource = Literal["seed", "extracted", "user", "master"]
 
 
+class SummaryObservation(BaseModel):
+    """A single raw summary observation accumulated during glossary build.
+
+    Each observation is one concise sentence (the ``summary_update`` emitted
+    by the extraction LLM for a mention) tagged with the chunk it came from.
+    During build these accumulate on :class:`GlossaryEntity.summary_observations`
+    and are later compressed (Phase 2B) into the scalar ``summary``.
+
+    The ``chunk_id`` provenance is retained on disk so the versioned-summary
+    stage (Phase 2C) can reconstruct a chronological timeline without
+    re-running build.
+    """
+
+    chunk_id: str  # Originating chunk, e.g. "0003.012"
+    text: str  # The observation sentence
+
+
 class SurfaceForm(BaseModel):
     """A source-language text form that refers to an entity.
 
@@ -134,6 +151,11 @@ class GlossaryEntity(BaseModel):
     category: str  # Validated against config.glossary.categories
     canonical_name: str  # Primary target-language name, e.g. "Abel"
     summary: str | None = None  # Accumulated understanding of this entity
+    summary_observations: list[SummaryObservation] = Field(default_factory=list)
+    # Raw per-chunk summary observations accumulated during build (Phase 2B).
+    # Compressed into ``summary`` by the build-tail compression pass and
+    # retained on disk for the versioned-summary stage (Phase 2C). Additive:
+    # never replaces the scalar ``summary``.
     surface_forms: list[SurfaceForm] = Field(default_factory=list)
 
     # Carried from previous schema
@@ -211,6 +233,12 @@ class GlossarySpeechMergeResponse(BaseModel):
     """LLM response for consolidating speech-style observations."""
 
     consolidated_speech_style: str
+
+
+class GlossarySummaryCompressResponse(BaseModel):
+    """LLM response for entity summary compression (Phase 2B)."""
+
+    summary: str
 
 
 class GlossaryClusterDecision(BaseModel):

@@ -19,17 +19,17 @@ from dao_bridge.glossary import (
     _group_chunks_by_spine,
     _load_build_meta,
     _load_glossary,
-    _merge_extraction_into_glossary,
     _pack_spine_batches,
     _rebalance_final_two_batches,
     _save_build_meta,
     _save_glossary,
     add_or_update_surface_form,
+    compress_entity_summaries,
+    compress_entity_summary,
     find_entity_for_mention,
     glossary_build,
     glossary_export,
     glossary_reconcile,
-    merge_aliases_nicknames_speech_notes,
     merge_entity_summary,
     next_entity_id,
     validate_glossary_categories,
@@ -43,8 +43,10 @@ from dao_bridge.schemas import (
     GlossaryExtractionResponse,
     GlossaryReconcileResponse,
     GlossarySpeechMergeResponse,
+    GlossarySummaryCompressResponse,
     Manifest,
     ManifestItem,
+    SummaryObservation,
     SurfaceForm,
 )
 from dao_bridge.state import (
@@ -1016,6 +1018,461 @@ class TestSummaryMerge:
         entity = _make_entity(summary="A" * 400)
         merge_entity_summary(entity, "B" * 200, "0000.001")
         assert len(entity.summary) <= 503  # 500 + "..."
+
+    def test_off_path_does_not_accumulate_observations(self):
+        """With compress disabled, no observations accumulate (Phase 1 path)."""
+        entity = _make_entity(summary=None)
+        merge_entity_summary(entity, "First.", "0000.001", compress_enabled=False)
+        merge_entity_summary(entity, "Second.", "0000.002", compress_enabled=False)
+        assert entity.summary_observations == []
+        assert "First." in entity.summary
+        assert "Second." in entity.summary
+
+
+# ---------------------------------------------------------------------------
+# TestSummaryCompress (Phase 2B)
+# ---------------------------------------------------------------------------
+
+
+def _compress_response(summary: str):
+    """Build a GlossarySummaryCompressResponse."""
+    return GlossarySummaryCompressResponse(summary=summary)
+
+
+class TestSummaryObservationAccumulation:
+    """merge_entity_summary in deferred (compress) mode."""
+
+    def test_observation_accumulated_not_written_to_summary(self):
+        entity = _make_entity(summary=None)
+        merge_entity_summary(entity, "An observation.", "0003.005", compress_enabled=True)
+        assert entity.summary is None
+        assert len(entity.summary_observations) == 1
+        assert entity.summary_observations[0].chunk_id == "0003.005"
+        assert entity.summary_observations[0].text == "An observation."
+        # latest_evidence_chunk is still set during build (cheap, no LLM).
+        assert entity.latest_evidence_chunk == "0003.005"
+
+    def test_multiple_observations_accumulate(self):
+        entity = _make_entity(summary=None)
+        merge_entity_summary(entity, "First.", "0001.001", compress_enabled=True)
+        merge_entity_summary(entity, "Second.", "0002.001", compress_enabled=True)
+        assert entity.summary is None
+        assert [o.text for o in entity.summary_observations] == ["First.", "Second."]
+
+    def test_null_update_ignored_in_compress_mode(self):
+        entity = _make_entity(summary=None)
+        merge_entity_summary(entity, None, "0001.001", compress_enabled=True)
+        assert entity.summary_observations == []
+
+
+class TestCompressEntitySummary:
+    """compress_entity_summary (single entity)."""
+
+    def _ctx(self):
+        """Common args: config, template, langs."""
+        config = AppConfig(source_epub="x.epub")
+        template = (
+            "{source_language} {target_language} {category} "
+            "{canonical_name}\n{observations}\n{max_length}"
+        )
+        return config, template
+
+    def test_bootstrap_single_observation_no_llm_call(self):
+        config, template = self._ctx()
+        entity = _make_entity(summary=None)
+        entity.summary_observations = [SummaryObservation(chunk_id="0001.001", text="Only one.")]
+        client = MagicMock()
+
+        made_call = compress_entity_summary(
+            entity,
+            config,
+            lambda: client,
+            source_lang="Japanese",
+            target_lang="English",
+            template=template,
+        )
+
+        assert made_call is False
+        client.complete_json.assert_not_called()
+        assert entity.summary == "Only one."
+        # Observations retained.
+        assert len(entity.summary_observations) == 1
+
+    def test_multiple_observations_one_llm_call(self):
+        config, template = self._ctx()
+        entity = _make_entity(summary=None)
+        entity.summary_observations = [
+            SummaryObservation(chunk_id="0002.001", text="Later fact."),
+            SummaryObservation(chunk_id="0001.001", text="Earlier fact."),
+        ]
+        client = MagicMock()
+        client.complete_json.return_value = _compress_response("Compressed summary.")
+
+        made_call = compress_entity_summary(
+            entity,
+            config,
+            lambda: client,
+            source_lang="Japanese",
+            target_lang="English",
+            template=template,
+        )
+
+        assert made_call is True
+        assert client.complete_json.call_count == 1
+        assert entity.summary == "Compressed summary."
+        # Observations retained and original order untouched on the entity.
+        assert len(entity.summary_observations) == 2
+
+    def test_observations_compressed_in_chunk_order(self):
+        config, template = self._ctx()
+        entity = _make_entity(summary=None)
+        entity.summary_observations = [
+            SummaryObservation(chunk_id="0005.001", text="Z-last."),
+            SummaryObservation(chunk_id="0001.001", text="A-first."),
+        ]
+        client = MagicMock()
+        client.complete_json.return_value = _compress_response("ok")
+
+        compress_entity_summary(
+            entity,
+            config,
+            lambda: client,
+            source_lang="ja",
+            target_lang="en",
+            template=template,
+        )
+
+        # The rendered prompt must list A-first before Z-last.
+        sent_messages = client.complete_json.call_args.args[0]
+        prompt_text = sent_messages[0]["content"]
+        assert prompt_text.index("A-first.") < prompt_text.index("Z-last.")
+
+    def test_empty_summary_falls_back(self):
+        config, template = self._ctx()
+        entity = _make_entity(summary=None)
+        entity.summary_observations = [
+            SummaryObservation(chunk_id="0001.001", text="Fact one."),
+            SummaryObservation(chunk_id="0002.001", text="Fact two."),
+        ]
+        client = MagicMock()
+        client.complete_json.return_value = _compress_response("   ")
+
+        compress_entity_summary(
+            entity,
+            config,
+            lambda: client,
+            source_lang="ja",
+            target_lang="en",
+            template=template,
+        )
+
+        # Fallback joins the observations rather than leaving summary empty.
+        assert entity.summary is not None
+        assert "Fact one." in entity.summary
+        assert "Fact two." in entity.summary
+
+    def test_summary_truncated_to_max_length(self):
+        config, template = self._ctx()
+        config.glossary.summary_max_length = 50
+        entity = _make_entity(summary=None)
+        entity.summary_observations = [
+            SummaryObservation(chunk_id="0001.001", text="a"),
+            SummaryObservation(chunk_id="0002.001", text="b"),
+        ]
+        client = MagicMock()
+        client.complete_json.return_value = _compress_response("X " * 100)
+
+        compress_entity_summary(
+            entity,
+            config,
+            lambda: client,
+            source_lang="ja",
+            target_lang="en",
+            template=template,
+        )
+
+        assert len(entity.summary) <= 53  # 50 + "..."
+
+
+class TestCompressEntitySummariesPass:
+    """compress_entity_summaries (full deferred pass)."""
+
+    def test_o_entities_not_o_mentions(self, tmp_path):
+        """LLM calls scale with entities (>=2 obs), not total observations."""
+        work = _setup_work_dir(tmp_path)
+        config = _make_config(work)
+        config.glossary.summary_compress_enabled = True
+
+        # Entity A: 3 observations -> 1 LLM call.
+        ent_a = _make_entity(entity_id="character_000001", canonical_name="A", summary=None)
+        ent_a.summary_observations = [
+            SummaryObservation(chunk_id=f"0001.{i:03d}", text=f"obs {i}") for i in range(3)
+        ]
+        # Entity B: 1 observation -> bootstrap, no LLM call.
+        ent_b = _make_entity(entity_id="character_000002", canonical_name="B", summary=None)
+        ent_b.summary_observations = [SummaryObservation(chunk_id="0002.001", text="solo")]
+        # Entity C: 2 observations -> 1 LLM call.
+        ent_c = _make_entity(entity_id="character_000003", canonical_name="C", summary=None)
+        ent_c.summary_observations = [
+            SummaryObservation(chunk_id="0003.001", text="c1"),
+            SummaryObservation(chunk_id="0003.002", text="c2"),
+        ]
+        glossary = Glossary(entities=[ent_a, ent_b, ent_c], book_id="test-book")
+        bp = glossary_build_path(work)
+        _save_glossary(work, glossary, bp)
+        meta = _BuildMeta()
+
+        with patch("dao_bridge.glossary.LLMClient") as mock_llm_cls:
+            mock_client = MagicMock()
+            mock_client.complete_json.return_value = _compress_response("compressed")
+            mock_llm_cls.return_value = mock_client
+
+            calls = compress_entity_summaries(work, config, glossary, meta, save_path=bp)
+
+        # 6 total observations, but only 2 entities need an LLM call.
+        assert calls == 2
+        assert mock_client.complete_json.call_count == 2
+        assert ent_b.summary == "solo"  # bootstrap
+        assert meta.summary_compress_done is True
+
+    def test_skips_user_entities(self, tmp_path):
+        work = _setup_work_dir(tmp_path)
+        config = _make_config(work)
+        config.glossary.summary_compress_enabled = True
+        user_ent = _make_entity(entity_id="character_000001", summary=None)
+        user_ent.source = "user"
+        user_ent.summary_observations = [
+            SummaryObservation(chunk_id="0001.001", text="x"),
+            SummaryObservation(chunk_id="0002.001", text="y"),
+        ]
+        glossary = Glossary(entities=[user_ent], book_id="test-book")
+        bp = glossary_build_path(work)
+        _save_glossary(work, glossary, bp)
+
+        with patch("dao_bridge.glossary.LLMClient") as mock_llm_cls:
+            mock_client = MagicMock()
+            mock_llm_cls.return_value = mock_client
+            calls = compress_entity_summaries(work, config, glossary, _BuildMeta(), save_path=bp)
+
+        assert calls == 0
+        mock_client.complete_json.assert_not_called()
+        assert user_ent.summary is None
+
+    def test_resume_skips_already_compressed(self, tmp_path):
+        """An entity that already has a summary is skipped on resume."""
+        work = _setup_work_dir(tmp_path)
+        config = _make_config(work)
+        config.glossary.summary_compress_enabled = True
+        done = _make_entity(entity_id="character_000001", summary="already done")
+        done.summary_observations = [
+            SummaryObservation(chunk_id="0001.001", text="a"),
+            SummaryObservation(chunk_id="0002.001", text="b"),
+        ]
+        pending = _make_entity(entity_id="character_000002", summary=None)
+        pending.summary_observations = [
+            SummaryObservation(chunk_id="0003.001", text="c"),
+            SummaryObservation(chunk_id="0003.002", text="d"),
+        ]
+        glossary = Glossary(entities=[done, pending], book_id="test-book")
+        bp = glossary_build_path(work)
+        _save_glossary(work, glossary, bp)
+
+        with patch("dao_bridge.glossary.LLMClient") as mock_llm_cls:
+            mock_client = MagicMock()
+            mock_client.complete_json.return_value = _compress_response("new summary")
+            mock_llm_cls.return_value = mock_client
+            calls = compress_entity_summaries(work, config, glossary, _BuildMeta(), save_path=bp)
+
+        assert calls == 1  # only the pending entity
+        assert done.summary == "already done"
+        assert pending.summary == "new summary"
+
+
+def _dispatching_client(extraction_responses, compress_summary="Compressed."):
+    """A MagicMock LLM client whose complete_json dispatches by response_model.
+
+    Extraction calls (GlossaryExtractionResponse) are served from
+    *extraction_responses* in order; compression calls
+    (GlossarySummaryCompressResponse) return a fixed compressed summary.
+    """
+    extraction_iter = iter(extraction_responses)
+
+    def _complete_json(messages, response_model=None, **kwargs):
+        if response_model is GlossarySummaryCompressResponse:
+            return GlossarySummaryCompressResponse(summary=compress_summary)
+        return next(extraction_iter)
+
+    client = MagicMock()
+    client.complete_json.side_effect = _complete_json
+    return client
+
+
+class TestGlossaryBuildSummaryCompression:
+    """glossary_build with summary_compress_enabled (Phase 2B integration)."""
+
+    def test_build_accumulates_then_compresses(self, tmp_path):
+        work = _setup_work_dir(tmp_path)
+        config = _make_config(work)
+        config.glossary.summary_compress_enabled = True
+        config.glossary_phase.target_tokens_per_call = 600  # force 2 batches
+        config.glossary_phase.min_batch_tokens = 100  # don't absorb the runt
+        state = load_state(work)
+        _mark_prior_stages_complete(work, state)
+        _make_manifest(work, n_spines=1, chunks_per_spine=2)
+        _write_chunks(work, n_spines=1, chunks_per_spine=2, tokens_per_chunk=500)
+
+        # Two batches, each contributing a summary_update for the same entity.
+        batch1 = _mock_extraction_response(
+            mentions=[
+                {
+                    "source": "スバル",
+                    "translation": "Subaru",
+                    "category": "character",
+                    "summary_update": "A boy from another world.",
+                }
+            ]
+        )
+        batch2 = _mock_extraction_response(
+            mentions=[
+                {
+                    "source": "スバル",
+                    "translation": "Subaru",
+                    "category": "character",
+                    "summary_update": "He can return after death.",
+                }
+            ]
+        )
+
+        with patch("dao_bridge.glossary.LLMClient") as mock_llm_cls:
+            mock_llm_cls.return_value = _dispatching_client(
+                [batch1, batch2], compress_summary="A boy from another world who can revive."
+            )
+            glossary = glossary_build(work, config, state, force=True)
+
+        subaru = next(e for e in glossary.entities if e.canonical_name == "Subaru")
+        # Two observations accumulated and retained, with chunk provenance.
+        assert len(subaru.summary_observations) == 2
+        assert {o.text for o in subaru.summary_observations} == {
+            "A boy from another world.",
+            "He can return after death.",
+        }
+        # Compressed summary written.
+        assert subaru.summary == "A boy from another world who can revive."
+        # Meta flag set; persisted glossary matches.
+        meta = _load_build_meta(work)
+        assert meta.summary_compress_done is True
+        reloaded = _load_glossary(work, glossary_build_path(work))
+        rs = next(e for e in reloaded.entities if e.canonical_name == "Subaru")
+        assert rs.summary == "A boy from another world who can revive."
+        assert len(rs.summary_observations) == 2
+
+    def test_disabled_uses_concatenation_path(self, tmp_path):
+        """summary_compress_enabled=False reproduces Phase 1 behaviour."""
+        work = _setup_work_dir(tmp_path)
+        config = _make_config(work)
+        assert config.glossary.summary_compress_enabled is False
+        state = load_state(work)
+        _mark_prior_stages_complete(work, state)
+        _make_manifest(work, n_spines=1, chunks_per_spine=1)
+        _write_chunks(work, n_spines=1, chunks_per_spine=1, tokens_per_chunk=500)
+
+        resp = _mock_extraction_response(
+            mentions=[
+                {
+                    "source": "スバル",
+                    "translation": "Subaru",
+                    "category": "character",
+                    "summary_update": "A boy from another world.",
+                }
+            ]
+        )
+
+        with patch("dao_bridge.glossary.LLMClient") as mock_llm_cls:
+            mock_client = MagicMock()
+            mock_client.complete_json.return_value = resp
+            mock_llm_cls.return_value = mock_client
+            glossary = glossary_build(work, config, state, force=True)
+
+        subaru = next(e for e in glossary.entities if e.canonical_name == "Subaru")
+        # Phase 1: summary written directly, no observations accumulated.
+        assert subaru.summary == "A boy from another world."
+        assert subaru.summary_observations == []
+        meta = _load_build_meta(work)
+        assert meta.summary_compress_done is False
+
+    def test_force_summaries_recompresses_without_extraction(self, tmp_path):
+        work = _setup_work_dir(tmp_path)
+        config = _make_config(work)
+        config.glossary.summary_compress_enabled = True
+        state = load_state(work)
+        _mark_prior_stages_complete(work, state)
+        _make_manifest(work, n_spines=1, chunks_per_spine=2)
+        _write_chunks(work, n_spines=1, chunks_per_spine=2, tokens_per_chunk=500)
+        config.glossary_phase.target_tokens_per_call = 600
+        config.glossary_phase.min_batch_tokens = 100
+
+        batch1 = _mock_extraction_response(
+            mentions=[
+                {
+                    "source": "スバル",
+                    "translation": "Subaru",
+                    "category": "character",
+                    "summary_update": "First.",
+                }
+            ]
+        )
+        batch2 = _mock_extraction_response(
+            mentions=[
+                {
+                    "source": "スバル",
+                    "translation": "Subaru",
+                    "category": "character",
+                    "summary_update": "Second.",
+                }
+            ]
+        )
+        with patch("dao_bridge.glossary.LLMClient") as mock_llm_cls:
+            mock_llm_cls.return_value = _dispatching_client(
+                [batch1, batch2], compress_summary="Initial compressed."
+            )
+            glossary_build(work, config, state, force=True)
+
+        # Now recompress with a different compressor output, no extraction calls.
+        with patch("dao_bridge.glossary.LLMClient") as mock_llm_cls:
+            client = MagicMock()
+
+            def _only_compress(messages, response_model=None, **kwargs):
+                assert response_model is GlossarySummaryCompressResponse
+                return GlossarySummaryCompressResponse(summary="Recompressed.")
+
+            client.complete_json.side_effect = _only_compress
+            mock_llm_cls.return_value = client
+            glossary = glossary_build(work, config, state, force_summaries=True)
+
+        subaru = next(e for e in glossary.entities if e.canonical_name == "Subaru")
+        assert subaru.summary == "Recompressed."
+        # Observations preserved (they are the input).
+        assert len(subaru.summary_observations) == 2
+
+    def test_force_summaries_requires_enabled(self, tmp_path):
+        work = _setup_work_dir(tmp_path)
+        config = _make_config(work)  # compression disabled
+        state = load_state(work)
+        _mark_prior_stages_complete(work, state)
+        _make_manifest(work, n_spines=1, chunks_per_spine=1)
+        _write_chunks(work, n_spines=1, chunks_per_spine=1, tokens_per_chunk=500)
+
+        resp = _mock_extraction_response(
+            mentions=[{"source": "ス", "translation": "S", "category": "character"}]
+        )
+        with patch("dao_bridge.glossary.LLMClient") as mock_llm_cls:
+            mock_client = MagicMock()
+            mock_client.complete_json.return_value = resp
+            mock_llm_cls.return_value = mock_client
+            glossary_build(work, config, state, force=True)
+
+        with pytest.raises(RuntimeError, match="summary_compress_enabled"):
+            glossary_build(work, config, state, force_summaries=True)
 
 
 # ---------------------------------------------------------------------------

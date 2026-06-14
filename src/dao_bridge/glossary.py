@@ -45,6 +45,8 @@ from dao_bridge.schemas import (
     GlossaryExtractionResponse,
     GlossaryReconcileResponse,
     GlossarySpeechMergeResponse,
+    GlossarySummaryCompressResponse,
+    SummaryObservation,
     SurfaceForm,
 )
 from dao_bridge.similarity import string_similarity
@@ -123,6 +125,11 @@ class _BuildMeta(BaseModel):
     conflicts: list[_ConflictRecord] = Field(default_factory=list)
     corrections: list[dict] = Field(default_factory=list)
     processed_batches: list[str] = Field(default_factory=list)
+    summary_compress_done: bool = False
+    """Phase 2B: set once the deferred summary-compression pass has finished
+    processing every entity.  Authoritative 'compression complete' signal so a
+    plain build re-run does not re-enter the pass.  Cleared by ``--force``
+    (deletes the whole meta) and by ``--force-summaries``."""
 
 
 # ---------------------------------------------------------------------------
@@ -647,10 +654,26 @@ def merge_entity_summary(
     entity: GlossaryEntity,
     summary_update: str | None,
     chunk_id: str,
+    compress_enabled: bool = False,
 ) -> None:
     """Merge a summary observation into an entity.
 
-    Simple concatenation with deduplication and max-length truncation.
+    Two modes, selected by *compress_enabled*:
+
+    - **Off (default, Phase 1):** simple concatenation with deduplication and
+      max-length truncation, writing directly to ``entity.summary``.  This is
+      byte-for-byte the original behaviour.
+    - **On (Phase 2B deferred compression):** the observation is accumulated
+      onto ``entity.summary_observations`` (tagged with *chunk_id*) and the
+      published ``entity.summary`` is left untouched.  A later compression pass
+      (:func:`compress_entity_summaries`) folds the accumulated observations
+      into ``summary`` in a single LLM call per entity.  Keeping the scratch
+      list separate from ``summary`` means a build that crashes before the
+      compression pass leaves ``summary`` clean (empty) rather than persisting
+      raw newline-joined observations into embeddings/exports.
+
+    In both modes ``latest_evidence_chunk`` is set so neither path leaves the
+    field stale.
 
     Parameters
     ----------
@@ -660,10 +683,23 @@ def merge_entity_summary(
         New summary observation, or ``None``.
     chunk_id:
         ID of the chunk providing the observation.
+    compress_enabled:
+        When True, accumulate the observation for deferred compression instead
+        of concatenating into ``summary``.
     """
     if not summary_update:
         return
     entity.latest_evidence_chunk = chunk_id
+
+    if compress_enabled:
+        # Deferred compression: accumulate raw observations; do NOT touch
+        # the published summary (kept crash-clean for embeddings/exports).
+        entity.summary_observations.append(
+            SummaryObservation(chunk_id=chunk_id, text=summary_update)
+        )
+        return
+
+    # Phase 1 concatenation path (unchanged).
     if not entity.summary:
         entity.summary = summary_update
     elif summary_update not in entity.summary:
@@ -716,6 +752,235 @@ def merge_aliases_nicknames_speech_notes(
                 entity.notes = entity.notes + " " + mention.notes
         else:
             entity.notes = mention.notes
+
+
+# ---------------------------------------------------------------------------
+# Summary compression (Phase 2B — deferred, build-tail)
+# ---------------------------------------------------------------------------
+
+
+def _truncate_summary(text: str, max_length: int) -> str:
+    """Truncate *text* to at most *max_length* characters on a word boundary."""
+    if len(text) <= max_length:
+        return text
+    return text[:max_length].rsplit(" ", 1)[0] + "..."
+
+
+def _entity_needs_compression(entity: GlossaryEntity) -> bool:
+    """Whether *entity* should be processed by the compression pass.
+
+    Skips user-sourced entities (never modified) and entities with no
+    accumulated observations.  Used both as the work filter and as the
+    resume predicate (an entity already given a summary is skipped on
+    resume — the coarse ``summary_compress_done`` flag is the authoritative
+    'pass complete' signal).
+    """
+    if entity.source == "user":
+        return False
+    return bool(entity.summary_observations)
+
+
+def compress_entity_summary(
+    entity: GlossaryEntity,
+    config: AppConfig,
+    client_factory: Callable[[], LLMClient],
+    *,
+    source_lang: str,
+    target_lang: str,
+    template: str,
+) -> bool:
+    """Compress one entity's accumulated observations into ``entity.summary``.
+
+    Bootstrap shortcut: a single observation becomes the summary directly with
+    no LLM call.  Multiple observations are compressed in one LLM call.
+    Observations are processed in **chunk order** (so the resulting summary —
+    and, later, Phase 2C versions — reflect chronological evolution) and are
+    **retained** on the entity afterwards for Phase 2C.
+
+    ``latest_evidence_chunk`` is left untouched (it was set during build);
+    compression rewrites text, not provenance.
+
+    Returns
+    -------
+    bool
+        ``True`` if an LLM call was made, ``False`` for the bootstrap
+        shortcut (used by callers/tests to assert O(entities) call counts).
+    """
+    observations = sorted(entity.summary_observations, key=lambda o: o.chunk_id)
+    if not observations:
+        return False
+
+    max_length = config.glossary.summary_max_length
+
+    # Bootstrap shortcut: a single observation needs no LLM call.
+    if len(observations) == 1:
+        entity.summary = _truncate_summary(observations[0].text, max_length)
+        return False
+
+    # Multiple observations: one LLM compression call.
+    observations_block = "\n".join(f"- {o.text}" for o in observations)
+    prompt = template.format(
+        source_language=source_lang,
+        target_language=target_lang,
+        category=entity.category,
+        canonical_name=entity.canonical_name,
+        observations=observations_block,
+        max_length=max_length,
+    )
+    messages = [{"role": "user", "content": prompt}]
+    client = client_factory()
+    response = client.complete_json(
+        messages,
+        response_model=GlossarySummaryCompressResponse,
+        context_label=f"summary:{entity.entity_id}",
+    )
+
+    # In deferred (batch) mode every entity is bootstrapped exactly once, so a
+    # well-behaved model returns a non-empty summary.  Guard the empty-summary
+    # case defensively: fall back to a joined, truncated form rather than
+    # leaving the entity summary-less.
+    summary = response.summary.strip()
+    if summary:
+        entity.summary = _truncate_summary(summary, max_length)
+    else:
+        joined = " ".join(o.text for o in observations)
+        entity.summary = _truncate_summary(joined, max_length)
+    return True
+
+
+def compress_entity_summaries(
+    work_dir: Path,
+    config: AppConfig,
+    glossary: Glossary,
+    meta: _BuildMeta,
+    *,
+    save_path: Path,
+    on_progress: Callable[[str], None] | None = None,
+) -> int:
+    """Deferred compression pass over all entities (Phase 2B).
+
+    Compresses each entity's accumulated ``summary_observations`` into its
+    scalar ``summary`` in O(entities) LLM calls (bootstrap entities cost no
+    call).  Saves the glossary after each compressed entity so the pass is
+    crash-resumable: a resumed pass skips entities that already have a
+    ``summary`` (and ``meta.summary_compress_done`` short-circuits a fully
+    completed pass before this is ever called).
+
+    Sets ``meta.summary_compress_done = True`` and saves the meta when done.
+
+    Returns
+    -------
+    int
+        Number of LLM calls made (entities compressed via the LLM, excluding
+        bootstrap shortcuts).  Primarily for logging/tests.
+    """
+    template = _load_prompt_template("glossary_summary_compress.txt")
+    source_lang = resolve_language_name(config.languages.source)
+    target_lang = resolve_language_name(config.languages.target)
+
+    _llm_client: LLMClient | None = None
+
+    def _get_client() -> LLMClient:
+        nonlocal _llm_client
+        if _llm_client is None:
+            _llm_client = LLMClient(config.models.glossary, config.llm)
+        return _llm_client
+
+    llm_calls = 0
+    for entity in glossary.entities:
+        if not _entity_needs_compression(entity):
+            continue
+        # Resume-skip: already compressed in a prior (interrupted) run.
+        if entity.summary:
+            if on_progress:
+                on_progress(entity.entity_id)
+            continue
+        made_call = compress_entity_summary(
+            entity,
+            config,
+            _get_client,
+            source_lang=source_lang,
+            target_lang=target_lang,
+            template=template,
+        )
+        if made_call:
+            llm_calls += 1
+        # Save after each entity for resumability.
+        _save_glossary(work_dir, glossary, save_path)
+        if on_progress:
+            on_progress(entity.entity_id)
+
+    meta.summary_compress_done = True
+    _save_build_meta(work_dir, meta)
+    logger.info(
+        "Summary compression complete: %d entities compressed via LLM",
+        llm_calls,
+    )
+    return llm_calls
+
+
+def _recompress_summaries_only(
+    work_dir: Path,
+    config: AppConfig,
+    state: PipelineState,
+    stage: str,
+    manifest,
+) -> Glossary:
+    """Implement ``glossary-build --force-summaries`` (Phase 2B maintenance).
+
+    Recompresses every (non-user) entity's summary from its existing
+    accumulated observations *without* re-running extraction.  Nulls each
+    entity's ``summary``, clears ``summary_compress_done``, and runs only the
+    compression pass.  Observations are left intact (they are the input).
+
+    Raises ``RuntimeError`` when summary compression is not enabled in config
+    (there are no observations to compress in that case — the naive
+    concatenation path never accumulates them).
+    """
+    if not config.glossary.summary_compress_enabled:
+        raise RuntimeError(
+            "--force-summaries requires glossary.summary_compress_enabled=True "
+            "in config.yaml (the naive concatenation path stores no observations "
+            "to recompress)."
+        )
+
+    if not is_stage_completed(state, stage):
+        raise RuntimeError(
+            "Glossary build is not completed — run 'dao-bridge glossary-build' first "
+            "before using --force-summaries."
+        )
+
+    bp = glossary_build_path(work_dir)
+    if not bp.exists():
+        raise RuntimeError(
+            "Glossary build output not found. Run 'dao-bridge glossary-build' first."
+        )
+
+    glossary = _load_glossary(work_dir, bp)
+    glossary.book_id = manifest.book_id
+    glossary.book_metadata = manifest.metadata
+    meta = _load_build_meta(work_dir)
+
+    # Null summaries for all non-user entities so the pass recomputes them.
+    reset_count = 0
+    for entity in glossary.entities:
+        if entity.source == "user":
+            continue
+        if entity.summary_observations:
+            entity.summary = None
+            reset_count += 1
+    meta.summary_compress_done = False
+    _save_glossary(work_dir, glossary, bp)
+    _save_build_meta(work_dir, meta)
+
+    logger.info("Recompressing summaries for %d entities (--force-summaries)", reset_count)
+    compress_entity_summaries(work_dir, config, glossary, meta, save_path=bp)
+
+    # Build output changed → downstream cluster/reconcile are now stale.
+    _invalidate_downstream_stages(work_dir, state, stage)
+
+    logger.info("Summary recompression complete.")
+    return glossary
 
 
 # ---------------------------------------------------------------------------
@@ -999,6 +1264,7 @@ def _merge_mention_into_glossary(
     batch_id: str,
     chunk_id: str,
     meta: _BuildMeta,
+    compress_enabled: bool = False,
 ) -> None:
     """Merge a single extracted mention into the glossary.
 
@@ -1020,6 +1286,11 @@ def _merge_mention_into_glossary(
         ID of the first chunk in the batch.
     meta:
         Build metadata sidecar (mutated with conflict info).
+    compress_enabled:
+        Phase 2B deferred compression.  When True, summary observations are
+        accumulated on ``summary_observations`` (including for a brand-new
+        entity) and the scalar ``summary`` is left empty until the
+        compression pass runs.
     """
     entity = find_entity_for_mention(glossary, mention)
 
@@ -1034,11 +1305,23 @@ def _merge_mention_into_glossary(
             first_seen_chunk=chunk_id,
             occurrence_count=1,
         )
+        # Under deferred compression, seed the observation accumulator and
+        # leave ``summary`` empty (kept crash-clean); otherwise write the
+        # observation straight into ``summary`` as before.
+        if compress_enabled and mention.summary_update:
+            initial_summary = None
+            initial_observations = [
+                SummaryObservation(chunk_id=chunk_id, text=mention.summary_update)
+            ]
+        else:
+            initial_summary = mention.summary_update
+            initial_observations = []
         new_entity = GlossaryEntity(
             entity_id=next_entity_id(mention.category, glossary),
             category=mention.category,
             canonical_name=mention.translation,
-            summary=mention.summary_update,
+            summary=initial_summary,
+            summary_observations=initial_observations,
             surface_forms=[sf],
             aliases=list(mention.aliases),
             nicknames=dict(mention.nicknames),
@@ -1065,7 +1348,7 @@ def _merge_mention_into_glossary(
     add_or_update_surface_form(entity, mention, chunk_id)
 
     # Merge summary.
-    merge_entity_summary(entity, mention.summary_update, chunk_id)
+    merge_entity_summary(entity, mention.summary_update, chunk_id, compress_enabled)
 
     # Merge aliases, nicknames, speech_style, notes.
     merge_aliases_nicknames_speech_notes(entity, mention)
@@ -1091,6 +1374,7 @@ def _merge_extraction_into_glossary(
     batch_id: str,
     first_chunk_id: str,
     meta: _BuildMeta,
+    compress_enabled: bool = False,
 ) -> None:
     """Merge all extracted mentions and corrections into the glossary.
 
@@ -1106,9 +1390,13 @@ def _merge_extraction_into_glossary(
         ID of the first chunk in the batch.
     meta:
         Build metadata sidecar (mutated with conflict info).
+    compress_enabled:
+        Phase 2B deferred compression flag, threaded to each mention merge.
     """
     for mention in response.mentions:
-        _merge_mention_into_glossary(glossary, mention, batch_id, first_chunk_id, meta)
+        _merge_mention_into_glossary(
+            glossary, mention, batch_id, first_chunk_id, meta, compress_enabled
+        )
 
     # Log corrections (not applied directly — recorded as conflicts for reconcile).
     for corr in response.corrections:
@@ -1275,6 +1563,7 @@ def glossary_build(
     retry_failed: bool = False,
     target_spine: int | None = None,
     target_batch: str | None = None,
+    force_summaries: bool = False,
     on_progress: Callable[[GlossaryBuildProgress], None] | None = None,
 ) -> Glossary:
     """Extract the per-book glossary from chunked source text.
@@ -1305,6 +1594,14 @@ def glossary_build(
         If set, redo only this specific sub-batch (e.g. ``"0003.b2"``).
         Implies force for the targeted item.  Takes precedence over
         *target_spine*.
+    force_summaries:
+        Phase 2B maintenance op.  Re-enter a completed build *without*
+        re-running extraction and recompress every (non-user) entity's
+        summary from its existing accumulated observations.  Nulls each
+        entity's ``summary``, clears ``summary_compress_done``, then runs only
+        the compression pass.  Requires ``summary_compress_enabled=True``.
+        Mutually exclusive with ``force``/``retry_failed`` (enforced by the
+        CLI).
     on_progress:
         Optional callback invoked with a :class:`GlossaryBuildProgress`
         after each sub-batch is processed.
@@ -1327,6 +1624,11 @@ def glossary_build(
     # Gate: chunk stage must be completed.
     if not is_stage_completed(state, "chunk"):
         raise RuntimeError("Chunk stage not completed. Run 'dao-bridge chunk' first.")
+
+    # Phase 2B maintenance op: recompress summaries from existing observations
+    # without re-running extraction.  Handled before any normal build flow.
+    if force_summaries:
+        return _recompress_summaries_only(work_dir, config, state, stage, manifest)
 
     # Determine if this is a targeted (partial) run.
     targeted = target_batch is not None or target_spine is not None
@@ -1448,6 +1750,11 @@ def glossary_build(
             _llm_client = LLMClient(config.models.glossary, config.llm)
         return _llm_client
 
+    # Phase 2B: when enabled, summary observations accumulate during the batch
+    # loop and a deferred compression pass runs after.  When disabled, summaries
+    # are concatenated inline exactly as Phase 1.
+    compress_enabled = config.glossary.summary_compress_enabled
+
     # Process each sub-batch.
     for batch in work_items:
         if batch.item_id not in pending:
@@ -1491,7 +1798,9 @@ def glossary_build(
 
             # Merge results.
             first_chunk_id = batch.chunks[0].chunk_id
-            _merge_extraction_into_glossary(glossary, response, batch.item_id, first_chunk_id, meta)
+            _merge_extraction_into_glossary(
+                glossary, response, batch.item_id, first_chunk_id, meta, compress_enabled
+            )
 
             # Save after each sub-batch (resumable).
             _save_glossary(work_dir, glossary, glossary_build_path(work_dir))
@@ -1539,10 +1848,28 @@ def glossary_build(
                 )
             )
 
-    # Mark stage completed only for full (non-targeted) runs.
+    # Phase 2B deferred compression: once every batch is done, fold the
+    # accumulated per-entity observations into the scalar summary.  Runs only
+    # on a full (non-targeted) build where all batches are complete, and only
+    # once (guarded by meta.summary_compress_done so a plain re-run is a no-op).
+    # Targeted reruns add fresh observations, so they reset the flag to force a
+    # recompression on the next full run.
+    if compress_enabled and targeted:
+        meta.summary_compress_done = False
+        _save_build_meta(work_dir, meta)
+
     if not targeted:
         remaining = list(iter_pending_items(state, stage, all_item_ids))
         if not remaining:
+            if compress_enabled and not meta.summary_compress_done:
+                logger.info("Compressing entity summaries (deferred pass)...")
+                compress_entity_summaries(
+                    work_dir,
+                    config,
+                    glossary,
+                    meta,
+                    save_path=glossary_build_path(work_dir),
+                )
             mark_stage_completed(work_dir, state, stage)
 
     logger.info(

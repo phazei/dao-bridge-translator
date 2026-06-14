@@ -868,6 +868,15 @@ def assemble(
     is_flag=True,
     help="Re-enter a completed stage to retry only failed batches.",
 )
+@click.option(
+    "--force-summaries",
+    "force_summaries",
+    is_flag=True,
+    help=(
+        "Recompress entity summaries from existing observations without "
+        "re-running extraction (requires summary_compress_enabled)."
+    ),
+)
 @click.pass_context
 def glossary_build_cmd(
     ctx: click.Context,
@@ -876,6 +885,7 @@ def glossary_build_cmd(
     single_batch: str | None,
     force: bool,
     retry_failed: bool,
+    force_summaries: bool,
 ) -> None:
     """Extract a per-book glossary from chunked source text.
 
@@ -885,6 +895,10 @@ def glossary_build_cmd(
 
     Use --spine or --batch to redo specific items without rebuilding
     the entire glossary.  --batch takes precedence over --spine.
+
+    Use --force-summaries to recompress entity summaries from their
+    already-accumulated observations (Phase 2B) without re-running the
+    extraction LLM calls.
 
     Requires: extract, clean, classify, chunk stages completed.
     """
@@ -896,11 +910,28 @@ def glossary_build_cmd(
         raise click.ClickException(
             "--spine/--batch cannot be combined with --force or --retry-failed."
         )
+    if force_summaries and (force or retry_failed or targeted):
+        raise click.ClickException(
+            "--force-summaries cannot be combined with --force, --retry-failed, "
+            "--spine, or --batch."
+        )
 
     work = Path(work_dir).resolve()
     setup_logging(work, ctx.obj["verbose"])
     config = _resolve_config(work)
     state = load_state(work)
+
+    if force_summaries:
+        from dao_bridge.glossary import glossary_build
+
+        try:
+            glossary = glossary_build(work, config, state, force_summaries=True)
+        except RuntimeError as exc:
+            raise click.ClickException(str(exc)) from exc
+        click.echo(
+            f"Summary recompression complete: {len(glossary.entities)} entities."
+        )
+        return
 
     glossary = _run_glossary_build_with_progress(
         work=work,

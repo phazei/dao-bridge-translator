@@ -710,6 +710,51 @@ concatenation path.
 - `summary_compress_enabled=False` → identical to Phase 1 concatenation.
 - Compressed summary respects `summary_max_length`.
 
+### 2B implementation results — shipped & verified
+
+Unlike 2A, 2B had no model-specific acceptance gate to tune: its correctness is
+mechanistic (deferred accumulation, call-count economics, retain-observations,
+resume-skip), so there were no surprises to record. Implementation notes that
+differ from / extend the spec above:
+
+- **Strategy 1 (deferred), implemented as an in-build phase, not a separate
+  stage.** The compression pass runs at the tail of `glossary_build` once all
+  batches complete, rather than as a new `glossary_summary_compress` pipeline
+  stage. This was a deliberate complexity tradeoff — it avoids touching
+  `STAGE_NAMES`, `_DOWNSTREAM_STAGES`, the `run` chain, and status display.
+  Resumability is *not* coarser: a `_BuildMeta.summary_compress_done` flag is the
+  authoritative "pass complete" signal, the glossary is saved after each
+  compressed entity, and an entity that already has a `summary` is skipped on
+  resume. Targeted `--spine`/`--batch` reruns reset the flag so the next full run
+  recompresses.
+- **Bootstrap/batch only (no incremental-update mode).** Under deferred
+  compression every entity is bootstrapped exactly once, so the
+  current-summary-vs-new-observation update path is never exercised and was not
+  built. The `GlossarySummaryCompressResponse.changed=false` no-change branch
+  exists (reserved for a future incremental mode) but is treated as a defensive
+  fallback in the deferred pass.
+- **Observations retained on disk** (`GlossaryEntity.summary_observations`, each a
+  `SummaryObservation` with `chunk_id` + `text`), chunk-sorted before
+  compression, so 2C can build the versioned timeline without re-running build.
+- **New flag `glossary-build --force-summaries`** (not in the original spec):
+  recompresses every non-`user` entity's summary from its existing observations
+  *without* re-running extraction (nulls `summary`, clears the done-flag, runs the
+  pass), then invalidates downstream cluster/reconcile. Errors clearly when
+  `summary_compress_enabled=False` (no observations exist to recompress). Mutually
+  exclusive with `--force`/`--retry-failed`/`--spine`/`--batch`.
+
+**Live verification (perfect-world-cn, Qwen3.6-35B via LM Studio, 114
+entities):** the deferred pass made **30 LLM calls** — exactly the 30 entities
+with ≥2 observations; the other 84 used the no-LLM bootstrap shortcut — confirming
+O(entities) not O(mentions). Compression replaced the Phase-1 concatenation
+artifacts with deduplicated summaries, e.g. the `Perfect World` entity's five
+near-identical observations ("The title of the novel from which this passage is
+extracted." × 5 variants) collapsed to a single `The title of the Chinese web
+novel.`, and `Stone Village` merged four partial cross-chunk observations
+(location, population, livelihood, owner) into one coherent summary.
+`--force-summaries` recompressed the same 30 entities with zero extraction calls
+and preserved all observations.
+
 ---
 
 ## Phase 2C — Versioned Summaries

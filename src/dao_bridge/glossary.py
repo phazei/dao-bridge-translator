@@ -1904,6 +1904,18 @@ def glossary_build(
 
         mark_item_started(work_dir, state, stage, batch.item_id)
 
+        # Emit progress at batch start so the bar label tracks the in-flight
+        # batch (matching the "[item] LLM request start" log line) rather than
+        # lagging one behind. The M/N count advances as each batch begins.
+        if on_progress:
+            on_progress(
+                GlossaryBuildProgress(
+                    item_id=batch.item_id,
+                    spine_batch_count=batch.spine_batch_count,
+                    items_total=items_total,
+                )
+            )
+
         try:
             # Build the chunk text for the prompt.
             chunk_texts = []
@@ -1972,15 +1984,6 @@ def glossary_build(
             _save_glossary(work_dir, glossary, glossary_build_path(work_dir))
             _save_build_meta(work_dir, meta)
             raise
-
-        if on_progress:
-            on_progress(
-                GlossaryBuildProgress(
-                    item_id=batch.item_id,
-                    spine_batch_count=batch.spine_batch_count,
-                    items_total=items_total,
-                )
-            )
 
     # Phase 2B deferred compression: once every batch is done, fold the
     # accumulated per-entity observations into the scalar summary.  Runs only
@@ -2367,6 +2370,16 @@ def glossary_cluster(
                     entity_pairs=entity_pairs_str,
                 )
 
+                # Emit progress at batch start so the bar label tracks the
+                # in-flight batch (matching the "[cluster.iterN.batchM] LLM
+                # request start" log line) rather than lagging one behind.
+                _emit_progress(
+                    iteration,
+                    batch_idx,
+                    num_batches,
+                    f"batch {batch_idx}/{num_batches}",
+                )
+
                 # Call LLM.
                 messages = [{"role": "user", "content": prompt}]
                 client = _get_llm_client()
@@ -2376,12 +2389,6 @@ def glossary_cluster(
                     context_label=f"cluster.{item_id}.batch{batch_idx}",
                 )
                 iteration_candidates += len(active_pairs)
-                _emit_progress(
-                    iteration,
-                    batch_idx,
-                    num_batches,
-                    f"batch {batch_idx}/{num_batches}",
-                )
 
                 # Execute merges directly from the original LLM
                 # decisions, resolving IDs on the fly through the remap
@@ -2735,13 +2742,11 @@ def glossary_reconcile(
             # Apply chosen translation to the specific surface form.
             entity = _find_entity_by_id(glossary, entity_id)
             old_translation = sf.translation
-            resolved_sf: SurfaceForm | None = None
             if entity:
                 for entity_sf in entity.surface_forms:
                     if entity_sf.source == sf.source:
                         entity_sf.translation = result.chosen_translation
                         entity_sf.translation_variants = []
-                        resolved_sf = entity_sf
                         break
 
             _save_glossary(work_dir, glossary)

@@ -256,7 +256,7 @@ class LLMClient:
         for attempt in range(1, self.llm_config.max_retries + 1):
             attempt_started = time.monotonic()
             logger.info(
-                "%sLLM request start (%d/%d): model=%s timeout=%.1fs messages=%d",
+                "%sLLM request start\u00a0\u00a0 (%d/%d): model=%s timeout=%.1fs messages=%d",
                 ctx,
                 attempt,
                 self.llm_config.max_retries,

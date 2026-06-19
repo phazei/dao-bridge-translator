@@ -299,6 +299,25 @@ class TestCompleteJson:
         assert isinstance(result, SimpleResponse)
         assert result.value == 42
 
+    @patch("dao_bridge.llm_client.openai.OpenAI")
+    def test_json_object_with_trailing_prose(self, mock_openai_cls):
+        """JSON object followed by trailing prose is recovered via fallback."""
+        mock_client = MagicMock()
+        mock_openai_cls.return_value = mock_client
+        mock_client.chat.completions.create.return_value = _mock_response(
+            'Sure! {"name": "ok", "value": 1} Hope that helps.'
+        )
+
+        client = LLMClient(ModelConfig(model="test-model"))
+        result = client.complete_json(
+            [{"role": "user", "content": "give me data"}],
+            response_model=SimpleResponse,
+        )
+
+        assert isinstance(result, SimpleResponse)
+        assert result.name == "ok"
+        assert result.value == 1
+
 
 # ---------------------------------------------------------------------------
 # complete_json — retry on invalid JSON

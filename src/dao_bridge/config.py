@@ -59,6 +59,13 @@ class ModelConfig(BaseModel):
     api_key: str = "not-needed"
     model: str = "default"
     temperature: float | None = None
+    # Controls server-side "thinking"/chain-of-thought on reasoning models.
+    # When set, it is forwarded to the chat-completions request. For LM Studio,
+    # ``"none"`` disables thinking entirely (the model stops emitting a
+    # ``reasoning_content`` block). ``None`` (default) omits the field so the
+    # server/app default applies. Other accepted values are model-specific
+    # (commonly ``"low"``/``"medium"``/``"high"``).
+    reasoning_effort: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -287,7 +294,8 @@ class TranslationPhaseConfig(BaseModel):
     summary_max_tokens: int = 2000
     glossary_injection: Literal["relevant", "all"] = "relevant"
     qa_check: bool = True
-    qa_temperature: float | None = 0.1
+    # None => omit the temperature field so the model/server default applies.
+    qa_temperature: float | None = None
     qa_max_retries: int = 2
     min_length_ratio: float = 0.3
     max_length_ratio: float = 2.0

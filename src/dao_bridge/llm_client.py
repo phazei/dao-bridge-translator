@@ -26,6 +26,71 @@ from dao_bridge.config import LLMConfig, ModelConfig
 logger = logging.getLogger("dao_bridge")
 
 
+def _last_balanced_json_object(text: str) -> str | None:
+    """Return the last top-level balanced ``{...}`` object in *text*, or None.
+
+    Scans from the end for a ``}``, then walks backwards to its matching ``{``
+    while respecting string literals and escapes.  Used as a fallback when a
+    model wraps its JSON in prose / an unclosed reasoning preamble.
+    """
+    end = text.rfind("}")
+    if end == -1:
+        return None
+    depth = 0
+    in_string = False
+    i = end
+    while i >= 0:
+        ch = text[i]
+        if in_string:
+            # We are scanning backwards; count preceding backslashes to know if
+            # this quote is escaped.
+            if ch == '"':
+                back = i - 1
+                slashes = 0
+                while back >= 0 and text[back] == "\\":
+                    slashes += 1
+                    back -= 1
+                if slashes % 2 == 0:
+                    in_string = False
+        else:
+            if ch == '"':
+                in_string = True
+            elif ch == "}":
+                depth += 1
+            elif ch == "{":
+                depth -= 1
+                if depth == 0:
+                    return text[i : end + 1]
+        i -= 1
+    return None
+
+
+def _extract_structured_text(raw_text: str) -> str:
+    """Best-effort extraction of the JSON object from a model response.
+
+    Order of operations:
+    1. Strip surrounding markdown code fences.
+    2. If the result still does not start with ``{``, fall back to extracting
+       the last balanced ``{...}`` object found anywhere in the text (handles a
+       model wrapping its JSON in prose like "Final decision: ...").
+    """
+    text = raw_text.strip()
+
+    if text.startswith("```"):
+        lines = text.split("\n")
+        if lines and lines[-1].strip() == "```":
+            lines = lines[1:-1]
+        else:
+            lines = lines[1:]
+        text = "\n".join(lines).strip()
+
+    if not text.startswith("{"):
+        candidate = _last_balanced_json_object(text)
+        if candidate is not None:
+            return candidate
+    return text
+
+
 # ---------------------------------------------------------------------------
 # Result / exception types
 # ---------------------------------------------------------------------------
@@ -39,6 +104,12 @@ class CompletionResult:
     token_usage: dict = field(default_factory=dict)
     model: str = ""
     finish_reason: str = ""
+    # Server-side reasoning/"thinking" text, when the model/endpoint returns it
+    # in a separate ``reasoning_content`` field (e.g. LM Studio). Empty string
+    # when thinking is disabled or the field is absent. The pipeline does not
+    # use this for output; it is exposed for diagnostics (e.g. measuring how
+    # often reasoning runs away).
+    reasoning_text: str = ""
 
 
 class LLMStructuredOutputError(Exception):
@@ -251,6 +322,14 @@ class LLMClient:
             kwargs["temperature"] = effective_temperature
         if max_tokens is not None:
             kwargs["max_tokens"] = max_tokens
+        # Forward the thinking/reasoning control when configured. Sent via
+        # extra_body so non-standard values (e.g. LM Studio's "none", which is
+        # outside the OpenAI SDK's typed enum) pass through unvalidated.
+        if self.config.reasoning_effort is not None:
+            kwargs["extra_body"] = {
+                **kwargs.get("extra_body", {}),
+                "reasoning_effort": self.config.reasoning_effort,
+            }
 
         last_error: Exception | None = None
         for attempt in range(1, self.llm_config.max_retries + 1):
@@ -286,11 +365,14 @@ class LLMClient:
                     elapsed,
                     choice.finish_reason or "",
                 )
+                # ``reasoning_content`` is non-standard; access defensively.
+                reasoning_text = getattr(choice.message, "reasoning_content", None) or ""
                 return CompletionResult(
                     text=choice.message.content or "",
                     token_usage=usage,
                     model=response.model or self.config.model,
                     finish_reason=choice.finish_reason or "",
+                    reasoning_text=reasoning_text,
                 )
             except _TRANSIENT_EXCEPTIONS as exc:
                 elapsed = time.monotonic() - attempt_started
@@ -399,17 +481,9 @@ class LLMClient:
                 temperature=temperature,
                 context_label=context_label,
             )
-            raw_text = result.text.strip()
-
-            # Strip markdown code fences if present.
-            if raw_text.startswith("```"):
-                lines = raw_text.split("\n")
-                # Remove first line (```json or ```) and last line (```)
-                if lines[-1].strip() == "```":
-                    lines = lines[1:-1]
-                else:
-                    lines = lines[1:]
-                raw_text = "\n".join(lines).strip()
+            # Extract the JSON object: strip code fences, falling back to the
+            # last balanced {...} object if the model wrapped its JSON in prose.
+            raw_text = _extract_structured_text(result.text)
 
             try:
                 parsed = json.loads(raw_text)

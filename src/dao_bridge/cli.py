@@ -451,18 +451,24 @@ def _default_config_yaml(epub_path: str, work_dir: str) -> str:
                 "api_key": "not-needed",
                 "model": "qwen3-30b-a3b",
                 "temperature": 0.6,
+                # Reasoning/thinking control for reasoning models.
+                # null => server/app default. For LM Studio, "none" disables
+                # thinking entirely. Other values: "low"/"medium"/"high".
+                "reasoning_effort": None,
             },
             "glossary": {
                 "base_url": "http://localhost:8080/v1",
                 "api_key": "not-needed",
                 "model": "gemma-4-26b-a4b",
                 "temperature": 0.7,
+                "reasoning_effort": None,
             },
             "translate": {
                 "base_url": "http://localhost:8080/v1",
                 "api_key": "not-needed",
                 "model": "gemma-4-26b-a4b",
                 "temperature": 0.9,
+                "reasoning_effort": None,
             },
             # "summarize" falls back to "translate" if absent.
             # "summarize": {
@@ -498,7 +504,8 @@ def _default_config_yaml(epub_path: str, work_dir: str) -> str:
             "summary_max_tokens": 2000,
             "glossary_injection": "relevant",
             "qa_check": True,
-            "qa_temperature": 0.1,
+            # null => use the model/server default sampling temperature.
+            "qa_temperature": None,
             "qa_max_retries": 2,
             "min_length_ratio": 0.3,
             "max_length_ratio": 2.0,

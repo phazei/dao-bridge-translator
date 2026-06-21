@@ -15,7 +15,11 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from dao_bridge.config import AppConfig
-from dao_bridge.llm_client import CompletionResult, LLMStructuredOutputError
+from dao_bridge.llm_client import (
+    CompletionResult,
+    LLMStructuredOutputError,
+    LLMValidationError,
+)
 from dao_bridge.schemas import (
     Chunk,
     Glossary,
@@ -44,10 +48,12 @@ from dao_bridge.translate import (
     _save_rolling_summaries,
     _strip_analysis,
     _update_rolling_summary,
+    _validate_pass1_analysis,
     build_pass1_messages,
     build_pass2_messages,
     build_qa_fix_messages,
     build_qa_messages,
+    has_analysis_boundary,
     load_overlap,
     programmatic_qa_check,
     qa_fix_chunk,
@@ -231,11 +237,17 @@ def _mock_completion(text: str = "Translated text.", **kwargs) -> CompletionResu
 
 def _make_mock_client(
     completions: list[CompletionResult] | CompletionResult | None = None,
+    inject_analysis: bool = True,
 ) -> MagicMock:
     """Create a MagicMock LLM client with working token-usage tracking.
 
     The mock accumulates token usage from each ``complete()`` call's return
     value, mirroring the real :class:`LLMClient` behaviour.
+
+    When *inject_analysis* is True (default), the mock's ``complete_validated``
+    injects a minimal ``</analysis>`` boundary into Pass 1 responses that lack
+    one, so tests supplying bare translation text still satisfy the Pass 1
+    contract.  Set it False to exercise the real validation/rejection path.
     """
     mock = MagicMock()
     mock.config = MagicMock(model="test-model")
@@ -276,6 +288,40 @@ def _make_mock_client(
             return result
 
         mock.complete.side_effect = _complete_side_effect
+
+    # Mirror the real client's complete_validated: call complete() (so any
+    # side-effect a test attaches to complete — including raised infra errors —
+    # propagates), run the validator, resubmit on LLMValidationError up to a
+    # bounded count. Wired unconditionally so it delegates even when no canned
+    # completions were supplied.
+    #
+    # As a convenience for the many tests that supply bare Pass 1 text, a
+    # minimal "<analysis></analysis>" boundary is injected when the response
+    # lacks one — Pass 1 output is now contractually required to carry it, and
+    # _strip_analysis removes the injected prefix so downstream assertions on the
+    # translation text are unaffected. Set inject_analysis=False to exercise the
+    # validation/rejection path.
+    def _complete_validated_side_effect(messages, validate, max_attempts=3, **kwargs):
+        attempts = max(1, max_attempts if max_attempts is not None else 3)
+        last_error = None
+        for _ in range(attempts):
+            result = mock.complete(messages, **kwargs)
+            if inject_analysis and "</analysis>" not in result.text:
+                result = CompletionResult(
+                    text="<analysis></analysis>\n" + result.text,
+                    token_usage=result.token_usage,
+                    model=result.model,
+                    finish_reason=result.finish_reason,
+                    reasoning_text=result.reasoning_text,
+                )
+            try:
+                validate(result.text)
+                return result
+            except LLMValidationError as exc:
+                last_error = exc
+        raise LLMValidationError(f"validation failed after {attempts} attempt(s): {last_error}")
+
+    mock.complete_validated.side_effect = _complete_validated_side_effect
 
     return mock
 
@@ -523,6 +569,22 @@ class TestStripAnalysis:
         text = "<analysis></analysis>Translation."
         assert _strip_analysis(text) == "Translation."
 
+    def test_missing_open_tag_still_strips_at_close(self):
+        """A dropped/truncated <analysis> open tag is recoverable: everything
+        through the last </analysis> is removed, leaving the translation."""
+        text = "Some notes the model emitted without an open tag.\n</analysis>\nThe translation."
+        assert _strip_analysis(text) == "The translation."
+
+    def test_anchors_on_last_close_tag(self):
+        """When </analysis> appears more than once, the split uses the last."""
+        text = "<analysis>a</analysis> stray </analysis>\nThe translation."
+        assert _strip_analysis(text) == "The translation."
+
+    def test_no_close_tag_returns_text_unchanged(self):
+        """Without a closing tag the text cannot be split; returned stripped."""
+        text = "  Just the translation, no tags.  "
+        assert _strip_analysis(text) == "Just the translation, no tags."
+
 
 class TestExtractAnalysis:
     """Tests for _extract_analysis()."""
@@ -559,6 +621,37 @@ class TestExtractAnalysis:
         result = _extract_analysis(text)
         assert result is not None
         assert result == "<analysis></analysis>"
+
+    def test_missing_open_tag_captures_lead_in(self):
+        """With no open tag, everything up to the last </analysis> is captured."""
+        text = "Notes without an open tag.\n</analysis>\nThe translation."
+        result = _extract_analysis(text)
+        assert result == "Notes without an open tag.\n</analysis>"
+
+    def test_no_close_tag_returns_none(self):
+        """Without a closing tag there is no analysis boundary."""
+        assert _extract_analysis("Just the translation, no tags.") is None
+
+
+class TestAnalysisBoundary:
+    """Tests for has_analysis_boundary() and _validate_pass1_analysis()."""
+
+    def test_boundary_present(self):
+        assert has_analysis_boundary("<analysis>x</analysis>\ntext") is True
+
+    def test_boundary_present_without_open_tag(self):
+        assert has_analysis_boundary("notes\n</analysis>\ntext") is True
+
+    def test_boundary_absent(self):
+        assert has_analysis_boundary("**Analysis**\nnotes\ntext") is False
+
+    def test_validator_passes_when_present(self):
+        # Should not raise.
+        _validate_pass1_analysis("notes</analysis>\ntext")
+
+    def test_validator_rejects_when_absent(self):
+        with pytest.raises(LLMValidationError):
+            _validate_pass1_analysis("**Analysis**\nnotes without a closing tag")
 
 
 # =========================================================================
@@ -985,7 +1078,9 @@ class TestTranslateChunk:
         config.translation_phase.qa_check = False
         config.translation_phase.rolling_summary = False
 
-        mock_client = _make_mock_client(_mock_completion("Pass 1 result."))
+        mock_client = _make_mock_client(
+            _mock_completion("<analysis>notes</analysis>\nPass 1 result.")
+        )
 
         chunk = _make_chunk()
         glossary = _make_glossary()
@@ -993,7 +1088,7 @@ class TestTranslateChunk:
         result = translate_chunk(chunk, config, glossary, None, [], mock_client)
 
         assert result.pass1_translation == "Pass 1 result."
-        assert result.pass1_analysis is None
+        assert result.pass1_analysis == "<analysis>notes</analysis>"
         assert result.translated_text == "Pass 1 result."
         assert result.pass_count == 1
         mock_client.complete.assert_called_once()
@@ -1009,7 +1104,7 @@ class TestTranslateChunk:
 
         mock_client = _make_mock_client(
             [
-                _mock_completion("Pass 1 draft."),
+                _mock_completion("<analysis>notes</analysis>\nPass 1 draft."),
                 _mock_completion("Pass 2 revised."),
             ]
         )
@@ -1020,7 +1115,7 @@ class TestTranslateChunk:
         result = translate_chunk(chunk, config, glossary, None, [], mock_client)
 
         assert result.pass1_translation == "Pass 1 draft."
-        assert result.pass1_analysis is None
+        assert result.pass1_analysis == "<analysis>notes</analysis>"
         assert result.translated_text == "Pass 2 revised."
         assert result.pass_count == 2
         assert mock_client.complete.call_count == 2
@@ -1128,6 +1223,52 @@ class TestTranslateChunk:
         assert result.token_usage["prompt_tokens"] == 300
         assert result.token_usage["completion_tokens"] == 110
         assert result.token_usage["total_tokens"] == 410
+
+    def test_pass1_missing_close_tag_resubmits_then_succeeds(self, tmp_path: Path):
+        """Pass 1 output lacking </analysis> is rejected and resubmitted; a
+        later compliant response is accepted."""
+        work_dir = _setup_work_dir(tmp_path)
+        config = _make_config(work_dir)
+        config.translation_phase.double_pass = False
+        config.translation_phase.qa_check = False
+        config.translation_phase.rolling_summary = False
+
+        mock_client = _make_mock_client(
+            [
+                _mock_completion("Leaked analysis, no closing tag."),
+                _mock_completion("<analysis>notes</analysis>\nClean translation."),
+            ],
+            inject_analysis=False,
+        )
+
+        chunk = _make_chunk()
+        glossary = _make_glossary()
+
+        result = translate_chunk(chunk, config, glossary, None, [], mock_client)
+
+        assert result.pass1_translation == "Clean translation."
+        assert result.pass1_analysis == "<analysis>notes</analysis>"
+        assert mock_client.complete.call_count == 2
+
+    def test_pass1_never_compliant_raises(self, tmp_path: Path):
+        """When Pass 1 never emits </analysis>, validation is exhausted and
+        an LLMValidationError propagates."""
+        work_dir = _setup_work_dir(tmp_path)
+        config = _make_config(work_dir)
+        config.translation_phase.double_pass = False
+        config.translation_phase.qa_check = False
+        config.translation_phase.rolling_summary = False
+
+        mock_client = _make_mock_client(
+            _mock_completion("No closing tag, ever."),
+            inject_analysis=False,
+        )
+
+        chunk = _make_chunk()
+        glossary = _make_glossary()
+
+        with pytest.raises(LLMValidationError):
+            translate_chunk(chunk, config, glossary, None, [], mock_client)
 
 
 # =========================================================================

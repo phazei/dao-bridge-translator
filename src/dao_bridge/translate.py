@@ -21,7 +21,6 @@ from __future__ import annotations
 import functools
 import json
 import logging
-import re
 import shutil
 import time
 from collections.abc import Callable
@@ -34,7 +33,7 @@ from pydantic import BaseModel
 from dao_bridge.chunk import count_tokens
 from dao_bridge.config import AppConfig, resolve_language_name
 from dao_bridge.glossary import load_glossary
-from dao_bridge.llm_client import LLMClient, LLMStructuredOutputError
+from dao_bridge.llm_client import LLMClient, LLMStructuredOutputError, LLMValidationError
 from dao_bridge.schemas import (
     Chunk,
     Glossary,
@@ -159,24 +158,58 @@ def _load_prompt_template(name: str) -> str:
 # Analysis stripping
 # ---------------------------------------------------------------------------
 
-_ANALYSIS_RE = re.compile(r"<analysis>.*?</analysis>\s*", re.DOTALL)
+_ANALYSIS_CLOSE_TAG = "</analysis>"
+
+
+def has_analysis_boundary(text: str) -> bool:
+    """Return whether Pass 1 output contains the required ``</analysis>`` tag.
+
+    The closing tag is the only reliable boundary between the model's analysis
+    block and the translation that follows.  A missing closing tag means the
+    output cannot be split safely and must be rejected (see
+    :meth:`LLMClient.complete_validated`).
+    """
+    return _ANALYSIS_CLOSE_TAG in text
+
+
+def _validate_pass1_analysis(text: str) -> None:
+    """Reject Pass 1 output that lacks the required ``</analysis>`` boundary.
+
+    Without the closing tag the analysis block cannot be separated from the
+    translation, so the whole reasoning preamble would otherwise leak into the
+    output.  Raising here lets :meth:`LLMClient.complete_validated` resubmit.
+    """
+    if not has_analysis_boundary(text):
+        raise LLMValidationError("Pass 1 output is missing the required </analysis> tag")
 
 
 def _extract_analysis(text: str) -> str | None:
-    """Extract the ``<analysis>...</analysis>`` block from Pass 1 LLM output.
+    """Extract the analysis block from Pass 1 LLM output.
 
-    Returns the full tagged block (including ``<analysis>`` tags), or
-    ``None`` if no analysis block is found.
+    Anchors on the **last** ``</analysis>`` tag rather than requiring a
+    well-formed ``<analysis>...</analysis>`` pair: if the model drops or
+    truncates the opening tag, the lead-in is still captured as analysis.
+    Returns everything up to and including that closing tag (stripped), or
+    ``None`` if no closing tag is present.
     """
-    match = _ANALYSIS_RE.search(text)
-    if match:
-        return match.group(0).strip()
-    return None
+    idx = text.rfind(_ANALYSIS_CLOSE_TAG)
+    if idx == -1:
+        return None
+    return text[: idx + len(_ANALYSIS_CLOSE_TAG)].strip()
 
 
 def _strip_analysis(text: str) -> str:
-    """Remove the ``<analysis>...</analysis>`` block from Pass 1 LLM output."""
-    return _ANALYSIS_RE.sub("", text).strip()
+    """Remove the analysis block from Pass 1 LLM output.
+
+    Returns everything after the last ``</analysis>`` tag (stripped).  If no
+    closing tag is present, the text is returned stripped but unchanged — the
+    caller is responsible for rejecting such output before this point (see
+    :func:`has_analysis_boundary`).
+    """
+    idx = text.rfind(_ANALYSIS_CLOSE_TAG)
+    if idx == -1:
+        return text.strip()
+    return text[idx + len(_ANALYSIS_CLOSE_TAG) :].strip()
 
 
 # ---------------------------------------------------------------------------
@@ -987,8 +1020,15 @@ def translate_chunk(
         q_client.reset_token_usage()
 
     # --- Pass 1 ---
+    # The analysis block must end with </analysis> so it can be split from the
+    # translation; reject and resubmit any response that omits it rather than
+    # letting the reasoning preamble leak downstream into Pass 2 / QA.
     messages = build_pass1_messages(chunk, glossary, overlap, rolling_summaries, config)
-    result1 = llm_client.complete(messages, context_label=f"{chunk.chunk_id}:pass1")
+    result1 = llm_client.complete_validated(
+        messages,
+        validate=_validate_pass1_analysis,
+        context_label=f"{chunk.chunk_id}:pass1",
+    )
     pass1_raw = result1.text
     pass1_analysis = _extract_analysis(pass1_raw)
     pass1_text = _strip_analysis(pass1_raw)

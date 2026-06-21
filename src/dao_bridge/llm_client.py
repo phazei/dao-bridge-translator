@@ -14,6 +14,7 @@ import json
 import logging
 import time
 import types
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Union, get_args, get_origin
 
@@ -115,6 +116,11 @@ class CompletionResult:
 class LLMStructuredOutputError(Exception):
     """Raised when ``complete_json`` cannot obtain valid structured output
     after exhausting retries."""
+
+
+class LLMValidationError(Exception):
+    """Raised by a ``complete_validated`` validator to reject a response, and
+    re-raised by ``complete_validated`` itself once retries are exhausted."""
 
 
 # ---------------------------------------------------------------------------
@@ -412,6 +418,85 @@ class LLMClient:
                 time.sleep(wait)
 
         raise last_error  # type: ignore[misc]
+
+    # ------------------------------------------------------------------
+    # complete_validated
+    # ------------------------------------------------------------------
+
+    def complete_validated(
+        self,
+        messages: list[dict],
+        validate: Callable[[str], None],
+        max_attempts: int | None = None,
+        max_tokens: int | None = None,
+        temperature: float | None = None,
+        context_label: str | None = None,
+    ) -> CompletionResult:
+        """Chat completion whose text must satisfy a caller-supplied contract.
+
+        Calls :meth:`complete` (which still handles transient API errors with
+        its own backoff) and runs *validate* on the returned text.  When
+        *validate* raises :class:`LLMValidationError`, the response is rejected
+        and the **same messages** are resubmitted — temperature variance, not
+        conversation feedback, drives the model toward a compliant sample.
+
+        Unlike :meth:`complete_json`, no corrective message is injected into the
+        conversation: the validated contract here (e.g. a required boundary
+        tag) is structural, and re-explaining freeform reasoning output is not
+        meaningful.  Only the bounded-retry discipline is borrowed.
+
+        Parameters
+        ----------
+        messages:
+            OpenAI chat format messages.
+        validate:
+            Callable invoked with the response text.  Must raise
+            :class:`LLMValidationError` to reject the response; return value is
+            ignored.
+        max_attempts:
+            Maximum number of completions to attempt.  Defaults to the client's
+            configured ``max_retries``.
+        max_tokens, temperature, context_label:
+            Forwarded to :meth:`complete`.
+
+        Returns
+        -------
+        CompletionResult
+            The first response that passes *validate*.
+
+        Raises
+        ------
+        LLMValidationError
+            After *max_attempts* responses all fail validation.
+        """
+        ctx = _context_prefix(context_label)
+        attempts = max_attempts if max_attempts is not None else self.llm_config.max_retries
+        attempts = max(1, attempts)
+
+        last_error: LLMValidationError | None = None
+        for attempt in range(1, attempts + 1):
+            result = self.complete(
+                messages,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                context_label=context_label,
+            )
+            try:
+                validate(result.text)
+                return result
+            except LLMValidationError as exc:
+                last_error = exc
+                logger.warning(
+                    "%scomplete_validated rejected response (%d/%d): %s — resubmitting",
+                    ctx,
+                    attempt,
+                    attempts,
+                    exc,
+                )
+
+        raise LLMValidationError(
+            f"{ctx}Response failed validation after {attempts} attempt(s): {last_error}"
+        )
 
     # ------------------------------------------------------------------
     # complete_json

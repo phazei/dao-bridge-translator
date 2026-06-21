@@ -8,7 +8,12 @@ import pytest
 from pydantic import BaseModel
 
 from dao_bridge.config import LLMConfig, ModelConfig
-from dao_bridge.llm_client import CompletionResult, LLMClient, LLMStructuredOutputError
+from dao_bridge.llm_client import (
+    CompletionResult,
+    LLMClient,
+    LLMStructuredOutputError,
+    LLMValidationError,
+)
 
 # ---------------------------------------------------------------------------
 # Helper: mock response factory
@@ -780,3 +785,75 @@ class TestTokenUsageTracking:
         usage1["prompt_tokens"] = 999
         usage2 = client.total_token_usage
         assert usage2["prompt_tokens"] == 0
+
+
+# ---------------------------------------------------------------------------
+# complete_validated()
+# ---------------------------------------------------------------------------
+
+
+def _require_tag(text: str) -> None:
+    if "</analysis>" not in text:
+        raise LLMValidationError("missing </analysis>")
+
+
+class TestCompleteValidated:
+    @patch("dao_bridge.llm_client.openai.OpenAI")
+    def test_passes_through_on_first_valid_response(self, mock_openai_cls):
+        mock_client = MagicMock()
+        mock_openai_cls.return_value = mock_client
+        mock_client.chat.completions.create.return_value = _mock_response("notes</analysis>\nok")
+
+        client = LLMClient(ModelConfig(model="test-model"))
+        result = client.complete_validated(
+            [{"role": "user", "content": "hi"}], validate=_require_tag
+        )
+
+        assert result.text == "notes</analysis>\nok"
+        # Only one underlying request when the first response validates.
+        assert mock_client.chat.completions.create.call_count == 1
+
+    @patch("dao_bridge.llm_client.openai.OpenAI")
+    def test_resubmits_then_succeeds(self, mock_openai_cls):
+        mock_client = MagicMock()
+        mock_openai_cls.return_value = mock_client
+        mock_client.chat.completions.create.side_effect = [
+            _mock_response("no tag here"),
+            _mock_response("now with </analysis>\ntext"),
+        ]
+
+        client = LLMClient(ModelConfig(model="test-model"))
+        result = client.complete_validated(
+            [{"role": "user", "content": "hi"}], validate=_require_tag, max_attempts=3
+        )
+
+        assert "</analysis>" in result.text
+        assert mock_client.chat.completions.create.call_count == 2
+
+    @patch("dao_bridge.llm_client.openai.OpenAI")
+    def test_raises_after_exhausting_attempts(self, mock_openai_cls):
+        mock_client = MagicMock()
+        mock_openai_cls.return_value = mock_client
+        mock_client.chat.completions.create.return_value = _mock_response("never has the tag")
+
+        client = LLMClient(ModelConfig(model="test-model"))
+        with pytest.raises(LLMValidationError):
+            client.complete_validated(
+                [{"role": "user", "content": "hi"}], validate=_require_tag, max_attempts=3
+            )
+
+        assert mock_client.chat.completions.create.call_count == 3
+
+    @patch("dao_bridge.llm_client.openai.OpenAI")
+    def test_defaults_to_configured_max_retries(self, mock_openai_cls):
+        from dao_bridge.config import LLMConfig
+
+        mock_client = MagicMock()
+        mock_openai_cls.return_value = mock_client
+        mock_client.chat.completions.create.return_value = _mock_response("no tag")
+
+        client = LLMClient(ModelConfig(model="test-model"), LLMConfig(max_retries=2))
+        with pytest.raises(LLMValidationError):
+            client.complete_validated([{"role": "user", "content": "hi"}], validate=_require_tag)
+
+        assert mock_client.chat.completions.create.call_count == 2

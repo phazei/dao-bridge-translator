@@ -682,6 +682,23 @@ class TestRunCommand:
                 return response_model(result="pass", issues=[])
 
             client.complete_json.side_effect = _complete_json
+
+            # complete_validated() — used by translate pass1. Delegate to
+            # complete() and ensure the required </analysis> boundary is present
+            # so the Pass 1 contract is satisfied (the bare mock text lacks it).
+            def _complete_validated(messages, validate, **kwargs):
+                result = client.complete(messages, **kwargs)
+                if "</analysis>" not in result.text:
+                    result = CompletionResult(
+                        text="<analysis></analysis>\n" + result.text,
+                        token_usage=result.token_usage,
+                        model=result.model,
+                        finish_reason=result.finish_reason,
+                    )
+                validate(result.text)
+                return result
+
+            client.complete_validated.side_effect = _complete_validated
             # reset_token_usage — called by translate_chunk
             client.reset_token_usage.return_value = None
             # total_token_usage property

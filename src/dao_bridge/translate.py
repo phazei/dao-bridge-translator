@@ -103,6 +103,13 @@ class QAResult:
 class QAIssue(BaseModel):
     """A single QA issue with a severity rating.
 
+    ``issue`` is described BEFORE ``severity`` on purpose: an autoregressive
+    model that emits ``severity`` first commits to a rating before it has
+    articulated the defect, then writes an ``issue`` that justifies the
+    pre-chosen rating. Describing the defect first lets the rating follow as a
+    conclusion rather than a premise, which markedly reduces spurious "high"
+    verdicts on correct translations.
+
     ``severity`` gates whether the issue forces a failure:
 
     - ``"high"`` — a real defect that breaks the translation (dropped or
@@ -112,15 +119,22 @@ class QAIssue(BaseModel):
       chunk (word choice, phrasing, minor imagery differences).
     """
 
-    severity: Literal["high", "low"] = "low"
     issue: str
+    severity: Literal["high", "low"] = "low"
 
 
 class QAResponse(BaseModel):
-    """Pydantic model for the LLM QA assessment JSON response."""
+    """Pydantic model for the LLM QA assessment JSON response.
 
-    result: Literal["pass", "fail"]
+    ``issues`` is listed BEFORE ``result`` for the same reason ``QAIssue``
+    describes the defect before rating it: an autoregressive model that emits
+    ``result`` first commits to a verdict before enumerating the evidence, then
+    rationalizes that verdict. Listing the issues first makes ``result`` follow
+    as a conclusion drawn from the issues, reducing premature pass/fail calls.
+    """
+
     issues: list[QAIssue] = []
+    result: Literal["pass", "fail"]
 
 
 @dataclass

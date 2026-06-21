@@ -10,7 +10,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 # ---------------------------------------------------------------------------
 # Classification literal
@@ -33,12 +33,20 @@ Classification = Literal[
 
 
 class ClassificationResponse(BaseModel):
-    """Pydantic model for LLM structured output via ``complete_json``."""
+    """Pydantic model for LLM structured output via ``complete_json``.
 
+    ``reasoning`` is declared first so the generated example makes the model
+    state its justification before committing to ``classification``/
+    ``confidence``. Field order is load-bearing here because the example
+    instruction follows declaration order; an autoregressive model that emits the
+    label first rationalizes after the fact, whereas a reason stated first
+    constrains the label that follows.
+    """
+
+    reasoning: str
     classification: Classification
     title: str | None = None
     confidence: Literal["high", "medium", "low"]
-    reasoning: str
 
 
 # ---------------------------------------------------------------------------
@@ -214,6 +222,21 @@ class GlossaryCorrectionEntry(BaseModel):
     corrected_translation: str
     reason: str
 
+    @field_validator("existing_translation", mode="before")
+    @classmethod
+    def _coerce_null_existing_translation(cls, v: object) -> object:
+        """Tolerate a null ``existing_translation``.
+
+        Models routinely emit ``null`` here when proposing a correction for a
+        term they consider previously untranslated (e.g. a brand-new name whose
+        ``reason`` is "new extraction"). The field is semantically optional in
+        that case, so a null is a valid intent — not malformed output. Coerce it
+        to ``""`` rather than failing validation and forcing an expensive retry.
+        Downstream consumers (correction-target lookup, conflict recording)
+        already treat an empty existing translation as "no prior match".
+        """
+        return "" if v is None else v
+
 
 class GlossaryExtractionResponse(BaseModel):
     """Top-level LLM response for glossary extraction."""
@@ -223,10 +246,21 @@ class GlossaryExtractionResponse(BaseModel):
 
 
 class GlossaryReconcileResponse(BaseModel):
-    """LLM response for resolving a term conflict."""
+    """LLM response for resolving a term conflict.
 
-    chosen_translation: str
+    Field order matters: ``reasoning`` is declared BEFORE ``chosen_translation``
+    so the generated example instruction (built from field declaration order in
+    ``llm_client._example_instruction``) makes the model state its justification
+    first and the decision last. An autoregressive model that emits the choice
+    first cannot let the justification influence it — the reasoning degrades into
+    a post-hoc rationalization of an already-committed answer. Stating the reason
+    first biases the subsequent choice toward that reason. This is not a request
+    for open-ended "thinking"; it is a stated justification that precedes (and
+    therefore constrains) the selection.
+    """
+
     reasoning: str
+    chosen_translation: str
 
 
 class GlossarySpeechMergeResponse(BaseModel):
@@ -242,14 +276,21 @@ class GlossarySummaryCompressResponse(BaseModel):
 
 
 class GlossaryClusterDecision(BaseModel):
-    """LLM decision for a single candidate entity pair during clustering."""
+    """LLM decision for a single candidate entity pair during clustering.
+
+    ``reasoning`` is declared before the decision fields (``same_entity`` etc.)
+    so the generated example makes the model state its justification first. See
+    ``GlossaryReconcileResponse`` for why field order is load-bearing here: a
+    stated reason that precedes the decision constrains it, whereas a reason
+    emitted afterward only rationalizes an already-committed answer.
+    """
 
     entity_id_a: str
     entity_id_b: str
+    reasoning: str
     same_entity: bool
     preferred_entity_id: str | None = None
     preferred_canonical_name: str | None = None
-    reasoning: str
 
 
 class GlossaryClusterResponse(BaseModel):

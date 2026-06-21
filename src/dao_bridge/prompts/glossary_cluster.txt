@@ -8,6 +8,16 @@ For each pair, decide whether the two entities are **the same identity** — mea
 - A place and an organization headquartered there are NOT the same entity.
 - Two different romanisations of the same character's name IS the same entity.
 - A character's name with an honorific suffix (-chan, -sama) and without IS the same entity.
+- Two members of the same group, rank, or title set (e.g. two of the "Nine Generals", two knights, two princes) are NOT the same entity just because they co-occur or sound similar. Co-membership is not identity.
+
+Base your decision ONLY on evidence present in the entity data shown below: overlapping source-language forms, a shared reading, overlapping aliases, or an explicit statement in a summary/context hint/notes that the two are the same individual.
+
+Do NOT merge on:
+- phonetic or sound-alike similarity between names (names "sounding like" each other is not evidence),
+- transliteration or romanization guesses (e.g. "X is probably how Y is read"),
+- outside knowledge, franchise "lore", or wiki/canon familiarity not contained in the entity data shown below.
+
+When two entities share NO source-language text and NO reading, default to same_entity=false UNLESS the entity data itself explicitly states they are the same individual (e.g. a context hint that names the other entity as the same person). Genuine cross-name reveals carry such an explicit in-data signal; speculation does not.
 
 If they ARE the same entity, also indicate:
 - Which entity_id should be kept (the "preferred" one)
@@ -22,7 +32,7 @@ Return JSON with exactly one array:
 - "decisions": one decision per pair, each with:
   - "entity_id_a": first entity's ID (as given above)
   - "entity_id_b": second entity's ID (as given above)
+  - "reasoning": the justification for your decision, citing the specific evidence from the entity data above that supports it — not external knowledge, phonetic guesses, or lore
   - "same_entity": true or false
   - "preferred_entity_id": the ID to keep (null if not same entity)
   - "preferred_canonical_name": the best canonical name for the merged entity (null if not same entity)
-  - "reasoning": brief explanation of your decision

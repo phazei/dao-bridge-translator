@@ -23,8 +23,8 @@ Guidelines:
 === CLEANED CONTENT (first ~1500 tokens of prose) ===
 {clean_excerpt}
 
-Return your answer as JSON with exactly these fields:
+Return your answer as JSON with exactly these fields, in this order:
+- reasoning: the justification for your classification
 - classification: one of the seven values listed above
 - title: string or null
 - confidence: "high", "medium", or "low"
-- reasoning: brief explanation of your decision

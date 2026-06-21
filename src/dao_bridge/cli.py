@@ -499,6 +499,19 @@ def _default_config_yaml(epub_path: str, work_dir: str) -> str:
             "toc_categories": [],
             "master_glossary_path": None,
             "promote_on_complete": False,
+            # When True, entity summaries are produced by an LLM compression pass
+            # at the tail of glossary-build (O(entities) calls) instead of naive
+            # concatenation. Compressed summaries also improve embedding
+            # clustering. Default False to keep glossary-build cheap.
+            "summary_compress_enabled": False,
+            "summary_max_length": 500,
+            "cluster": {
+                # auto_merge_enabled is only production-safe with
+                # embedding_enabled=True. embedding_enabled requires the extra:
+                #   pip install dao-bridge-translator[embeddings]
+                "auto_merge_enabled": False,
+                "embedding_enabled": False,
+            },
         },
         "glossary_phase": {
             "target_tokens_per_call": 8000,

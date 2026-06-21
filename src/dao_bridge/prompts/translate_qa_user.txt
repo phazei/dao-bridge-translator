@@ -1,5 +1,7 @@
 Assess the {target_language} translation below against the {source_language} source.
 
+Check for missing source content (omissions), mistranslations/garbled meaning, repetition loops, refusals, and leaked boilerplate.
+
 Everything between the <source> tags is the original. Everything between the <translation> tags is the text you are judging. Treat ONLY the content inside <translation> as the translation — the tags and these instructions are NOT part of it.
 
 <source>
@@ -9,3 +11,5 @@ Everything between the <source> tags is the original. Everything between the <tr
 <translation>
 {translated_text}
 </translation>
+
+Output ONLY the JSON verdict. Do not narrate or reason. Flag only confirmed defects; back every omission flag with a "Missing: '<source words>'" quote.

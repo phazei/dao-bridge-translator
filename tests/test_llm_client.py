@@ -113,14 +113,15 @@ class TestContextLabel:
         mock_client.chat.completions.create.return_value = _mock_response("ok")
 
         client = LLMClient(ModelConfig(model="test-model"))
-        with caplog.at_level("INFO", logger="dao_bridge"):
+        # "start" is a DEBUG line; the success summary is INFO. Capture both.
+        with caplog.at_level("DEBUG", logger="dao_bridge"):
             client.complete(
                 [{"role": "user", "content": "hi"}],
                 context_label="0014.b3",
             )
 
         start = next(m for m in caplog.messages if "LLM request start" in m)
-        success = next(m for m in caplog.messages if "LLM request success" in m)
+        success = next(m for m in caplog.messages if "finish=" in m)
         # Batch IDs are not tag-like, so they are not escaped and render as-is.
         assert start.startswith("[0014.b3] ")
         assert success.startswith("[0014.b3] ")
@@ -133,7 +134,7 @@ class TestContextLabel:
         mock_client.chat.completions.create.return_value = _mock_response("ok")
 
         client = LLMClient(ModelConfig(model="test-model"))
-        with caplog.at_level("INFO", logger="dao_bridge"):
+        with caplog.at_level("DEBUG", logger="dao_bridge"):
             client.complete(
                 [{"role": "user", "content": "hi"}],
                 context_label="summary:place_000001",
@@ -152,7 +153,7 @@ class TestContextLabel:
         mock_client.chat.completions.create.return_value = _mock_response("ok")
 
         client = LLMClient(ModelConfig(model="test-model"))
-        with caplog.at_level("INFO", logger="dao_bridge"):
+        with caplog.at_level("DEBUG", logger="dao_bridge"):
             client.complete([{"role": "user", "content": "hi"}])
 
         start = next(m for m in caplog.messages if "LLM request start" in m)
@@ -167,7 +168,7 @@ class TestContextLabel:
         )
 
         client = LLMClient(ModelConfig(model="test-model"))
-        with caplog.at_level("INFO", logger="dao_bridge"):
+        with caplog.at_level("DEBUG", logger="dao_bridge"):
             client.complete_json(
                 [{"role": "user", "content": "hi"}],
                 response_model=SimpleResponse,

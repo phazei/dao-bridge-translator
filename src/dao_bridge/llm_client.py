@@ -330,11 +330,19 @@ class LLMClient:
                 **kwargs.get("extra_body", {}),
                 "reasoning_effort": self.config.reasoning_effort,
             }
+        # Keep-alive: forward ttl so the server (LM Studio) defers auto-unload,
+        # keeping the model resident between calls (e.g. when alternating with a
+        # separate QA model). Sent via extra_body as it is non-standard.
+        if self.config.ttl is not None:
+            kwargs["extra_body"] = {
+                **kwargs.get("extra_body", {}),
+                "ttl": self.config.ttl,
+            }
 
         last_error: Exception | None = None
         for attempt in range(1, self.llm_config.max_retries + 1):
             attempt_started = time.monotonic()
-            logger.info(
+            logger.debug(
                 "%sLLM request start\u00a0\u00a0 (%d/%d): model=%s timeout=%.1fs messages=%d",
                 ctx,
                 attempt,
@@ -356,12 +364,12 @@ class LLMClient:
                     }
                     for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
                         self._total_token_usage[key] += usage.get(key, 0)
+                retry_note = "" if attempt == 1 else f" (retry {attempt}/{self.llm_config.max_retries})"
                 logger.info(
-                    "%sLLM request success (%d/%d): model=%s elapsed=%.2fs finish=%s",
+                    "%sLLM model=%s%s elapsed=%.2fs finish=%s",
                     ctx,
-                    attempt,
-                    self.llm_config.max_retries,
-                    response.model or self.config.model,
+                    self.config.model,
+                    retry_note,
                     elapsed,
                     choice.finish_reason or "",
                 )

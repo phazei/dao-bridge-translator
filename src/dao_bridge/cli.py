@@ -476,6 +476,17 @@ def _default_config_yaml(epub_path: str, work_dir: str) -> str:
             #     "api_key": "not-needed",
             #     "model": "qwen3-30b-a3b",
             # },
+            # "qa" (translation QA judge) falls back to "translate" if absent.
+            # Point it at a model that detects defects/omissions well. Set a
+            # large "ttl" on both this and "translate" so LM Studio keeps them
+            # resident and does not reload on every translate<->QA switch.
+            # "qa": {
+            #     "base_url": "http://localhost:8080/v1",
+            #     "api_key": "not-needed",
+            #     "model": "gemma-4-31b-it",
+            #     "reasoning_effort": "none",
+            #     "ttl": 3600,
+            # },
         },
         "chunking": {
             "target_tokens": 2000,

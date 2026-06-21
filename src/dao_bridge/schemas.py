@@ -277,7 +277,7 @@ class TranslatedChunk(BaseModel):
     pass1_translation: str  # Pass 1 output, kept for debugging
     pass1_analysis: str | None = None  # <analysis> block from Pass 1 (stripped from translation)
     translated_text: str  # final: Pass 2 if double_pass, else Pass 1
-    pass_count: int  # 1 or 2
+    pass_count: int  # generation passes: 1 (pass1) or 2 (+pass2), +1 per qa-fix
     qa_result: Literal["pass", "fail"] | None = None  # None if QA disabled
     qa_issues: list[str] = []
     total_attempts: int  # count of full chunk translation attempts

@@ -5,6 +5,7 @@ Choose your mode based on the defects:
 SURGICAL MODE (default — use when the translation is mostly good):
 - Make the minimal edits needed to resolve each listed issue. Do not re-translate, re-paraphrase, or "improve" passages that are not part of an issue.
 - Preserve all correct prose, paragraph structure, names, and terminology exactly as they already appear.
+- If an issue is that the meaning is reversed, mistranslated, or garbled, find the specific sentence or clause it names and REWRITE that sentence so it faithfully conveys the {source_language} source meaning. Re-read the cited source span and translate it correctly — paying attention to WHO does WHAT to WHOM (subject, object, and who benefits), negation/affirmation, and which character a pronoun refers to. A sentence that reads fluently in {target_language} can still be wrong: fluency is NOT evidence that the meaning is correct. Fix flagged meaning errors even when the current wording sounds natural.
 - If an issue is that non-story boilerplate leaked in (copyright notices, website URLs, disclaimers, author/translator notes, "next update" or publish-date lines, advertisements, site credits), DELETE those passages entirely — including any links or markup inside them.
 - If an issue is a repetition loop, remove the duplicated runs, keeping one clean copy.
 

@@ -66,6 +66,13 @@ class ModelConfig(BaseModel):
     # server/app default applies. Other accepted values are model-specific
     # (commonly ``"low"``/``"medium"``/``"high"``).
     reasoning_effort: str | None = None
+    # Optional keep-alive (seconds) forwarded to the request as ``ttl``. LM
+    # Studio uses this as the JIT auto-unload timeout: how long the model stays
+    # resident after its last request. Set a large value (e.g. 3600) on models
+    # used in an alternating pattern (e.g. translate + a separate QA model) so
+    # the idle one is NOT evicted between calls — this keeps both resident and
+    # avoids costly reloads on every switch. ``None`` (default) omits the field.
+    ttl: int | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -348,12 +355,16 @@ class LLMConfig(BaseModel):
 
 
 class ModelsConfig(BaseModel):
-    """Per-task model endpoints.  ``summarize`` falls back to ``translate``."""
+    """Per-task model endpoints.
+
+    ``summarize`` and ``qa`` both fall back to ``translate`` when absent.
+    """
 
     classify: ModelConfig = Field(default_factory=ModelConfig)
     glossary: ModelConfig = Field(default_factory=ModelConfig)
     translate: ModelConfig = Field(default_factory=ModelConfig)
     summarize: ModelConfig | None = None  # falls back to translate if absent
+    qa: ModelConfig | None = None  # translation QA judge; falls back to translate
 
 
 # ---------------------------------------------------------------------------
@@ -389,6 +400,10 @@ class AppConfig(BaseModel):
     def summarize_model(self) -> ModelConfig:
         """Return the summarize model config, falling back to translate."""
         return self.models.summarize or self.models.translate
+
+    def qa_model(self) -> ModelConfig:
+        """Return the QA-judge model config, falling back to translate."""
+        return self.models.qa or self.models.translate
 
 
 # ---------------------------------------------------------------------------

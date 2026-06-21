@@ -857,7 +857,7 @@ def generate_summary(
         {"role": "user", "content": translated_text},
     ]
 
-    result = llm_client.complete(messages)
+    result = llm_client.complete(messages, context_label=f"{chunk_id}:summary")
     return result.text.strip()
 
 
@@ -879,15 +879,16 @@ def _run_qa(
     source_text: str,
     final_text: str,
     glossary: Glossary,
-    llm_client: LLMClient,
+    qa_client: LLMClient,
     config: AppConfig,
 ) -> tuple[Literal["pass", "fail"] | None, list[str]]:
     """Assess a translation and return ``(qa_result, high_severity_issues)``.
 
-    Programmatic checks run first.  If they pass, the LLM judge is consulted.
-    Only HIGH-severity issues force a ``"fail"``; low-severity observations are
-    logged but pass.  Returns the list of high-severity issue strings (empty on
-    pass).
+    Programmatic checks run first.  If they pass, the LLM judge is consulted via
+    *qa_client* (which may be a different model than the translator — see
+    :meth:`AppConfig.qa_model`).  Only HIGH-severity issues force a ``"fail"``;
+    low-severity observations are logged but pass.  Returns the list of
+    high-severity issue strings (empty on pass).
     """
     tp = config.translation_phase
 
@@ -897,7 +898,7 @@ def _run_qa(
 
     messages = build_qa_messages(source_text, final_text, glossary, config)
     try:
-        qa_resp: QAResponse = llm_client.complete_json(  # type: ignore[assignment]
+        qa_resp: QAResponse = qa_client.complete_json(  # type: ignore[assignment]
             messages,
             QAResponse,
             max_retries=3,
@@ -930,6 +931,7 @@ def translate_chunk(
     rolling_summaries: list[dict],
     llm_client: LLMClient,
     summary_client: LLMClient | None = None,
+    qa_client: LLMClient | None = None,
     enable_summary: bool = True,
 ) -> TranslatedChunk:
     """Translate a single chunk through the full pipeline.
@@ -956,6 +958,10 @@ def translate_chunk(
     summary_client:
         LLM client for summary generation.  Falls back to *llm_client*
         if ``None``.
+    qa_client:
+        LLM client for the QA judge.  Falls back to *llm_client* if ``None``.
+        May be a different model than the translator (see
+        :meth:`AppConfig.qa_model`).
     enable_summary:
         When ``False``, skip rolling-summary generation entirely (no LLM
         call, ``summary_generated`` left ``None``).  Used to suppress
@@ -976,10 +982,13 @@ def translate_chunk(
     s_client = summary_client or llm_client
     if s_client is not llm_client:
         s_client.reset_token_usage()
+    q_client = qa_client or llm_client
+    if q_client is not llm_client and q_client is not s_client:
+        q_client.reset_token_usage()
 
     # --- Pass 1 ---
     messages = build_pass1_messages(chunk, glossary, overlap, rolling_summaries, config)
-    result1 = llm_client.complete(messages)
+    result1 = llm_client.complete(messages, context_label=f"{chunk.chunk_id}:pass1")
     pass1_raw = result1.text
     pass1_analysis = _extract_analysis(pass1_raw)
     pass1_text = _strip_analysis(pass1_raw)
@@ -991,7 +1000,7 @@ def translate_chunk(
 
     if tp.double_pass:
         messages = build_pass2_messages(chunk.text, pass1_text, config)
-        result2 = llm_client.complete(messages)
+        result2 = llm_client.complete(messages, context_label=f"{chunk.chunk_id}:pass2")
         final_text = result2.text.strip()
         pass_count = 2
 
@@ -1001,7 +1010,7 @@ def translate_chunk(
 
     if tp.qa_check:
         qa_result_val, qa_issues = _run_qa(
-            chunk.chunk_id, chunk.text, final_text, glossary, llm_client, config
+            chunk.chunk_id, chunk.text, final_text, glossary, q_client, config
         )
 
     # --- Rolling summary ---
@@ -1015,6 +1024,8 @@ def translate_chunk(
     token_usage = llm_client.total_token_usage
     if s_client is not llm_client:
         token_usage = _merge_token_usage(token_usage, s_client.total_token_usage)
+    if q_client is not llm_client and q_client is not s_client:
+        token_usage = _merge_token_usage(token_usage, q_client.total_token_usage)
 
     duration = time.monotonic() - start_time
 
@@ -1046,6 +1057,7 @@ def qa_fix_chunk(
     rolling_summaries: list[dict],
     llm_client: LLMClient,
     summary_client: LLMClient | None = None,
+    qa_client: LLMClient | None = None,
     enable_summary: bool = True,
 ) -> TranslatedChunk:
     """Run a targeted QA-fix pass on a translation that failed QA.
@@ -1063,21 +1075,28 @@ def qa_fix_chunk(
     s_client = summary_client or llm_client
     if s_client is not llm_client:
         s_client.reset_token_usage()
+    q_client = qa_client or llm_client
+    if q_client is not llm_client and q_client is not s_client:
+        q_client.reset_token_usage()
 
     # --- QA-fix pass ---
+    # The corrective generation uses the QA model (q_client) rather than the
+    # translator: the QA judge already understood the defect well enough to flag
+    # it, so it is best placed to rewrite the offending span correctly. Falls
+    # back to the translator when no separate QA model is configured.
     messages = build_qa_fix_messages(
         chunk.text, prior.translated_text, issues, glossary, config
     )
-    result = llm_client.complete(messages)
+    result = q_client.complete(messages, context_label=f"{chunk.chunk_id}:qa-fix")
     fixed_text = result.text.strip()
-    model_used = result.model or llm_client.config.model
+    model_used = result.model or q_client.config.model
 
     # --- Re-assess ---
     qa_result_val: Literal["pass", "fail"] | None = None
     qa_issues: list[str] = []
     if tp.qa_check:
         qa_result_val, qa_issues = _run_qa(
-            chunk.chunk_id, chunk.text, fixed_text, glossary, llm_client, config
+            chunk.chunk_id, chunk.text, fixed_text, glossary, q_client, config
         )
 
     # --- Rolling summary (only when the fixed text passes) ---
@@ -1090,6 +1109,8 @@ def qa_fix_chunk(
     token_usage = llm_client.total_token_usage
     if s_client is not llm_client:
         token_usage = _merge_token_usage(token_usage, s_client.total_token_usage)
+    if q_client is not llm_client and q_client is not s_client:
+        token_usage = _merge_token_usage(token_usage, q_client.total_token_usage)
 
     duration = time.monotonic() - start_time
 
@@ -1101,7 +1122,10 @@ def qa_fix_chunk(
         pass1_translation=prior.pass1_translation,
         pass1_analysis=prior.pass1_analysis,
         translated_text=fixed_text,
-        pass_count=prior.pass_count,
+        # Each corrective qa-fix is an additional generation pass on top of the
+        # prior attempt's passes (pass1/pass2). QA judge calls are evaluation
+        # only and do not count.
+        pass_count=prior.pass_count + 1,
         qa_result=qa_result_val,
         qa_issues=qa_issues,
         total_attempts=1,  # caller sets the real attempt number
@@ -1247,6 +1271,13 @@ def run_translate_stage(
     summary_client: LLMClient | None = None
     if summarize_cfg is not config.models.translate:
         summary_client = LLMClient(summarize_cfg, llm_config)
+    # QA judge may use a different model than the translator (e.g. a model that
+    # detects omissions well without reasoning). Reuse the translate client when
+    # the config falls back to translate, to avoid a redundant client/swap.
+    qa_cfg = config.qa_model()
+    qa_client: LLMClient | None = None
+    if qa_cfg is not config.models.translate:
+        qa_client = LLMClient(qa_cfg, llm_config)
 
     # Enumerate all chunk IDs.
     all_chunk_ids = _enumerate_chunk_ids(manifest)
@@ -1378,6 +1409,7 @@ def run_translate_stage(
                         rolling_summaries=rolling_summaries,
                         llm_client=translate_client,
                         summary_client=summary_client,
+                        qa_client=qa_client,
                         enable_summary=enable_summary,
                     )
                 else:
@@ -1392,6 +1424,7 @@ def run_translate_stage(
                         rolling_summaries=rolling_summaries,
                         llm_client=translate_client,
                         summary_client=summary_client,
+                        qa_client=qa_client,
                         enable_summary=enable_summary,
                     )
             except Exception as exc:
@@ -1413,17 +1446,12 @@ def run_translate_stage(
             )
             last_tc = tc
 
-            # Keep-best: an attempt with zero high-severity issues is a pass —
-            # adopt it and stop early.  Otherwise retain the attempt with the
-            # fewest high-severity issues (ties resolved by the latest attempt).
+            # A clean attempt (no high-severity issues) is a pass — adopt and stop.
             if tc.qa_result != "fail":
                 best_tc = tc
                 break
 
-            if best_tc is None or len(tc.qa_issues) <= len(best_tc.qa_issues):
-                best_tc = tc
-
-            # Save the failed attempt as an audit artifact.
+            # Save the failed attempt as an audit artifact (every failing attempt).
             fail_num = next_failed_attempt(work_dir, chunk_id, sw)
             fail_path = failed_translation_path(work_dir, chunk_id, fail_num, sw)
             fail_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1438,6 +1466,27 @@ def run_translate_stage(
                 "; ".join(tc.qa_issues),
                 fail_path.name,
             )
+
+            # Selection for an iterative refinement chain: each qa-fix attempt is
+            # built on the prior attempt's text, so it carries forward all earlier
+            # corrections. Adopt the latest attempt as best while it improves or
+            # holds (fewer-or-equal high-severity issues than the prior attempt).
+            # If an attempt REGRESSES (more high-severity issues than the prior),
+            # a fix has broken something: roll back to the prior attempt and stop,
+            # since further rounds risk compounding the damage.
+            if best_tc is None or len(tc.qa_issues) <= len(best_tc.qa_issues):
+                best_tc = tc
+            else:
+                logger.warning(
+                    "Chunk %s attempt %d regressed (high %d -> %d); rolling back to "
+                    "attempt %d and stopping.",
+                    chunk_id,
+                    attempt,
+                    len(best_tc.qa_issues),
+                    len(tc.qa_issues),
+                    best_tc.selected_attempt,
+                )
+                break
 
         assert best_tc is not None
         final_tc = best_tc
@@ -1479,9 +1528,8 @@ def run_translate_stage(
         total_duration += final_tc.duration_seconds
 
         logger.info(
-            "Chunk %s translated (pass %d, %s tokens, %.1fs)",
+            "Chunk %s translated (%s tokens, %.1fs)",
             chunk_id,
-            final_tc.pass_count,
             f"{chunk_tokens:,}",
             final_tc.duration_seconds,
         )

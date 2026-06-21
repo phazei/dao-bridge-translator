@@ -530,7 +530,7 @@ def _default_config_yaml(epub_path: str, work_dir: str) -> str:
             "qa_check": True,
             # null => use the model/server default sampling temperature.
             "qa_temperature": None,
-            "qa_max_retries": 2,
+            "qa_max_retries": 3,
             "min_length_ratio": 0.3,
             "max_length_ratio": 2.0,
         },

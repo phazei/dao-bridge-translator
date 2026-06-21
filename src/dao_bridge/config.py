@@ -303,7 +303,7 @@ class TranslationPhaseConfig(BaseModel):
     qa_check: bool = True
     # None => omit the temperature field so the model/server default applies.
     qa_temperature: float | None = None
-    qa_max_retries: int = 2
+    qa_max_retries: int = 3
     min_length_ratio: float = 0.3
     max_length_ratio: float = 2.0
 

@@ -1774,7 +1774,7 @@ class TestRunTranslateStage:
 
     @patch("dao_bridge.translate.LLMClient")
     def test_qa_failure_is_non_blocking(self, mock_llm_cls, tmp_path: Path):
-        """Persistent QA failure does NOT halt the pipeline: the best attempt
+        """Persistent QA failure does NOT halt the pipeline: the last attempt
         is kept, the chunk is marked completed, and the run continues."""
         work_dir, config, state, manifest = _setup_stage_test(tmp_path, spines=[(1, 2)])
         config.translation_phase.qa_check = True
@@ -1846,6 +1846,63 @@ class TestRunTranslateStage:
         assert saved.selected_attempt == 2
         # Stopped after attempt 2 — only two QA verdicts consumed.
         assert mock_client.complete_json.call_count == 2
+
+    @patch("dao_bridge.translate.LLMClient")
+    def test_take_last_attempt_when_never_clean(self, mock_llm_cls, tmp_path: Path):
+        """When no attempt clears all high-severity issues, the LAST attempt is
+        selected — even if an earlier attempt had a lower issue count.
+
+        The high-severity issue *count* is a noisy per-call QA signal, so it must
+        not drive selection or trigger a rollback (regression test for the old
+        count-based 'roll back on a higher count' behaviour, which could discard
+        a strictly-improved final attempt)."""
+        work_dir, config, state, manifest = _setup_stage_test(tmp_path, spines=[(1, 1)])
+        config.translation_phase.double_pass = False
+        config.translation_phase.qa_check = True
+        config.translation_phase.qa_max_retries = 3  # 4 attempts total
+        config.translation_phase.rolling_summary = False
+
+        long_text = "これは合理的な長さのテスト翻訳です。テストのための文章。" * 3
+        c = _make_chunk("0001.001", 1, 1, long_text)
+        _write_chunk_file(work_dir, c)
+
+        # A distinct translation per attempt so we can identify the selected one.
+        good = "This is a reasonable length translation for the test. " * 3
+        texts = [f"{good} attempt-{i}" for i in range(1, 5)]
+        mock_client = _make_mock_client([_mock_completion(t) for t in texts])
+        # Issue counts fluctuate 1 -> 2 -> 1 -> 2; never a clean pass. The old
+        # logic would roll back at the 1->2 step; take-last must run all 4 and
+        # keep the last.
+        mock_client.complete_json.side_effect = [
+            QAResponse(result="fail", issues=[QAIssue(severity="high", issue="a")]),
+            QAResponse(
+                result="fail",
+                issues=[QAIssue(severity="high", issue="b"), QAIssue(severity="high", issue="c")],
+            ),
+            QAResponse(result="fail", issues=[QAIssue(severity="high", issue="d")]),
+            QAResponse(
+                result="fail",
+                issues=[QAIssue(severity="high", issue="e"), QAIssue(severity="high", issue="f")],
+            ),
+        ]
+        mock_llm_cls.return_value = mock_client
+
+        result = run_translate_stage(work_dir, config, state, manifest)
+
+        assert result["completed"] == 1
+        assert result["error"] is None
+
+        saved = TranslatedChunk.model_validate_json(
+            translation_path(work_dir, "0001.001").read_text(encoding="utf-8")
+        )
+        # The last (4th) attempt is selected despite its higher issue count.
+        assert saved.qa_result == "fail"
+        assert saved.selected_attempt == 4
+        assert saved.total_attempts == 4
+        assert "attempt-4" in saved.translated_text
+        assert saved.qa_issues == ["e", "f"]
+        # All 4 attempts ran (no early rollback).
+        assert mock_client.complete_json.call_count == 4
 
     @patch("dao_bridge.translate.LLMClient")
     def test_chunk_range_filter(self, mock_llm_cls, tmp_path: Path):

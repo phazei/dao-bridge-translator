@@ -1416,12 +1416,11 @@ def run_translate_stage(
         )
 
         # Attempt 1 is a full translation; subsequent attempts are targeted
-        # QA-fix passes that correct the high-severity issues in the best
+        # QA-fix passes that correct the high-severity issues in the latest
         # translation so far.  max_attempts = 1 + qa_max_retries (QA on).
         max_attempts = 1 + (tp.qa_max_retries if tp.qa_check else 0)
 
-        best_tc: TranslatedChunk | None = None  # fewest high-severity issues so far
-        last_tc: TranslatedChunk | None = None  # most recent attempt (for QA-fix input)
+        last_tc: TranslatedChunk | None = None  # most recent attempt (also the selected one)
 
         for attempt in range(1, max_attempts + 1):
             if progress_cb is not None:
@@ -1488,7 +1487,6 @@ def run_translate_stage(
 
             # A clean attempt (no high-severity issues) is a pass — adopt and stop.
             if tc.qa_result != "fail":
-                best_tc = tc
                 break
 
             # Save the failed attempt as an audit artifact (every failing attempt).
@@ -1509,27 +1507,14 @@ def run_translate_stage(
 
             # Selection for an iterative refinement chain: each qa-fix attempt is
             # built on the prior attempt's text, so it carries forward all earlier
-            # corrections. Adopt the latest attempt as best while it improves or
-            # holds (fewer-or-equal high-severity issues than the prior attempt).
-            # If an attempt REGRESSES (more high-severity issues than the prior),
-            # a fix has broken something: roll back to the prior attempt and stop,
-            # since further rounds risk compounding the damage.
-            if best_tc is None or len(tc.qa_issues) <= len(best_tc.qa_issues):
-                best_tc = tc
-            else:
-                logger.warning(
-                    "Chunk %s attempt %d regressed (high %d -> %d); rolling back to "
-                    "attempt %d and stopping.",
-                    chunk_id,
-                    attempt,
-                    len(best_tc.qa_issues),
-                    len(tc.qa_issues),
-                    best_tc.selected_attempt,
-                )
-                break
+            # corrections. The high-severity issue *count* is a noisy, per-call QA
+            # signal (different judge draws surface different subsets of the same
+            # latent defects), so it is not a reliable quality measure. We always
+            # carry the latest attempt forward and let the loop run to exhaustion;
+            # the final attempt is the selected result.
 
-        assert best_tc is not None
-        final_tc = best_tc
+        assert last_tc is not None
+        final_tc = last_tc
 
         # Save translation.
         t_dir = translation_dir(work_dir, chunk.spine_index, sw)
@@ -1545,16 +1530,16 @@ def run_translate_stage(
             _save_rolling_summaries(work_dir, rolling_summaries)
 
         # Handle final QA result.  QA is advisory and NON-halting: if no attempt
-        # cleared all high-severity issues, we keep the best attempt (fewest
-        # high-severity issues), log a warning, and continue the run.  The
-        # per-attempt failed artifacts remain on disk for later review.
+        # cleared all high-severity issues, we keep the last attempt (the end of
+        # the iterative refinement chain), log a warning, and continue the run.
+        # The per-attempt failed artifacts remain on disk for later review.
         if final_tc.qa_result == "fail":
             error_msg = "; ".join(final_tc.qa_issues)
             logger.warning(
-                "Chunk %s unresolved after %d attempt(s) — keeping best (attempt %d, "
+                "Chunk %s unresolved after %d attempt(s) — keeping last (attempt %d, "
                 "high:%d) and continuing. Issues: %s",
                 chunk_id,
-                last_tc.total_attempts if last_tc else 0,
+                final_tc.total_attempts,
                 final_tc.selected_attempt,
                 len(final_tc.qa_issues),
                 error_msg,

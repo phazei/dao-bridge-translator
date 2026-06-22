@@ -1,0 +1,5 @@
+Translate the following {source_language} text to {target_language}.
+
+First output your <analysis>...</analysis> block (an empty <analysis></analysis> if there is nothing to analyze), then output the {target_language} translation.
+
+{source_text}

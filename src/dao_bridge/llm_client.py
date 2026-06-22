@@ -493,6 +493,11 @@ class LLMClient:
                     attempts,
                     exc,
                 )
+                logger.debug(
+                    "%sRaw LLM response (failed validation):\n%s",
+                    ctx,
+                    result.text,
+                )
 
         raise LLMValidationError(
             f"{ctx}Response failed validation after {attempts} attempt(s): {last_error}"

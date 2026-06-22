@@ -618,8 +618,15 @@ def build_pass1_messages(
         messages.append({"role": "user", "content": overlap_content})
         messages.append({"role": "assistant", "content": "Understood."})
 
-    # Source text to translate.
-    source_content = f"Translate the following {source_lang} text to {target_lang}:\n\n{chunk.text}"
+    # Source text to translate. The user turn restates the analysis-then-
+    # translation contract so weak models that ignore the distant system
+    # instruction still emit the required <analysis> block.
+    user_template = _load_prompt_template("translate_pass1_user.txt")
+    source_content = user_template.format(
+        source_language=source_lang,
+        target_language=target_lang,
+        source_text=chunk.text,
+    )
     messages.append({"role": "user", "content": source_content})
 
     return messages
